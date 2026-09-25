@@ -8,7 +8,7 @@
 //! 3. **Then** attempt delivery to the pinned destination, if there is one.
 //!
 //! Nothing here clears a transcript. There is deliberately no code path that does, on either
-//! success or failure — per `docs/user-experience.md`: *"the transcript is sacred."*
+//! success or failure: the transcript is sacred.
 
 use crate::drafts::DraftStore;
 use crate::transcript::Transcript;

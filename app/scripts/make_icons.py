@@ -118,8 +118,8 @@ def app_icon(side: int, polys) -> Image.Image:
 
 def tray_icon(side: int, polys) -> Image.Image:
     """Menu bar: a template image (alpha only) of the full mark, sound arcs and words included.
-    Changed 2026-09-25 at Quintin's direction - a plain H did not read as this program, and Snip
-    'n' Clip's menu-bar H carries its interior too. Overrides the size-band note in icon-spec."""
+    A plain H did not read as this program, and Snip 'n' Clip's menu-bar H carries its interior
+    too. Overrides the size-band note in icon-spec."""
     # At 18 pt the 2-unit word blocks fall to one faint pixel, so the menu-bar master sets them
     # half again as tall. They stay inside the letter's interior clip (rows at y 25, 32, 39).
     def taller(poly):

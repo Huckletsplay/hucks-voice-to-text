@@ -52,8 +52,9 @@ cd "$APP_DIR"
 case "${1:-run}" in
   build)  cargo build -p hvtt-desktop ;;
   # Release build, used by install.sh. It lives here so the Command Line Tools workaround
-  # above stays in exactly one place.
-  build-release) cargo build --release -p hvtt-desktop ;;
+  # above stays in exactly one place. Extra arguments let the public packager enable Tauri's
+  # production custom-protocol feature without changing local development installs.
+  build-release) shift; cargo build --release -p hvtt-desktop "$@" ;;
   # Extra arguments pass through, e.g. `scripts/dev.sh test -- --ignored`.
   test)   shift; cargo test --workspace "$@" ;;
   bundle) echo "Use scripts/install.sh - it assembles and signs the .app without the Tauri CLI." >&2; exit 2 ;;

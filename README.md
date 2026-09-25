@@ -17,7 +17,7 @@ and download:
 
 | Platform | Download | Requirement |
 |---|---|---|
-| macOS | `HucksVoiceToText-0.1.0-macOS-arm64-unsigned-beta.dmg` | Apple silicon Mac (M1 or newer), macOS 11 or newer |
+| macOS | `HucksVoiceToText-0.1.1-macOS-arm64-unsigned-beta.dmg` | Apple silicon Mac (M1 or newer), macOS 11 or newer |
 
 This is an unsigned public beta. macOS Gatekeeper will identify the developer as unknown.
 Installation instructions are below, and the download has a SHA-256 checksum beside it. The beta
@@ -91,13 +91,13 @@ explicitly choose **Check for Updates**. To report a security issue privately, s
 The DMG has a checksum file beside it on the release page.
 
 ```bash
-shasum -a 256 HucksVoiceToText-0.1.0-macOS-arm64-unsigned-beta.dmg
+shasum -a 256 HucksVoiceToText-0.1.1-macOS-arm64-unsigned-beta.dmg
 ```
 
 Expected SHA-256:
 
 ```text
-1c51bd8fd053e46894e9b4dc5da0a862aef8df8ac1ead1c899484ecaf044fdc2
+73479b1a0fb7bbe5dd356ce068e2e4be81d0a8ff732876802bb2a4bb81ef110a
 ```
 
 ## Support

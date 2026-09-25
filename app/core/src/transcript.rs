@@ -1,7 +1,7 @@
 //! The transcript model.
 //!
-//! Shaped now for the two-pass design recorded in `docs/user-experience.md`: a fast model paints
-//! a *provisional* draft while the user speaks, an accurate model replaces it with *settled*
+//! Shaped for a two-pass design: a fast model paints a *provisional* draft while the user speaks,
+//! an accurate model replaces it with *settled*
 //! text, and delivery always uses the settled pass. The first milestone only produces settled
 //! text, but the distinction is in the type from the start so the UI never has to be rebuilt
 //! around it — and so provisional text can be rendered visually distinct, which the doctrine
@@ -112,10 +112,10 @@ mod tests {
     #[test]
     fn a_user_edit_is_never_overwritten_by_recognition() {
         let mut t = Transcript::provisional("helo ther");
-        t.edit("Hello there, Quintin.");
+        t.edit("Hello there, Taylor.");
         // The accurate pass lands late — it must not win.
         assert!(!t.apply_recognition("hello there", Provenance::Settled));
-        assert_eq!(t.text(), "Hello there, Quintin.");
+        assert_eq!(t.text(), "Hello there, Taylor.");
         assert_eq!(t.provenance(), Provenance::Edited);
     }
 

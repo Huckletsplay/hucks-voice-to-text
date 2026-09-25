@@ -21,8 +21,8 @@ pub fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
 
 /// Linear resampling.
 ///
-/// Good enough for speech at these rates, and cheap — which matters because the hotkey budget
-/// in `docs/user-experience.md` is 150 ms and this sits on that path.
+/// Good enough for speech at these rates, and cheap — which matters because the hotkey-to-visible
+/// budget is 150 ms and this sits on that path.
 pub fn resample_linear(input: &[f32], from_hz: u32, to_hz: u32) -> Vec<f32> {
     if from_hz == to_hz || input.is_empty() {
         return input.to_vec();

@@ -1,7 +1,7 @@
 //! Whisper recognition, via whisper.cpp.
 //!
-//! Loaded once and kept resident — `docs/user-experience.md` decides to pay RAM rather than
-//! seconds so the hotkey responds instantly. Behind `hvtt_core::engine::Transcriber`, so
+//! Loaded once and kept resident — pay RAM rather than seconds so the hotkey responds instantly.
+//! Behind `hvtt_core::engine::Transcriber`, so
 //! milestone 2 can swap the engine after measuring rather than rewriting.
 
 use hvtt_core::engine::{EngineError, TranscriptionRequest, TranscriptionResult, Transcriber};

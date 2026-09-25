@@ -1,8 +1,7 @@
 //! Local settings. Small on purpose.
 //!
-//! `docs/user-experience.md` warns against a big settings interface, and the hub guardrail
-//! repeats it. Each field here earns its place by being something that genuinely differs
-//! between machines or between people.
+//! Each field here earns its place by being something that genuinely differs between machines or
+//! between people; the program deliberately avoids a large settings interface.
 
 use crate::paths;
 use serde::{Deserialize, Serialize};
@@ -180,7 +179,7 @@ mod tests {
     fn settings_round_trip_through_disk() {
         let p = temp_path("roundtrip");
         let mut s = Settings::default();
-        s.vocabulary = vec!["HyperFrames".into(), "Quintin".into()];
+        s.vocabulary = vec!["HyperFrames".into(), "Taylor".into()];
         s.model = "ggml-small.en.bin".into();
         s.save_to(&p).unwrap();
 

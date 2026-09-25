@@ -17,7 +17,7 @@ pub struct TranscriptionRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptionResult {
     pub text: String,
-    /// Wall-clock recognition time, measured against the budgets in `docs/user-experience.md`.
+    /// Wall-clock recognition time, retained so normal use exposes latency regressions.
     pub elapsed_ms: u128,
 }
 
@@ -46,8 +46,8 @@ impl std::error::Error for EngineError {}
 
 /// A loaded, resident recognition model.
 ///
-/// Resident is deliberate: `docs/user-experience.md` decides to pay RAM rather than seconds, so
-/// the hotkey responds instantly. Implementations are expected to be created once at startup.
+/// Resident is deliberate: pay RAM rather than seconds so the hotkey responds instantly.
+/// Implementations are expected to be created once at startup.
 pub trait Transcriber: Send + Sync {
     fn name(&self) -> &str;
     fn transcribe(&self, req: &TranscriptionRequest) -> Result<TranscriptionResult, EngineError>;

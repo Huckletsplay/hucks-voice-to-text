@@ -54,15 +54,43 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/hvtt-release.XXXXXX")"
 trap 'hdiutil detach "$WORK/mnt" -quiet 2>/dev/null || true; rm -rf "$WORK"' EXIT
 STAGE="$WORK/stage"
 APP="$STAGE/$PRODUCT_NAME.app"
+CARGO_TARGET_DIR="$WORK/target"
+export CARGO_TARGET_DIR
+
+# Rust and the native whisper.cpp build otherwise embed this Mac's absolute source, Cargo-cache
+# and target paths in the executable. Besides making the build machine part of the public binary,
+# that exposes the private project location and macOS account name. Keep useful source locations,
+# but make them deterministic and anonymous. CARGO_ENCODED_RUSTFLAGS uses the unit separator so
+# the project path remains one argument even though the external drive's name contains a space.
+FLAG_SEPARATOR=$'\037'
+PATH_REMAP_FLAGS="--remap-path-prefix=$PROJECT_ROOT=/src/huck-voice-to-text${FLAG_SEPARATOR}--remap-path-prefix=$HOME=/build${FLAG_SEPARATOR}--remap-path-prefix=$WORK=/build/work"
+if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+    PATH_REMAP_FLAGS="$PATH_REMAP_FLAGS${FLAG_SEPARATOR}$CARGO_ENCODED_RUSTFLAGS"
+fi
+export CARGO_ENCODED_RUSTFLAGS="$PATH_REMAP_FLAGS"
+NATIVE_PATH_REMAP="-ffile-prefix-map=$HOME=/build -ffile-prefix-map=$WORK=/build/work"
+export CFLAGS="${CFLAGS:-} $NATIVE_PATH_REMAP"
+export CXXFLAGS="${CXXFLAGS:-} $NATIVE_PATH_REMAP"
+export CMAKE_C_FLAGS="${CMAKE_C_FLAGS:-} $NATIVE_PATH_REMAP"
+export CMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS:-} $NATIVE_PATH_REMAP"
 
 say() { printf '%s\n' "$*"; }
 
 say "Building $PRODUCT_NAME $VERSION (release)…"
-bash "$SCRIPT_DIR/dev.sh" build-release
+bash "$SCRIPT_DIR/dev.sh" build-release --features custom-protocol
 
 say "Assembling, with the speech model inside…"
 mkdir -p "$STAGE"
 HVTT_BUNDLE_MODEL="$MODEL" bash "$SCRIPT_DIR/assemble-app.sh" "$APP"
+
+# This is deliberately a release failure, not a best-effort warning. It protects against a future
+# compiler, dependency or custom target directory bypassing the remapping above.
+PRIVATE_MARKERS='/''Users/|/''Volumes/|@''gmail\.com|huckletsplay''@'
+if strings "$APP/Contents/MacOS/hvtt-desktop" \
+    | grep -E "$PRIVATE_MARKERS" >/dev/null; then
+    echo "Refusing to package: the executable contains a personal path or email address." >&2
+    exit 1
+fi
 
 say "Signing ad hoc (unsigned beta)…"
 codesign --force --sign - "$APP"

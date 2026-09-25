@@ -64,8 +64,8 @@ struct Snapshot {
     timings: Timings,
 }
 
-/// The numbers `docs/user-experience.md` sets budgets for. Measured every session so a
-/// regression shows up in normal use rather than in a benchmark nobody runs.
+/// The product's latency numbers. Measured every session so a regression shows up in normal use
+/// rather than in a benchmark nobody runs.
 #[derive(Debug, Clone, Default, Serialize)]
 struct Timings {
     /// Shortcut pressed -> indicator on screen. Budget: under 150 ms.
@@ -163,8 +163,8 @@ impl App {
     }
 }
 
-/// One line per dictation, so the budgets in `docs/user-experience.md` are checked by using
-/// the product rather than by running a benchmark nobody runs.
+/// One line per dictation, so the latency budgets are checked by using the product rather than by
+/// running a benchmark nobody runs.
 fn log_latency(state: &App) {
     let t = state.timings.lock();
     eprintln!(
@@ -182,8 +182,8 @@ fn push(app: &AppHandle) {
 /// Bring the composer into view without taking the foreground.
 ///
 /// `show()` alone is correct here: the app runs as a macOS accessory, so showing a window does
-/// not activate it. Rule 1 of `docs/user-experience.md` — never take the foreground — depends
-/// on nothing here calling `set_focus()`.
+/// not activate it. The never-take-the-foreground rule depends on nothing here calling
+/// `set_focus()`.
 fn reveal_composer(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("composer") {
         let _ = w.show();
@@ -761,8 +761,8 @@ fn start_recording(app: AppHandle) {
         std::thread::spawn(move || crate::destination::chromium::ChromiumDestination::pin(bridge))
     };
 
-    // 1. THE INDICATOR, before anything that can block. `docs/user-experience.md` budgets
-    //    150 ms from keypress to visible and calls it the most felt number in the product.
+    // 1. THE INDICATOR, before anything that can block. The budget is 150 ms from keypress to
+    //    visible; it is the most felt number in the product.
     // A new dictation starts empty. The previous words are already in their text box, or on
     // the clipboard and in the recovery draft; appending them would send old words somewhere new.
     *state.generation.lock() += 1;

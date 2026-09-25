@@ -3,9 +3,9 @@
 // No bundler and no npm: this project lives on an exFAT volume that cannot store the symlinks a
 // package manager needs, so the UI uses Tauri's injected global directly.
 //
-// The guiding rule from docs/user-experience.md: this is a voice layer, not an application. The
-// surface shows one state, says briefly where the words went, and leaves by itself. The words are
-// never shown back afterwards: they are in the text box, or on the clipboard.
+// This is a voice layer, not an application. The surface shows one state, says briefly where the
+// words went, and leaves by itself. The words are never shown back afterwards: they are in the
+// text box, or on the clipboard.
 
 import { H_BODY, ARCS, WORDS } from "./mark.js";
 

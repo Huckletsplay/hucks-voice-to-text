@@ -14,6 +14,12 @@ path = "src/lib.rs"
 name = "hvtt-desktop"
 path = "src/main.rs"
 
+[features]
+# Tauri's production context omits the build machine's config directory and serves the embedded
+# UI through its application protocol. Public packages enable this explicitly; ordinary dev runs
+# keep Tauri's development context.
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
