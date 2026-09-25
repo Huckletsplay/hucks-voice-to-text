@@ -1,0 +1,42 @@
+# Build output lives outside the program and outside git
+/artifacts/
+target/
+**/target/
+*.app/
+*.dmg
+*.sha256.txt
+
+# Machine-local cargo target redirection
+/app/.cargo/config.toml
+
+# Models are NEVER committed and never live on this drive
+*.bin
+*.gguf
+*.pt
+models/
+
+# Recordings and transcripts are the most sensitive data in this project
+*.wav
+recordings/
+drafts/
+
+# macOS / editor noise
+.DS_Store
+._*
+__pycache__/
+*.pyc
+
+# Tauri regenerates these from tauri.conf.json and capabilities/ on every build
+/app/desktop/gen/schemas/
+
+# Credentials and signing material
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.cer
+*.crt
+*.mobileprovision
+secrets/
+.secrets/

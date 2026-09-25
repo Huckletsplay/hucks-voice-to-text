@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Huck's mark">
+  <!-- SHARED ASSET - identical in every Huck's program, copied from
+       hucks-snip-n-clip/docs/icon/. The letter never varies; only the interior
+       does, and below 32 px there is no interior.
+
+       Master mark. fill=currentColor so it works as a macOS template image
+       and can be tinted to the product hue. 64-unit grid. -->
+  <path d="M6 6 H29 V27 H35 V6 H58 V58 H35 V37 H29 V58 H6 Z" fill="currentColor"/>
+</svg>

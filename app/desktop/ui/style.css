@@ -1,0 +1,127 @@
+/* Huck's Voice to Text — a voice layer, not an application.
+   The same family as Huck's Snip 'n' Clip: grayscale throughout, a black translucent panel like
+   its toast, a white H like its floating controller, white buttons with grey glyphs. The one hue
+   is Snip's own amber, for a problem. The H itself is the only level meter. */
+
+:root {
+  --bg: rgba(0, 0, 0, 0.82);        /* Snip 'n' Clip's toast */
+  --raised: rgba(255, 255, 255, 0.08);
+  --edge: rgba(255, 255, 255, 0.14);
+  --ink: #ffffff;
+  --dim: rgba(255, 255, 255, 0.62);
+  --button: #ffffff;
+  --glyph: #464646;                  /* Snip's controller glyph, 70/255 */
+  --glyph-hover: #282828;            /* 40/255 */
+  --focus: rgba(255, 255, 255, 0.45);
+  --warn: #c98a2e;                   /* Snip's warning / paused */
+  --r: 10px;
+}
+
+* { box-sizing: border-box; }
+
+/* `display: flex` on a section beats the `hidden` attribute's UA `display: none`, which showed
+   the composer and the permission panel when they were supposed to be absent. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  color: var(--ink);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  cursor: default;
+  user-select: none;
+}
+
+.surface {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 10px 11px;
+  background: var(--bg);
+  border-radius: var(--r);
+}
+
+/* ------------------------------------------------------------------ header */
+
+.bar { display: flex; align-items: center; gap: 9px; }
+
+.mark {
+  /* Big enough that the word lines visibly write themselves in while he talks. */
+  width: 36px; height: 36px; flex: 0 0 auto;
+  color: var(--ink);
+}
+
+.status { flex: 1 1 auto; min-width: 0; }
+
+.state {
+  margin: 0; font-size: 13px; font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.target {
+  margin: 1px 0 0; font-size: 10.5px; color: var(--dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.target:empty { display: none; }
+
+/* The close button: quiet until pointed at, and present in every state but transcribing. */
+.close {
+  flex: 0 0 auto; width: 22px; height: 22px; padding: 0;
+  display: grid; place-items: center;
+  border: 0; border-radius: 50%; background: transparent; color: var(--dim);
+}
+.close svg { width: 10px; height: 10px; stroke: currentColor; stroke-width: 1.6; fill: none; }
+.close:hover { background: var(--raised); color: var(--ink); }
+
+/* Transcribing: the text side of the mark fills in, word block by word block. */
+body[data-state="transcribing"] #words path { animation: settle 1s ease-in-out infinite; }
+#words path:nth-child(2) { animation-delay: .07s }
+#words path:nth-child(3) { animation-delay: .14s }
+#words path:nth-child(4) { animation-delay: .21s }
+#words path:nth-child(5) { animation-delay: .28s }
+#words path:nth-child(6) { animation-delay: .35s }
+#words path:nth-child(7) { animation-delay: .42s }
+@keyframes settle { 0%, 100% { opacity: 1 } 50% { opacity: .15 } }
+
+/* ------------------------------------------------------------------ buttons */
+
+button {
+  padding: 5px 12px; border-radius: 6px;
+  border: 0; background: var(--button); color: var(--glyph);
+  font: inherit; font-size: 12px; font-weight: 500; cursor: pointer;
+  transition: color 120ms, background 120ms, opacity 120ms;
+}
+button:hover:not(:disabled) { color: var(--glyph-hover); }
+button:disabled { opacity: .4; cursor: default; }
+button.quiet { background: transparent; color: var(--dim); }
+button.quiet:hover:not(:disabled) { color: var(--ink); }
+
+
+/* ------------------------------------------------------------------ one-line note */
+
+.note {
+  margin: 0; font-size: 11.5px; color: var(--dim);
+  /* Deliberately not a dialog, not centred, not coloured like an alarm. Losing a destination
+     is an ordinary event: the words are already on the clipboard. */
+}
+body[data-state="error"] .note { color: var(--warn); }
+
+/* ------------------------------------------------------------------ permission */
+
+.permission {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 7px;
+  padding: 8px 9px; border-radius: 9px;
+  background: var(--raised); border: 1px solid var(--edge);
+}
+.permission p { margin: 0 0 2px; flex: 1 1 100%; font-size: 11.5px; color: var(--ink); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition-duration: 1ms !important; animation: none !important; }
+}
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}

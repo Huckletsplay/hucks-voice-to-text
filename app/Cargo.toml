@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["core", "desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+authors = ["Quintin Huckaby"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Huck's Voice to Text</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body data-state="idle">
+    <main class="surface" data-tauri-drag-region>
+      <!-- The whole normal-use interface: the H, one status line, and a close button. -->
+      <header class="bar" data-tauri-drag-region>
+        <svg class="mark" viewBox="0 0 64 64" aria-hidden="true">
+          <defs>
+            <mask id="knock">
+              <rect x="0" y="0" width="64" height="64" fill="white" />
+              <g id="arcs" fill="black"></g>
+              <g id="words" fill="black"></g>
+            </mask>
+          </defs>
+          <path id="hbody" mask="url(#knock)" fill="currentColor" />
+        </svg>
+
+        <div class="status" data-tauri-drag-region>
+          <p class="state" id="state-line">Ready</p>
+          <p class="target" id="target-line"></p>
+        </div>
+
+        <!-- Always there: the box must never be something he cannot get rid of. -->
+        <button id="close" class="close" title="Close (Esc)" aria-label="Close">
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 2L10 10M10 2L2 10" /></svg>
+        </button>
+      </header>
+
+      <!-- One line, never a dialog. -->
+      <p class="note" id="note" hidden></p>
+
+      <!-- Check for Updates: only once a verified download is waiting. -->
+      <section class="permission" id="update-actions" hidden>
+        <button id="update-open" class="primary">Open Update</button>
+        <button id="update-later" class="quiet">Not now</button>
+      </section>
+
+      <section class="permission" id="permission" hidden>
+        <p id="permission-text">Huck needs Accessibility permission to type into other apps.</p>
+        <button id="permission-open" class="primary">Open Settings</button>
+        <button id="permission-later" class="quiet">Not now</button>
+      </section>
+    </main>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

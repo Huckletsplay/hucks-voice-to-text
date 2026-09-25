@@ -1,0 +1,13 @@
+[package]
+name = "hvtt-core"
+description = "Huck's Voice to Text - platform-free core: session state, transcript safety, settings, audio conditioning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+dirs = "6"
