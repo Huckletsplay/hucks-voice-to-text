@@ -10,6 +10,8 @@ pub mod engine_whisper;
 pub mod recorder;
 pub mod update;
 #[cfg(windows)]
+mod win_hook;
+#[cfg(windows)]
 mod win_shortcut;
 #[cfg(windows)]
 mod win_surface;
@@ -120,10 +122,6 @@ struct App {
     /// Windows: the keyboard hook that hears the new shortcut while the prompt is open.
     #[cfg(windows)]
     key_capture: Mutex<Option<win_shortcut::Capture>>,
-    /// Windows: the window he was in when the pointer reached the H, given the foreground back
-    /// when a menu item is chosen.
-    #[cfg(windows)]
-    before_menu: Mutex<Option<isize>>,
     update: Mutex<Option<UpdateView>>,
     /// A downloaded, verified update - the DMG on macOS, the installer on Windows - waiting to
     /// be opened.
@@ -376,6 +374,8 @@ fn begin_rebind(app: &AppHandle, which: Rebinding) {
         // the box takes the keyboard as on macOS.
         #[cfg(windows)]
         {
+            // A prompt reopened from the menu replaces the old one; the old one goes first.
+            drop(state.key_capture.lock().take());
             let handle = app.clone();
             let capture = win_shortcut::start(move |heard| match heard {
                 win_shortcut::Heard::Keys(accelerator) => finish_rebind(handle.clone(), accelerator),
@@ -678,8 +678,8 @@ fn on_menu(app: &AppHandle, id: &str) {
     let state: State<App> = app.state();
     // Windows leaves the menu's hidden window in front; give it back to where he was first.
     #[cfg(windows)]
-    if let Some(h) = *state.before_menu.lock() {
-        win_surface::give_back_foreground(h);
+    if let Some(workplace) = win_surface::take_last_workplace() {
+        win_surface::give_back_foreground(workplace);
     }
     match id {
         // Windows: a moment for that window to take its focus back, so the dictation is aimed at
@@ -785,13 +785,12 @@ fn dismiss(app: AppHandle) {
     }
     *state.generation.lock() += 1;
     // Leaving the key prompt, by any route, puts every shortcut back.
+    // Let go of the keyboard - always, whatever state the prompt is in - before the shortcuts go
+    // back on.
+    #[cfg(windows)]
+    drop(state.key_capture.lock().take());
     if state.rebinding.lock().take().is_some() {
         *state.rebind_error.lock() = None;
-        // Let go of the keyboard before the shortcuts go back on.
-        #[cfg(windows)]
-        {
-            *state.key_capture.lock() = None;
-        }
         bind_all(&app);
     }
     if let Some(rec) = state.recording.lock().take() {
@@ -998,6 +997,10 @@ fn resolve_pin_windows(
     match windows_uia::capture(&stamp).and_then(|el| windows_uia::validate_captured(el, app_label.clone())) {
         Ok(d) => set(Box::new(d.with_paste_fallback(Some(paste())))),
         Err(reason) if reason == "secure-field" => note(PinError::SecureField),
+        // Could not tell whether it is a password box: no write and no paste, only the copy.
+        Err(reason) if reason == "password-unknown" => note(PinError::Other(
+            "Huck couldn't tell if that's a password box, so it will only copy the words.".into(),
+        )),
         // Nothing UI Automation could write: paste, gated. That includes focus having moved
         // before the capture landed - the gate then refuses at delivery, just as it would had he
         // moved later, and the words wait on the clipboard.
@@ -1297,8 +1300,6 @@ pub fn run() {
         rebind_error: Mutex::new(None),
         #[cfg(windows)]
         key_capture: Mutex::new(None),
-        #[cfg(windows)]
-        before_menu: Mutex::new(None),
         update: Mutex::new(None),
         update_file: Mutex::new(None),
         menu_key: Mutex::new(String::new()),
@@ -1343,6 +1344,9 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("composer") {
                 win_surface::prepare(&w);
             }
+            // Windows: know where he was working, for when a menu item hands the foreground back.
+            #[cfg(windows)]
+            win_surface::follow_foreground();
 
             {
                 let handle = app.handle().clone();
@@ -1380,13 +1384,6 @@ pub fn run() {
                             let state: State<App> = app.state();
                             *state.ax_trusted.lock() = accessibility_ready();
                             refresh_menu(app);
-                        }
-                        // Windows: note where he was working before the click takes it away.
-                        #[cfg(windows)]
-                        if matches!(event, TrayIconEvent::Enter { .. } | TrayIconEvent::Move { .. }) {
-                            if let Some(h) = win_surface::outside_foreground() {
-                                *tray.app_handle().state::<App>().before_menu.lock() = Some(h);
-                            }
                         }
                     })
                     .build(app)?;

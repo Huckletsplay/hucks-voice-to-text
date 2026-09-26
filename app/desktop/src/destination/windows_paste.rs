@@ -12,35 +12,35 @@
 //! installed at the keypress and removed when the last `FocusStamp` of that dictation is dropped.
 //! They count; they record nothing about which keys were pressed.
 //!
+//! **Exactly one key may be pressed between the keypress and delivery: the one that stopped the
+//! dictation.** Keys already held at the start (the shortcut's own auto-repeat) and modifiers are
+//! not counted, so that press is always exactly one. Any other key - an arrow, a letter,
+//! Backspace, Enter - may have moved the caret, and refuses the paste; so does none at all, which
+//! means the count was not running (Codex's review, 2026-09-26: the first version allowed three).
+//!
 //! The paste is instant, even with the shortcut's keys still held: see `paste_keys`.
 //!
 //! Ctrl+V only ever reads the normal clipboard. On the normal-clipboard setting it already holds
 //! the transcript (`complete_transcription` copies before it delivers). On Huck's own clipboard
 //! the words are put on the normal one for half a second and whatever he had there is put back.
 
+use crate::win_hook::{self, HookThread};
 use hvtt_core::pipeline::{DeliveryError, Destination, Liveness};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetMessageW,
-    GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, GUITHREADINFO, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
-    WM_XBUTTONDOWN,
+    CallNextHookEx, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo,
+    GetWindowThreadProcessId, GUITHREADINFO, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED,
+    MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
 };
-
-/// Key presses allowed between the keypress and delivery: the stop press, plus a little slack.
-/// Modifiers and auto-repeat are not counted. Anything more means he typed somewhere.
-const SHORTCUT_KEYS: u32 = 3;
 
 const VK_V: u16 = 0x56;
 
@@ -55,17 +55,13 @@ static HELD: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 static WATCH: Mutex<Weak<Watch>> = Mutex::new(Weak::new());
 
 /// While one of these is alive, clicks and key presses are being counted.
-#[derive(Debug)]
 struct Watch {
-    thread: u32,
+    hooks: HookThread,
 }
 
-impl Drop for Watch {
-    fn drop(&mut self) {
-        // The hook thread unhooks and exits on WM_QUIT.
-        unsafe {
-            let _ = PostThreadMessageW(self.thread, WM_QUIT, WPARAM(0), LPARAM(0));
-        }
+impl std::fmt::Debug for Watch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Watch({})", self.hooks.thread())
     }
 }
 
@@ -73,21 +69,37 @@ fn is_modifier(vk: u32) -> bool {
     matches!(vk, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C)
 }
 
+/// Does this key press count as him doing something? Our own keystrokes (injected), a held key's
+/// auto-repeat and modifiers on their own do not.
+fn counts_as_typing(vk: u32, injected: bool, repeat: bool) -> bool {
+    !injected && !repeat && !is_modifier(vk)
+}
+
+/// The input half of the gate, from what the hooks counted since the keypress.
+fn input_moved(clicks: u32, keys: u32) -> Option<&'static str> {
+    if clicks != 0 {
+        return Some("clicked");
+    }
+    match keys {
+        1 => None,
+        0 => Some("stop-not-seen"),
+        _ => Some("typed"),
+    }
+}
+
 unsafe extern "system" fn on_key(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let vk = (info.vkCode & 0xFF) as usize;
         let message = wparam.0 as u32;
-        // Our own Ctrl+V is injected; it is never counted as him typing.
-        if !info.flags.contains(LLKHF_INJECTED) {
-            if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
-                let repeat = HELD[vk].swap(true, Ordering::Relaxed);
-                if !repeat && !is_modifier(vk as u32) {
-                    KEYS.fetch_add(1, Ordering::Relaxed);
-                }
-            } else if message == WM_KEYUP || message == WM_SYSKEYUP {
-                HELD[vk].store(false, Ordering::Relaxed);
+        let injected = info.flags.contains(LLKHF_INJECTED);
+        if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
+            let repeat = !injected && HELD[vk].swap(true, Ordering::Relaxed);
+            if counts_as_typing(vk as u32, injected, repeat) {
+                KEYS.fetch_add(1, Ordering::Relaxed);
             }
+        } else if !injected && (message == WM_KEYUP || message == WM_SYSKEYUP) {
+            HELD[vk].store(false, Ordering::Relaxed);
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
@@ -105,6 +117,15 @@ unsafe extern "system" fn on_mouse(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     CallNextHookEx(None, code, wparam, lparam)
 }
 
+/// Runs on the hook thread with the hooks in: whatever is held now - the start chord, still
+/// under his fingers - is marked held, so its auto-repeat is not counted as typing.
+fn mark_held_keys() {
+    for (vk, held) in HELD.iter().enumerate() {
+        let down = unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 };
+        held.store(down, Ordering::Relaxed);
+    }
+}
+
 /// Start counting, or join the count already running. Blocks for the millisecond or two it takes
 /// the hooks to go in, so nothing after the keypress is missed.
 fn watch() -> Option<Arc<Watch>> {
@@ -112,33 +133,13 @@ fn watch() -> Option<Arc<Watch>> {
     if let Some(w) = current.upgrade() {
         return Some(w);
     }
-    let (tx, rx) = std::sync::mpsc::channel::<Option<u32>>();
-    std::thread::spawn(move || unsafe {
-        // A message queue must exist before anyone can post WM_QUIT to this thread.
-        let mut msg = MSG::default();
-        let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
-        let (keys, mouse) = match (
-            SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), None, 0),
-            SetWindowsHookExW(WH_MOUSE_LL, Some(on_mouse), None, 0),
-        ) {
-            (Ok(k), Ok(m)) => (k, m),
-            (k, m) => {
-                // Without both counts the gate cannot tell that nothing moved: no watch at all.
-                for hook in [k.ok(), m.ok()].into_iter().flatten() {
-                    let _ = UnhookWindowsHookEx(hook);
-                }
-                let _ = tx.send(None);
-                return;
-            }
-        };
-        let _ = tx.send(Some(GetCurrentThreadId()));
-        // Low-level hooks are called on this thread, from this loop.
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
-        let _ = UnhookWindowsHookEx(keys);
-        let _ = UnhookWindowsHookEx(mouse);
-    });
-    let thread = rx.recv_timeout(Duration::from_millis(500)).ok().flatten()?;
-    let w = Arc::new(Watch { thread });
+    // Without both counts the gate cannot tell that nothing moved: no watch at all.
+    let hooks = win_hook::start(
+        vec![(WH_KEYBOARD_LL, Some(on_key)), (WH_MOUSE_LL, Some(on_mouse))],
+        Duration::from_millis(500),
+        mark_held_keys,
+    )?;
+    let w = Arc::new(Watch { hooks });
     *current = Arc::downgrade(&w);
     Some(w)
 }
@@ -215,21 +216,37 @@ impl FocusStamp {
         self.class.starts_with("Chrome_WidgetWin")
     }
 
-    /// Why a paste would no longer land in the control that was focused at the keypress.
-    pub fn moved(&self) -> Option<&'static str> {
+    fn window_moved(&self) -> Option<&'static str> {
         match front() {
-            None => return Some("no-front-window"),
-            Some((window, _, _)) if window != self.window => return Some("window-changed"),
-            Some((_, focus, _)) if focus != self.focus => return Some("focus-changed"),
-            Some(_) => {}
+            None => Some("no-front-window"),
+            Some((window, _, _)) if window != self.window => Some("window-changed"),
+            Some((_, focus, _)) if focus != self.focus => Some("focus-changed"),
+            Some(_) => None,
         }
-        if CLICKS.load(Ordering::Relaxed) != self.clicks {
-            return Some("clicked");
-        }
-        if KEYS.load(Ordering::Relaxed).wrapping_sub(self.keys) > SHORTCUT_KEYS {
-            return Some("typed");
-        }
-        None
+    }
+
+    fn counted(&self) -> (u32, u32) {
+        (
+            CLICKS.load(Ordering::Relaxed).wrapping_sub(self.clicks),
+            KEYS.load(Ordering::Relaxed).wrapping_sub(self.keys),
+        )
+    }
+
+    /// Anything at all since the keypress - for a capture made a moment after it, before even
+    /// the stop press.
+    pub fn moved_since_keypress(&self) -> Option<&'static str> {
+        self.window_moved().or(match self.counted() {
+            (0, 0) => None,
+            (0, _) => Some("typed"),
+            _ => Some("clicked"),
+        })
+    }
+
+    /// Why a paste would no longer land in the control that was focused at the keypress: the
+    /// window or focused control changed, he clicked, or he pressed any key besides the stop.
+    pub fn moved(&self) -> Option<&'static str> {
+        let (clicks, keys) = self.counted();
+        self.window_moved().or_else(|| input_moved(clicks, keys))
     }
 }
 
@@ -320,13 +337,16 @@ pub fn mask_menu_key() {
 
 /// Paste `text` from the normal clipboard, then put back whatever was there. The app reads the
 /// clipboard when it handles the keystroke, a moment later, so the give-back waits for it.
+///
+/// If his clipboard cannot be remembered in full, it is not borrowed and nothing is pasted: the
+/// words stay on Huck's clipboard, and what he copied stays exactly where it was.
 pub fn paste_borrowing_clipboard(text: &str) -> Result<(), DeliveryError> {
     let borrowed = crate::clip::huck::borrow_general(text)
-        .ok_or_else(|| DeliveryError::Other("the clipboard refused the text".into()))?;
+        .map_err(|why| DeliveryError::Other(format!("his clipboard was left alone: {why}")))?;
     let pressed = press_paste();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(500));
-        borrowed.give_back();
+        let _ = borrowed.give_back();
     });
     pressed
 }
@@ -375,6 +395,26 @@ impl Destination for PasteDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_key_besides_the_stop_press_refuses_the_paste() {
+        // Codex's blocker: Arrow Left then the stop shortcut used to pass (three were allowed).
+        for vk in [0x25, 0x26, 0x27, 0x28, 0x41, 0x31, 0x08, 0x0D, 0x2E, 0x20] {
+            assert!(counts_as_typing(vk, false, false), "{vk:#x} can move the caret");
+        }
+        assert_eq!(input_moved(0, 1), None, "the stop press alone");
+        assert_eq!(input_moved(0, 2), Some("typed"), "an arrow or a letter, then the stop press");
+        assert_eq!(input_moved(0, 3), Some("typed"));
+        assert_eq!(input_moved(1, 1), Some("clicked"));
+        assert_eq!(input_moved(0, 0), Some("stop-not-seen"), "no count at all is not proof");
+    }
+
+    #[test]
+    fn repeats_and_our_own_keystrokes_are_not_typing() {
+        assert!(!counts_as_typing(0x20, false, true), "the shortcut's auto-repeat");
+        assert!(!counts_as_typing(0x56, true, false), "our own Ctrl+V");
+        assert!(!counts_as_typing(0xE8, true, false), "our menu mask");
+    }
 
     #[test]
     fn modifiers_are_not_counted_as_typing() {

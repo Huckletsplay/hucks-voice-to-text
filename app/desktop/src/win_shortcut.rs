@@ -8,18 +8,19 @@
 //!
 //! While the prompt is open the hook swallows every key, so the chord he presses reaches no other
 //! program either. Esc on its own cancels. So that a keyboard can never be left captured, the
-//! prompt gives up by itself after `TIMEOUT` without a successful choice.
+//! prompt gives up by itself after `TIMEOUT` without a successful choice, and the hook is taken
+//! out directly `LAST_RESORT` after that whatever else has happened. The hook runs on
+//! `win_hook`'s thread, which cannot outlive its owner.
 
+use crate::win_hook::{self, HookThread};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
+    CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 pub const TIMEOUT: Duration = Duration::from_secs(15);
@@ -181,56 +182,70 @@ unsafe extern "system" fn on_key(code: i32, wparam: WPARAM, lparam: LPARAM) -> L
 
 /// The open prompt. Dropping it lets go of the keyboard.
 pub struct Capture {
-    thread: u32,
+    prompt: u64,
+    _hooks: HookThread,
+}
+
+/// Forget the sink - but only this prompt's, never a newer one's.
+fn clear_sink(prompt: u64) {
+    let mut sink = SINK.lock();
+    if PROMPT.load(Ordering::Relaxed) == prompt {
+        *sink = None;
+    }
 }
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        *SINK.lock() = None;
-        unsafe {
-            let _ = PostThreadMessageW(self.thread, WM_QUIT, WPARAM(0), LPARAM(0));
-        }
+        clear_sink(self.prompt);
+        // Dropping `_hooks` takes the hook out.
     }
 }
 
+/// However the app answers or fails to, the keyboard is let go of this long after the deadline.
+const LAST_RESORT: Duration = Duration::from_secs(5);
+
 /// Start listening for the new shortcut. `sink` hears the chord, or a cancel - including the
-/// automatic one when `TIMEOUT` passes.
+/// automatic one when `TIMEOUT` passes. The caller must drop any previous `Capture` first.
 pub fn start(sink: impl Fn(Heard) + Send + Sync + 'static) -> Option<Capture> {
     for flag in [&CTRL, &ALT, &SHIFT, &WIN].into_iter().chain(HELD.iter()) {
         flag.store(false, Ordering::Relaxed);
     }
-    *SINK.lock() = Some(Arc::new(sink));
+    let prompt = {
+        let mut slot = SINK.lock();
+        *slot = Some(Arc::new(sink));
+        PROMPT.fetch_add(1, Ordering::Relaxed) + 1
+    };
     extend();
-    let prompt = PROMPT.fetch_add(1, Ordering::Relaxed) + 1;
 
-    let (tx, rx) = std::sync::mpsc::channel::<Option<u32>>();
-    std::thread::spawn(move || unsafe {
-        let mut msg = MSG::default();
-        let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
-        let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), None, 0) else {
-            let _ = tx.send(None);
-            return;
-        };
-        let thread = GetCurrentThreadId();
-        let _ = tx.send(Some(thread));
-        // The safety net: a prompt left open lets go of the keyboard by itself.
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(200));
-            if SINK.lock().is_none() || PROMPT.load(Ordering::Relaxed) != prompt {
-                break;
-            }
-            // Not while a chord is being saved: the answer to that ends or reopens the prompt.
-            if now_ms() > DEADLINE.load(Ordering::Relaxed) && !HEARD.swap(true, Ordering::Relaxed) {
-                deliver(Heard::Cancel);
-                let _ = PostThreadMessageW(thread, WM_QUIT, WPARAM(0), LPARAM(0));
-                break;
-            }
-        });
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
-        let _ = UnhookWindowsHookEx(hook);
+    let Some(hooks) =
+        win_hook::start(vec![(WH_KEYBOARD_LL, Some(on_key))], Duration::from_millis(500), || {})
+    else {
+        clear_sink(prompt);
+        return None;
+    };
+
+    // The safety net. A prompt left open cancels itself at the deadline; and if nothing ends it
+    // even then, the hook is taken out directly, so the keyboard is never held for longer than
+    // TIMEOUT + LAST_RESORT - whatever state the rest of the app is in.
+    let thread = hooks.thread();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(200));
+        if PROMPT.load(Ordering::Relaxed) != prompt || SINK.lock().is_none() {
+            break;
+        }
+        let now = now_ms();
+        let deadline = DEADLINE.load(Ordering::Relaxed);
+        if now > deadline + LAST_RESORT.as_millis() as u64 {
+            clear_sink(prompt);
+            win_hook::stop(thread);
+            break;
+        }
+        // Not while a chord is being saved: the answer to that ends or reopens the prompt.
+        if now > deadline && !HEARD.swap(true, Ordering::Relaxed) {
+            deliver(Heard::Cancel);
+        }
     });
-    let thread = rx.recv_timeout(Duration::from_millis(500)).ok().flatten()?;
-    Some(Capture { thread })
+    Some(Capture { prompt, _hooks: hooks })
 }
 
 #[cfg(test)]

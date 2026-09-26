@@ -128,7 +128,7 @@ Expected SHA-256:
 
 ```text
 73479b1a0fb7bbe5dd356ce068e2e4be81d0a8ff732876802bb2a4bb81ef110a  HucksVoiceToText-0.1.1-macOS-arm64-unsigned-beta.dmg
-29c1e7167d5fdfcd6e20076c38251e1ac8d6200c6127b0cc53846cd389e435f0  HucksVoiceToText-0.1.1-windows-x64-setup.exe
+3b873c17ef3ccbaab414052f8e3a812b7860220b8e0389f2cd12829b60911766  HucksVoiceToText-0.1.1-windows-x64-setup.exe
 ```
 
 ## Support

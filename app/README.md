@@ -6,9 +6,8 @@ you started in, and they are never lost.
 Everything runs on the machine. There is no account and no telemetry, and the only network
 connection is **Check for Updates**, made to GitHub when the user chooses it.
 
-**Status:** macOS on Apple silicon, public unsigned beta. Releases:
-https://github.com/Huckletsplay/hucks-voice-to-text/releases. Windows 10/11 builds from this source
-and runs; there is no Windows release yet.
+**Status:** public unsigned beta for macOS on Apple silicon and for Windows 10/11 (x64, AVX2).
+Releases: https://github.com/Huckletsplay/hucks-voice-to-text/releases
 
 ## Requirements
 
@@ -75,7 +74,7 @@ updater in `desktop/src/update.rs`.
 | Choose the clipboard | H › Settings › Clipboard: *Normal Clipboard — ⌘V* (default) or *Huck's Clipboard — Ctrl + Option + V* (Windows: Ctrl+V, or Ctrl + Alt + Shift + V). One or the other, never both |
 | Change a shortcut | H › Settings › Shortcuts, pick one, press the new keys (Esc cancels) |
 | Recovery drafts | H › Settings › Keep Recovery Drafts, and Open Drafts Folder |
-| Update | H › Settings › Check for Updates… — downloads a newer DMG from GitHub Releases, checks its SHA-256, then offers to open it |
+| Update | H › Settings › Check for Updates… — downloads this platform's newer release from GitHub (the DMG, or the Windows installer), checks its size and SHA-256, then offers to open it; on Windows the installer runs silently and starts the new copy |
 | Close the floating box | It leaves by itself; the × or `Esc` closes it early |
 
 Every setting lives in the menu-bar H (on Windows, the H in the notification area); there is no
@@ -162,8 +161,8 @@ Never inside this repository:
 | `dirs` | MIT / Apache-2.0 | OS app-data paths |
 | `thiserror` | MIT / Apache-2.0 | Error types |
 
-Whisper model weights are MIT, converted by the whisper.cpp project; the release DMG includes
-`ggml-base.en.bin`. Updates are fetched with the system's own `curl` and checked with `shasum`
+Whisper model weights are MIT, converted by the whisper.cpp project; the release DMG and the
+Windows installer include `ggml-base.en.bin`. Updates are fetched with the system's own `curl` and checked with `shasum`
 (Windows: `curl.exe` and `certutil`), so there is no HTTP or crypto crate. No code was copied from any third-party application.
 
 ## Licence

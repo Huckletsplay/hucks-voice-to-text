@@ -107,36 +107,99 @@ pub fn claim_single_instance() -> bool {
     }
 }
 
-/// The window he was working in, if the one in front now is somewhere he could be typing: not
-/// this program, and not the taskbar or its notification area.
-pub fn outside_foreground() -> Option<isize> {
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
-    let h = unsafe { GetForegroundWindow() };
+/// A window he was working in, with who owned it, so a closed window whose handle Windows has
+/// handed to someone else is never mistaken for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Remembered {
+    window: isize,
+    pid: u32,
+    thread: u32,
+}
+
+static LAST_OUTSIDE: parking_lot::Mutex<Option<Remembered>> = parking_lot::Mutex::new(None);
+
+fn identify(h: HWND) -> Option<Remembered> {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
     if h.0.is_null() {
         return None;
     }
     let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
-    let class = crate::destination::windows_paste::class_of(h.0 as isize);
+    let thread = unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    (thread != 0).then_some(Remembered { window: h.0 as isize, pid, thread })
+}
+
+/// Somewhere he could be typing: not this program, and not the taskbar, its notification area or
+/// the desktop.
+fn is_workplace(r: &Remembered) -> bool {
+    let class = crate::destination::windows_paste::class_of(r.window);
     let shell = matches!(
         class.as_str(),
         "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow"
             | "TopLevelWindowForOverflowXamlIsland" | "Progman" | "WorkerW"
     );
-    (pid != std::process::id() && !shell).then_some(h.0 as isize)
+    r.pid != std::process::id() && !shell
 }
 
-/// Hand the foreground back to the window he was in before he opened the H's menu.
+unsafe extern "system" fn on_foreground(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    _event: u32,
+    window: HWND,
+    _object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if let Some(r) = identify(window).filter(is_workplace) {
+        *LAST_OUTSIDE.lock() = Some(r);
+    }
+}
+
+/// Once, at startup, on the window thread: follow which window he is working in.
+///
+/// Windows' own foreground notification - the one screen readers use - not an input hook: it
+/// says only which window came to the front. Opening the H's menu brings the taskbar and then
+/// this program to the front; both are skipped, so what is remembered is where he actually was.
+pub fn follow_foreground() {
+    use windows::Win32::UI::Accessibility::SetWinEventHook;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    };
+    unsafe {
+        if let Some(r) = identify(GetForegroundWindow()).filter(is_workplace) {
+            *LAST_OUTSIDE.lock() = Some(r);
+        }
+        let _ = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(on_foreground),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+    }
+}
+
+/// The window he was last working in - taken, so it is used once. Handing it the foreground
+/// makes Windows report it again, which remembers it afresh.
+pub fn take_last_workplace() -> Option<Remembered> {
+    LAST_OUTSIDE.lock().take()
+}
+
+/// Hand the foreground back to the window he was in before he opened the H's menu - only if it is
+/// still that window, owned by the same process and thread.
 ///
 /// Opening a tray menu makes Windows put the program's own hidden window in front, and it stays
 /// there after the menu closes. With it in front, the shortcut prompt heard no keys until he
 /// clicked into another window (found 2026-09-26, from a recording), and Start Dictation from
 /// the menu had nothing to aim at. Giving the foreground straight back does what his click did.
-pub fn give_back_foreground(to: isize) {
+/// (Codex's review, 2026-09-26: the first version remembered the window under the pointer when it
+/// reached the H, which Alt+Tab could leave out of date, and trusted a bare handle.)
+pub fn give_back_foreground(to: Remembered) {
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-    let h = HWND(to as *mut _);
+    let h = HWND(to.window as *mut _);
     unsafe {
-        if IsWindow(Some(h)).as_bool() {
+        if IsWindow(Some(h)).as_bool() && identify(h) == Some(to) {
             let _ = SetForegroundWindow(h);
         }
     }

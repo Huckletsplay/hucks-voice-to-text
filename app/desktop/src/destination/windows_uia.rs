@@ -98,7 +98,7 @@ unsafe impl Sync for UiaElement {}
 pub fn capture(stamp: &FocusStamp) -> Result<UiaElement, String> {
     let uia = automation()?;
     let element = unsafe { uia.GetFocusedElement() }.map_err(|_| "nothing-focused".to_string())?;
-    if let Some(why) = stamp.moved() {
+    if let Some(why) = stamp.moved_since_keypress() {
         return Err(format!("moved-before-capture:{why}"));
     }
     if unsafe { element.CurrentProcessId() }.ok() == Some(std::process::id() as i32) {
@@ -111,9 +111,12 @@ pub fn capture(stamp: &FocusStamp) -> Result<UiaElement, String> {
 pub fn validate_captured(captured: UiaElement, app: String) -> Result<UiaDestination, String> {
     let element = captured.element;
     unsafe {
-        // Never dictate into a password box. Checked first, before anything else.
-        if element.CurrentIsPassword().map(|b| b.as_bool()).unwrap_or(false) {
-            return Err("secure-field".into());
+        // Never dictate into a password box. Checked first, and closed on doubt: a field that
+        // cannot say whether it is one is not written to, silently or by paste.
+        match password_box(&element) {
+            Some(false) => {}
+            Some(true) => return Err("secure-field".into()),
+            None => return Err("password-unknown".into()),
         }
         let role = element.CurrentControlType().map_err(|_| "element-unreachable".to_string())?;
         if role != UIA_EditControlTypeId && role != UIA_DocumentControlTypeId {
@@ -137,6 +140,12 @@ pub fn validate_captured(captured: UiaElement, app: String) -> Result<UiaDestina
             paste: None,
         })
     }
+}
+
+/// Is this a password box? `None` when UI Automation will not say - which is treated as yes
+/// (Codex's review, 2026-09-26: an error used to count as "no").
+fn password_box(element: &IUIAutomationElement) -> Option<bool> {
+    unsafe { element.CurrentIsPassword() }.ok().map(|b| b.as_bool())
 }
 
 /// Classic Win32 text controls that take `EM_REPLACESEL` - Notepad's is `Edit` on Windows 10 and
@@ -263,9 +272,12 @@ impl Destination for UiaDestination {
 
     fn deliver(&self, text: &str) -> Result<(), DeliveryError> {
         let _ = automation();
-        // Re-check immediately before writing: a field can become a password box.
-        if unsafe { self.element.CurrentIsPassword() }.map(|b| b.as_bool()).unwrap_or(false) {
-            return Err(DeliveryError::RefusedSecureField);
+        // Re-check immediately before writing: a field can become a password box. Closed on
+        // doubt here too - and then not even the paste rung is tried.
+        match password_box(&self.element) {
+            Some(false) => {}
+            Some(true) => return Err(DeliveryError::RefusedSecureField),
+            None => return Err(DeliveryError::DestinationLost),
         }
 
         let before = self.value().unwrap_or_default();

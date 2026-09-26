@@ -154,6 +154,7 @@ pub mod huck {
         CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
         GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
+    use windows::Win32::Graphics::Gdi::{GetEnhMetaFileBits, SetEnhMetaFileBits, HENHMETAFILE};
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
 
     static HELD: Mutex<Option<String>> = Mutex::new(None);
@@ -204,10 +205,38 @@ pub mod huck {
         }
     }
 
-    /// Formats whose data is a GDI handle rather than memory. Windows rebuilds the common ones
-    /// (a bitmap from its DIB) by itself, so they are left out rather than copied wrongly.
-    fn is_gdi(format: u32) -> bool {
-        matches!(format, 2 | 3 | 9 | 14 | 0x80 | 0x82 | 0x83 | 0x8E | 0x300..=0x3FF)
+    const CF_BITMAP: u32 = 2;
+    const CF_METAFILEPICT: u32 = 3;
+    const CF_DIB: u32 = 8;
+    const CF_PALETTE: u32 = 9;
+    const CF_ENHMETAFILE: u32 = 14;
+    const CF_DIBV5: u32 = 17;
+
+    /// How one clipboard format can be carried across a borrow.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Carry {
+        /// Plain memory, copied byte for byte.
+        Memory,
+        /// An enhanced metafile: a GDI handle, carried as its bytes.
+        Metafile,
+        /// A GDI handle Windows makes again by itself from another format being kept (a bitmap
+        /// from its DIB, a metafile picture from its enhanced metafile).
+        Rebuilt,
+        /// A handle that cannot be copied at all - owner-drawn or private GDI data. Its presence
+        /// stops the borrow before anything is touched.
+        Impossible,
+    }
+
+    fn carry(format: u32, present: &[u32]) -> Carry {
+        let has = |f: u32| present.contains(&f);
+        match format {
+            CF_ENHMETAFILE => Carry::Metafile,
+            CF_BITMAP | CF_PALETTE if has(CF_DIB) || has(CF_DIBV5) => Carry::Rebuilt,
+            CF_METAFILEPICT if has(CF_ENHMETAFILE) => Carry::Rebuilt,
+            CF_BITMAP | CF_PALETTE | CF_METAFILEPICT => Carry::Impossible,
+            0x80 | 0x82 | 0x83 | 0x8E | 0x300..=0x3FF => Carry::Impossible,
+            _ => Carry::Memory,
+        }
     }
 
     fn global_from(bytes: &[u8]) -> Option<HGLOBAL> {
@@ -223,11 +252,19 @@ pub mod huck {
         }
     }
 
+    /// Put one format on the (open, emptied) clipboard. True only if Windows took it.
     fn put(format: u32, bytes: &[u8]) -> bool {
-        match global_from(bytes) {
-            // Once set, the memory belongs to the clipboard.
-            Some(memory) => unsafe { SetClipboardData(format, Some(HANDLE(memory.0))) }.is_ok(),
-            None => false,
+        unsafe {
+            if format == CF_ENHMETAFILE {
+                let metafile = SetEnhMetaFileBits(bytes);
+                return !metafile.is_invalid()
+                    && SetClipboardData(format, Some(HANDLE(metafile.0))).is_ok();
+            }
+            match global_from(bytes) {
+                // Once set, the memory belongs to the clipboard.
+                Some(memory) => SetClipboardData(format, Some(HANDLE(memory.0))).is_ok(),
+                None => false,
+            }
         }
     }
 
@@ -235,33 +272,74 @@ pub mod huck {
         text.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect()
     }
 
-    /// Everything on the normal clipboard, every format, as plain bytes - so an image or a copied
-    /// file comes back exactly as it was, not just its text.
-    pub fn snapshot_general() -> Vec<(u32, Vec<u8>)> {
-        let Some(_open) = Open::new() else { return Vec::new() };
-        let mut items = Vec::new();
+    fn memory_bytes(format: u32) -> Result<Vec<u8>, String> {
+        let unreadable = || format!("clipboard format {format:#x} could not be read");
+        unsafe {
+            let memory = HGLOBAL(GetClipboardData(format).map_err(|_| unreadable())?.0);
+            let size = GlobalSize(memory);
+            if size == 0 {
+                return Ok(Vec::new());
+            }
+            let source = GlobalLock(memory) as *const u8;
+            if source.is_null() {
+                return Err(unreadable());
+            }
+            let bytes = std::slice::from_raw_parts(source, size).to_vec();
+            let _ = GlobalUnlock(memory);
+            Ok(bytes)
+        }
+    }
+
+    fn metafile_bytes() -> Result<Vec<u8>, String> {
+        let unreadable = || "the copied picture could not be read".to_string();
+        unsafe {
+            let metafile = HENHMETAFILE(GetClipboardData(CF_ENHMETAFILE).map_err(|_| unreadable())?.0);
+            let size = GetEnhMetaFileBits(metafile, None);
+            if size == 0 {
+                return Err(unreadable());
+            }
+            let mut bytes = vec![0u8; size as usize];
+            if GetEnhMetaFileBits(metafile, Some(&mut bytes)) != size {
+                return Err(unreadable());
+            }
+            Ok(bytes)
+        }
+    }
+
+    /// Everything on the normal clipboard, every format, as bytes - so an image or a copied file
+    /// comes back exactly as it was, not just its text.
+    ///
+    /// All or nothing. A busy clipboard, an unreadable format, or one that cannot be copied is an
+    /// error, and then the clipboard is not borrowed at all (Codex's review, 2026-09-26: the first
+    /// version returned whatever it could, and a borrow could then wipe the rest).
+    pub fn snapshot_general() -> Result<Vec<(u32, Vec<u8>)>, String> {
+        let _open = Open::new().ok_or("the clipboard is busy")?;
+        let mut formats = Vec::new();
         let mut format = 0u32;
         loop {
             format = unsafe { EnumClipboardFormats(format) };
             if format == 0 {
                 break;
             }
-            if is_gdi(format) {
-                continue;
-            }
-            unsafe {
-                let Ok(handle) = GetClipboardData(format) else { continue };
-                let memory = HGLOBAL(handle.0);
-                let size = GlobalSize(memory);
-                let source = GlobalLock(memory) as *const u8;
-                if source.is_null() {
-                    continue;
+            formats.push(format);
+        }
+        let mut items = Vec::new();
+        for &format in &formats {
+            match carry(format, &formats) {
+                Carry::Rebuilt => {}
+                Carry::Impossible => {
+                    return Err(format!("clipboard format {format:#x} cannot be copied"))
                 }
-                items.push((format, std::slice::from_raw_parts(source, size).to_vec()));
-                let _ = GlobalUnlock(memory);
+                Carry::Metafile => items.push((format, metafile_bytes()?)),
+                Carry::Memory => items.push((format, memory_bytes(format)?)),
             }
         }
-        items
+        Ok(items)
+    }
+
+    /// Put a snapshot back onto the open, emptied clipboard. True only if every format went back.
+    fn restore(items: &[(u32, Vec<u8>)]) -> bool {
+        items.iter().fold(true, |ok, (format, bytes)| put(*format, bytes) && ok)
     }
 
     /// What the normal clipboard holds as text, if anything.
@@ -288,43 +366,50 @@ pub mod huck {
         ours: u32,
     }
 
-    /// Put `text` on the normal clipboard for a moment, remembering what was there. A paste into
-    /// an app like VS Code can only come from the normal clipboard.
+    /// Put `text` on the normal clipboard for a moment, remembering exactly what was there. A
+    /// paste into an app like VS Code can only come from the normal clipboard.
     ///
-    /// Marked so Windows' clipboard history (Win+V) does not keep the borrowed copy - it is his
-    /// words on loan for half a second, not something he copied.
-    pub fn borrow_general(text: &str) -> Option<Borrowed> {
-        let items = snapshot_general();
+    /// Refused - with the clipboard untouched - unless all of it could be remembered. Marked so
+    /// Windows' clipboard history (Win+V) does not keep the borrowed copy: it is his words on loan
+    /// for half a second, not something he copied.
+    pub fn borrow_general(text: &str) -> Result<Borrowed, String> {
+        let items = snapshot_general()?;
         {
-            let _open = Open::new()?;
-            unsafe {
-                EmptyClipboard().ok()?;
-                if !put(CF_UNICODETEXT, &utf16z(text)) {
-                    return None;
-                }
-                let private = RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
-                if private != 0 {
-                    let _ = put(private, &[0]);
-                }
+            let _open = Open::new().ok_or("the clipboard is busy")?;
+            unsafe { EmptyClipboard() }.map_err(|_| "the clipboard could not be emptied")?;
+            if !put(CF_UNICODETEXT, &utf16z(text)) {
+                // Put his things straight back rather than leave the clipboard empty.
+                restore(&items);
+                return Err("the clipboard refused the text".into());
+            }
+            let private = unsafe { RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing")) };
+            if private != 0 {
+                let _ = put(private, &[0]);
             }
         }
         // Read only once the clipboard is closed: closing it is itself a change Windows counts.
-        Some(Borrowed { items, ours: unsafe { GetClipboardSequenceNumber() } })
+        Ok(Borrowed { items, ours: unsafe { GetClipboardSequenceNumber() } })
     }
 
     impl Borrowed {
         /// Put his clipboard back - unless he copied something new in the meantime, which wins.
-        pub fn give_back(self) {
+        /// True when his clipboard is as it was (or newer); false if any of it could not go back.
+        pub fn give_back(self) -> bool {
             if unsafe { GetClipboardSequenceNumber() } != self.ours {
-                return;
+                return true;
             }
-            let Some(_open) = Open::new() else { return };
-            unsafe {
-                let _ = EmptyClipboard();
+            let Some(_open) = Open::new() else {
+                eprintln!("[hvtt] the clipboard stayed busy; the borrowed words are still on it");
+                return false;
+            };
+            if unsafe { EmptyClipboard() }.is_err() {
+                return false;
             }
-            for (format, bytes) in &self.items {
-                put(*format, bytes);
+            let ok = restore(&self.items);
+            if !ok {
+                eprintln!("[hvtt] part of the clipboard could not be put back");
             }
+            ok
         }
     }
 
@@ -333,18 +418,128 @@ pub mod huck {
         use super::*;
 
         #[test]
-        fn gdi_handle_formats_are_not_copied_as_memory() {
-            for format in [2, 3, 9, 14, 0x80, 0x300, 0x3FF] {
-                assert!(is_gdi(format), "{format:#x}");
-            }
-            for format in [1, 8, 13, 15, 17, 0xC0FF] {
-                assert!(!is_gdi(format), "{format:#x} is plain memory");
+        fn handles_that_cannot_be_copied_stop_the_borrow() {
+            assert_eq!(carry(0x80, &[0x80]), Carry::Impossible, "owner-drawn");
+            assert_eq!(carry(0x300, &[0x300]), Carry::Impossible, "private GDI");
+            assert_eq!(carry(CF_BITMAP, &[CF_BITMAP]), Carry::Impossible, "a bitmap with no DIB");
+            assert_eq!(carry(CF_METAFILEPICT, &[CF_METAFILEPICT]), Carry::Impossible);
+        }
+
+        #[test]
+        fn pictures_travel_as_something_windows_can_rebuild() {
+            assert_eq!(carry(CF_BITMAP, &[CF_BITMAP, CF_DIB]), Carry::Rebuilt);
+            assert_eq!(carry(CF_METAFILEPICT, &[CF_METAFILEPICT, CF_ENHMETAFILE]), Carry::Rebuilt);
+            assert_eq!(carry(CF_ENHMETAFILE, &[CF_ENHMETAFILE]), Carry::Metafile);
+            for format in [1, CF_DIB, 13, 15, CF_DIBV5, 0xC0FF] {
+                assert_eq!(carry(format, &[format]), Carry::Memory, "{format:#x}");
             }
         }
 
         #[test]
         fn text_goes_on_as_nul_terminated_utf16() {
             assert_eq!(utf16z("Hi"), vec![b'H', 0, b'i', 0, 0, 0]);
+        }
+
+        const CF_HDROP: u32 = 15;
+
+        /// A DROPFILES list naming one file, as Explorer puts it on the clipboard.
+        fn copied_file(path: &str) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for field in [20u32, 0, 0, 0, 1] {
+                bytes.extend(field.to_le_bytes()); // pFiles, pt.x, pt.y, fNC, fWide
+            }
+            bytes.extend(path.encode_utf16().chain([0, 0]).flat_map(u16::to_le_bytes));
+            bytes
+        }
+
+        /// A 2 x 2, 32-bit DIB.
+        fn picture() -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend(40u32.to_le_bytes()); // biSize
+            bytes.extend(2i32.to_le_bytes()); // biWidth
+            bytes.extend(2i32.to_le_bytes()); // biHeight
+            bytes.extend(1u16.to_le_bytes()); // biPlanes
+            bytes.extend(32u16.to_le_bytes()); // biBitCount
+            bytes.extend([0u8; 24]); // compression, size, resolution, colours
+            bytes.extend([0x10, 0x20, 0x30, 0xFF].repeat(4));
+            bytes
+        }
+
+        fn sorted(mut items: Vec<(u32, Vec<u8>)>) -> Vec<(u32, Vec<u8>)> {
+            items.sort();
+            items
+        }
+
+        /// Borrows his real clipboard and puts it back. Run on purpose:
+        /// `scripts\dev.ps1 test --ignored clip::huck`.
+        #[test]
+        #[ignore]
+        fn every_kind_of_copy_comes_back_from_a_borrow() {
+            let his = snapshot_general().expect("his clipboard can be read");
+            let html = unsafe { RegisterClipboardFormatW(w!("HTML Format")) };
+            {
+                let _open = Open::new().expect("clipboard");
+                unsafe { EmptyClipboard() }.expect("emptied");
+                assert!(put(CF_UNICODETEXT, &utf16z("plain words")));
+                assert!(put(html, b"Version:0.9\r\n<b>bold words</b>\0"));
+                assert!(put(CF_HDROP, &copied_file(r"C:\Windows\win.ini")));
+                assert!(put(CF_DIB, &picture()));
+            }
+            let before = snapshot_general().expect("text, HTML, a file and a picture read back");
+            let borrowed = borrow_general("borrowed for a paste").expect("borrowed");
+            let during = general_text();
+            let back = borrowed.give_back();
+            let after = snapshot_general().expect("read after");
+            {
+                let _open = Open::new().expect("clipboard");
+                unsafe { EmptyClipboard() }.expect("emptied");
+                assert!(restore(&his), "his own clipboard went back");
+            }
+            assert_eq!(during.as_deref(), Some("borrowed for a paste"));
+            assert!(back, "every format went back");
+            for format in [CF_UNICODETEXT, html, CF_HDROP, CF_DIB] {
+                assert!(after.iter().any(|(f, _)| *f == format), "{format:#x} came back");
+            }
+            assert_eq!(sorted(after), sorted(before), "byte for byte");
+        }
+
+        /// Another program holds the clipboard for a few seconds, the way programs do: from its own
+        /// window. Measured 2026-09-26: a clipboard opened with *no* owner window locks nobody
+        /// out, in this process or any other, so a holder without a window would prove nothing.
+        #[test]
+        #[ignore]
+        fn a_busy_clipboard_is_never_borrowed() {
+            let before = snapshot_general().expect("his clipboard can be read");
+            let marker = std::env::temp_dir().join(format!("hvtt-clip-held-{}", std::process::id()));
+            let _ = std::fs::remove_file(&marker);
+            let script = format!(
+                "Add-Type -AssemblyName System.Windows.Forms; \
+                 Add-Type -Name C -Namespace H -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool OpenClipboard(IntPtr h); [DllImport(\"user32.dll\")] public static extern bool CloseClipboard();'; \
+                 $f = New-Object System.Windows.Forms.Form; \
+                 if ([H.C]::OpenClipboard($f.Handle)) {{ New-Item -ItemType File -Path '{}' | Out-Null; Start-Sleep -Milliseconds 3000; [void][H.C]::CloseClipboard() }}",
+                marker.display()
+            );
+            let mut holder = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .spawn()
+                .expect("a second program starts");
+            let started = std::time::Instant::now();
+            while !marker.exists() && started.elapsed() < std::time::Duration::from_secs(20) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let held = marker.exists();
+            let tried = if held { Some(borrow_general("must land nowhere")) } else { None };
+            let _ = holder.wait();
+            let _ = std::fs::remove_file(&marker);
+            // Whatever happened, his clipboard goes back before anything is judged.
+            let mut leaked = false;
+            if let Some(Ok(borrowed)) = tried {
+                leaked = true;
+                borrowed.give_back();
+            }
+            assert!(held, "the other program never got hold of the clipboard");
+            assert!(!leaked, "a busy clipboard was borrowed");
+            assert_eq!(snapshot_general().expect("read after"), before, "and nothing changed");
         }
     }
 }
