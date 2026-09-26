@@ -167,6 +167,53 @@ fn windows_delivery_paste_lands_at_once_with_ctrl_alt_still_held() {
     }
 }
 
+/// Open Edge on a page whose only field is focused, in a throwaway InPrivate profile (a fresh
+/// normal profile pops up a sync panel that takes the focus), and ask what the program asks
+/// before pasting into a browser: is that a password box?
+fn browser_field_is_password(name: &str, field: &str) -> Option<bool> {
+    let edge = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
+    let dir = std::env::temp_dir().join(format!("hvtt-edge-{}-{name}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let page = dir.join("field.html");
+    std::fs::write(&page, format!("<!doctype html><title>field</title>{field}")).unwrap();
+    let previous = unsafe { GetForegroundWindow() };
+    let mut browser = Command::new(edge)
+        .arg(format!("--user-data-dir={}", dir.join("profile").display()))
+        .args(["--no-first-run", "--no-default-browser-check", "--inprivate", "--new-window"])
+        .arg(format!("file:///{}", page.display().to_string().replace('\\', "/")))
+        .spawn()
+        .expect("Edge starts");
+    let answer = std::panic::catch_unwind(|| {
+        let window = window_of(browser.id()).expect("Edge shows a window");
+        bring_forward(window);
+        std::thread::sleep(Duration::from_millis(1500)); // the page loads and the field takes focus
+        let stamp = FocusStamp::capture().expect("Edge is in front");
+        windows_uia::focused_is_password(&stamp)
+    });
+    let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &browser.id().to_string()]).output();
+    let _ = browser.wait();
+    bring_forward(previous);
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = std::fs::remove_dir_all(&dir);
+    answer.unwrap_or(None)
+}
+
+#[test]
+#[ignore]
+fn windows_delivery_a_browser_password_box_is_recognised_before_any_paste() {
+    // Codex's second review: Chrome and Edge went straight to the paste. Now the paste waits for
+    // UI Automation to say "not a password box".
+    let password = browser_field_is_password("password", "<input type=password autofocus>");
+    let text = browser_field_is_password("text", "<input type=text autofocus>");
+    let composer = browser_field_is_password(
+        "composer",
+        "<div contenteditable=true id=c style='min-height:40px'>x</div><script>c.focus()</script>",
+    );
+    assert_eq!(password, Some(true), "a password box is seen as one");
+    assert_eq!(text, Some(false), "an ordinary box is not");
+    assert_eq!(composer, Some(false), "nor is a chat composer (contenteditable)");
+}
+
 #[test]
 #[ignore]
 fn windows_delivery_is_refused_after_the_window_closes() {

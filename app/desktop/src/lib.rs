@@ -322,6 +322,9 @@ fn bind_all(app: &AppHandle) {
     let state: State<App> = app.state();
     let _ = app.global_shortcut().unregister_all();
     let s = state.settings.lock().clone();
+    // The paste gate exempts this key's auto-repeat, and no other key's.
+    #[cfg(windows)]
+    platform_paste::set_trigger_key(&s.shortcut);
     let dictate = register_shortcut(app, &s.shortcut, Action::Dictate).err();
     // Only with Huck's clipboard: on the normal one, Cmd+V already does the job.
     let paste = match s.clipboard {
@@ -976,20 +979,44 @@ fn resolve_pin_windows(
     let borrow = state.settings.lock().clipboard == ClipboardChoice::Huck;
     let paste = || PasteDestination::new(stamp.clone(), app_label.clone(), borrow);
 
-    // The extension is the only silent way into Chrome.
+    let unsure = || {
+        PinError::Other("Huck couldn't tell if that's a password box, so it will only copy the words.".into())
+    };
+
+    // The extension is the only silent way into Chrome - and its "that's a password box" is final.
     if is_chromium_executable(&exe) {
-        if let Some(Ok(d)) = browser {
-            set(Box::new(d));
-            return;
+        match browser {
+            Some(Ok(d)) => {
+                set(Box::new(d));
+                return;
+            }
+            Some(Err(ref why)) if why == "secure-field" => {
+                note(PinError::SecureField);
+                return;
+            }
+            _ => {}
         }
     } else if let Some(Ok(_)) = browser {
         // Not our destination; release it so the extension is not left holding a field.
         release_browser();
     }
 
-    // Chromium and Electron windows are never asked for their accessibility tree: they have no
-    // native fields to write, and asking flips some (VS Code) into screen-reader mode. Paste.
-    if stamp.is_chromium_window() || is_chromium_executable(&exe) || is_unsupported_executable(&exe).is_some() {
+    // A browser without the extension: a paste, but only once UI Automation has said the field
+    // is not a password box - yes or no answer, only the copy. Browsers can be asked without side
+    // effects. (Decided with him 2026-09-26, from Codex's second review.)
+    if is_chromium_executable(&exe) {
+        match windows_uia::focused_is_password(&stamp) {
+            Some(false) => set(Box::new(paste())),
+            Some(true) => note(PinError::SecureField),
+            None => note(unsure()),
+        }
+        return;
+    }
+
+    // Desktop apps built on Chromium (VS Code, Slack, Discord, the Claude and ChatGPT apps) are
+    // never asked: asking flips VS Code into screen-reader mode. Their only password boxes are
+    // login screens, and he chose to keep the paste here. Gated, like every paste.
+    if stamp.is_chromium_window() || is_unsupported_executable(&exe).is_some() {
         set(Box::new(paste()));
         return;
     }
@@ -998,9 +1025,7 @@ fn resolve_pin_windows(
         Ok(d) => set(Box::new(d.with_paste_fallback(Some(paste())))),
         Err(reason) if reason == "secure-field" => note(PinError::SecureField),
         // Could not tell whether it is a password box: no write and no paste, only the copy.
-        Err(reason) if reason == "password-unknown" => note(PinError::Other(
-            "Huck couldn't tell if that's a password box, so it will only copy the words.".into(),
-        )),
+        Err(reason) if reason == "password-unknown" => note(unsure()),
         // Nothing UI Automation could write: paste, gated. That includes focus having moved
         // before the capture landed - the gate then refuses at delivery, just as it would had he
         // moved later, and the words wait on the clipboard.

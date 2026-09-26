@@ -149,7 +149,10 @@ pub mod huck {
 pub mod huck {
     use parking_lot::Mutex;
     use windows::core::w;
-    use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+    use windows::Win32::Foundation::{GetLastError, SetLastError, HANDLE, HGLOBAL, HWND, WIN32_ERROR};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+    };
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
         GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
@@ -185,23 +188,51 @@ pub mod huck {
 
     /// The Windows clipboard, open for as long as this lives. Another program may hold it for a
     /// moment, so opening retries briefly rather than failing the paste.
-    struct Open;
+    ///
+    /// Opened from a hidden window of our own, made on this thread for the purpose: a clipboard
+    /// opened with no window locks nobody out (measured 2026-09-26), so another program could
+    /// change it between reading it and replacing it. With a window, others are refused until it
+    /// closes.
+    struct Open {
+        owner: HWND,
+    }
 
     impl Open {
         fn new() -> Option<Open> {
+            let owner = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    None,
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .ok()?;
             for _ in 0..20 {
-                if unsafe { OpenClipboard(None) }.is_ok() {
-                    return Some(Open);
+                if unsafe { OpenClipboard(Some(owner)) }.is_ok() {
+                    return Some(Open { owner });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            let _ = unsafe { DestroyWindow(owner) };
             None
         }
     }
 
     impl Drop for Open {
         fn drop(&mut self) {
-            let _ = unsafe { CloseClipboard() };
+            unsafe {
+                let _ = CloseClipboard();
+                let _ = DestroyWindow(self.owner);
+            }
         }
     }
 
@@ -314,11 +345,21 @@ pub mod huck {
     /// version returned whatever it could, and a borrow could then wipe the rest).
     pub fn snapshot_general() -> Result<Vec<(u32, Vec<u8>)>, String> {
         let _open = Open::new().ok_or("the clipboard is busy")?;
+        read_all()
+    }
+
+    /// Every format on the clipboard, which the caller has open.
+    fn read_all() -> Result<Vec<(u32, Vec<u8>)>, String> {
         let mut formats = Vec::new();
         let mut format = 0u32;
         loop {
+            unsafe { SetLastError(WIN32_ERROR(0)) };
             format = unsafe { EnumClipboardFormats(format) };
             if format == 0 {
+                // The end of the list, or a failure part-way through - which is not a snapshot.
+                if unsafe { GetLastError() } != WIN32_ERROR(0) {
+                    return Err("the clipboard's formats could not be listed".into());
+                }
                 break;
             }
             formats.push(format);
@@ -372,10 +413,15 @@ pub mod huck {
     /// Refused - with the clipboard untouched - unless all of it could be remembered. Marked so
     /// Windows' clipboard history (Win+V) does not keep the borrowed copy: it is his words on loan
     /// for half a second, not something he copied.
+    ///
+    /// Read, emptied and replaced under one open (Codex's second review, 2026-09-26: between two
+    /// opens another program could copy something new, which the borrow then replaced and never
+    /// put back).
     pub fn borrow_general(text: &str) -> Result<Borrowed, String> {
-        let items = snapshot_general()?;
+        let items;
         {
             let _open = Open::new().ok_or("the clipboard is busy")?;
+            items = read_all()?;
             unsafe { EmptyClipboard() }.map_err(|_| "the clipboard could not be emptied")?;
             if !put(CF_UNICODETEXT, &utf16z(text)) {
                 // Put his things straight back rather than leave the clipboard empty.
@@ -501,6 +547,30 @@ pub mod huck {
                 assert!(after.iter().any(|(f, _)| *f == format), "{format:#x} came back");
             }
             assert_eq!(sorted(after), sorted(before), "byte for byte");
+        }
+
+        /// While Huck has the clipboard open, another program cannot open it - so nothing can
+        /// change between reading it and replacing it.
+        #[test]
+        #[ignore]
+        fn while_huck_holds_the_clipboard_nobody_else_can_open_it() {
+            let result = std::env::temp_dir().join(format!("hvtt-clip-try-{}", std::process::id()));
+            let _ = std::fs::remove_file(&result);
+            let script = format!(
+                "Add-Type -Name C -Namespace H -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool OpenClipboard(IntPtr h); [DllImport(\"user32.dll\")] public static extern bool CloseClipboard();'; \
+                 $ok = [H.C]::OpenClipboard([IntPtr]::Zero); if ($ok) {{ [void][H.C]::CloseClipboard() }}; Set-Content -Path '{}' -Value $ok",
+                result.display()
+            );
+            let other = {
+                let _open = Open::new().expect("Huck opens the clipboard");
+                std::process::Command::new("powershell")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                    .status()
+                    .expect("a second program runs");
+                std::fs::read_to_string(&result).unwrap_or_default()
+            };
+            let _ = std::fs::remove_file(&result);
+            assert_eq!(other.trim(), "False", "another program opened the clipboard Huck was holding");
         }
 
         /// Another program holds the clipboard for a few seconds, the way programs do: from its own

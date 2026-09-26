@@ -32,7 +32,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
-    UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_ValuePatternId, UIA_CONTROLTYPE_ID,
+    UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_PaneControlTypeId, UIA_ValuePatternId,
+    UIA_CONTROLTYPE_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_GETTEXT, WM_GETTEXTLENGTH,
@@ -140,6 +141,31 @@ pub fn validate_captured(captured: UiaElement, app: String) -> Result<UiaDestina
             paste: None,
         })
     }
+}
+
+/// Is the focused field in a browser a password box? For browsers, whose fields are not native
+/// controls and get no silent write, so this is all UI Automation is asked. `None` when it cannot
+/// say - including when anything moved since the keypress.
+///
+/// Measured in Edge, 2026-09-26: a password input is always an Edit with IsPassword set; text
+/// inputs and textareas are Edits without it; a contenteditable composer (ChatGPT's, Claude's) is
+/// a Group and a page with no field a Document - neither can be a password input. Until the
+/// browser has built its accessibility tree, which the first question switches on, the focused
+/// element is the page's Pane; so a Pane is asked again for up to a second, and then counts as
+/// "cannot say".
+pub fn focused_is_password(stamp: &FocusStamp) -> Option<bool> {
+    for _ in 0..8 {
+        let captured = capture(stamp).ok()?;
+        let role = unsafe { captured.element.CurrentControlType() }.ok()?;
+        if role == UIA_EditControlTypeId {
+            return password_box(&captured.element);
+        }
+        if role != UIA_PaneControlTypeId {
+            return Some(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(125));
+    }
+    None
 }
 
 /// Is this a password box? `None` when UI Automation will not say - which is treated as yes

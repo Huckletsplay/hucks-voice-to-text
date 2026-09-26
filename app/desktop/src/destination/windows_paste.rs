@@ -13,10 +13,16 @@
 //! They count; they record nothing about which keys were pressed.
 //!
 //! **Exactly one key may be pressed between the keypress and delivery: the one that stopped the
-//! dictation.** Keys already held at the start (the shortcut's own auto-repeat) and modifiers are
-//! not counted, so that press is always exactly one. Any other key - an arrow, a letter,
-//! Backspace, Enter - may have moved the caret, and refuses the paste; so does none at all, which
-//! means the count was not running (Codex's review, 2026-09-26: the first version allowed three).
+//! dictation.** Modifiers are not counted, and neither is the auto-repeat of the dictation
+//! shortcut's own key still held from the start - that key only. Any other key - an arrow, a
+//! letter, Backspace, Enter - may have moved the caret, and refuses the paste; so does any other
+//! key already held when the dictation starts (its auto-repeat would move the caret unseen), and
+//! so does no key at all, which means the count was not running. (Codex's reviews, 2026-09-26: the
+//! first version allowed three keys; the second exempted every key held at the start.)
+//!
+//! What remains unseen: a key pressed *and* released in the few milliseconds between the shortcut
+//! and the hooks going in. Keeping the hooks resident would close that too, at the price of a
+//! permanent keyboard hook - which Snip 'n' Clip also declined.
 //!
 //! The paste is instant, even with the shortcut's keys still held: see `paste_keys`.
 //!
@@ -50,6 +56,36 @@ static CLICKS: AtomicU32 = AtomicU32::new(0);
 static KEYS: AtomicU32 = AtomicU32::new(0);
 /// Keys currently held, so auto-repeat is not counted as typing.
 static HELD: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+
+/// The virtual key of the dictation shortcut's own key (Space for Alt+Space); 0 if unknown.
+static TRIGGER: AtomicU32 = AtomicU32::new(0);
+
+/// Tell the gate which key starts and stops dictation, from its accelerator (`Alt+Space`).
+pub fn set_trigger_key(accelerator: &str) {
+    let key = accelerator.rsplit('+').next().unwrap_or("").trim();
+    let key = key.strip_prefix("Key").or_else(|| key.strip_prefix("Digit")).unwrap_or(key);
+    let vk = (0..=255u32)
+        .find(|vk| crate::win_shortcut::key_name(*vk).is_some_and(|n| n.eq_ignore_ascii_case(key)))
+        .unwrap_or(0);
+    TRIGGER.store(vk, Ordering::Relaxed);
+}
+
+/// Mouse buttons also answer GetAsyncKeyState; they are the mouse hook's business, not typing.
+fn is_mouse_button(vk: u32) -> bool {
+    matches!(vk, 0x01 | 0x02 | 0x04 | 0x05 | 0x06)
+}
+
+/// Is any key other than modifiers, mouse buttons and the dictation shortcut's own key held down
+/// right now?
+fn other_key_held() -> bool {
+    let trigger = TRIGGER.load(Ordering::Relaxed);
+    (1..=255u32).any(|vk| {
+        !is_modifier(vk)
+            && !is_mouse_button(vk)
+            && vk != trigger
+            && unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
+    })
+}
 
 /// The running hook thread, shared by every stamp of the current dictation.
 static WATCH: Mutex<Weak<Watch>> = Mutex::new(Weak::new());
@@ -117,11 +153,13 @@ unsafe extern "system" fn on_mouse(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     CallNextHookEx(None, code, wparam, lparam)
 }
 
-/// Runs on the hook thread with the hooks in: whatever is held now - the start chord, still
-/// under his fingers - is marked held, so its auto-repeat is not counted as typing.
+/// Runs on the hook thread with the hooks in. Only the dictation shortcut's own key, if it is
+/// still under his fingers, is marked held, so its auto-repeat is not counted as typing. Any other
+/// key is marked up: its next repeat counts, like a fresh press.
 fn mark_held_keys() {
+    let trigger = TRIGGER.load(Ordering::Relaxed) as usize;
     for (vk, held) in HELD.iter().enumerate() {
-        let down = unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 };
+        let down = vk == trigger && unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 };
         held.store(down, Ordering::Relaxed);
     }
 }
@@ -181,6 +219,8 @@ pub struct FocusStamp {
     class: String,
     clicks: u32,
     keys: u32,
+    /// Another key was already held when the dictation started.
+    held_other: bool,
     /// Held, never read: while any stamp of this dictation lives, the count keeps running.
     _watch: Arc<Watch>,
 }
@@ -201,6 +241,8 @@ impl FocusStamp {
             class,
             clicks: CLICKS.load(Ordering::Relaxed),
             keys: KEYS.load(Ordering::Relaxed),
+            // Read with the hooks in, so a key pressed since is counted by them instead.
+            held_other: other_key_held(),
             _watch: watch,
         })
     }
@@ -235,6 +277,9 @@ impl FocusStamp {
     /// Anything at all since the keypress - for a capture made a moment after it, before even
     /// the stop press.
     pub fn moved_since_keypress(&self) -> Option<&'static str> {
+        if self.held_other {
+            return Some("key-held-at-start");
+        }
         self.window_moved().or(match self.counted() {
             (0, 0) => None,
             (0, _) => Some("typed"),
@@ -245,6 +290,9 @@ impl FocusStamp {
     /// Why a paste would no longer land in the control that was focused at the keypress: the
     /// window or focused control changed, he clicked, or he pressed any key besides the stop.
     pub fn moved(&self) -> Option<&'static str> {
+        if self.held_other {
+            return Some("key-held-at-start");
+        }
         let (clicks, keys) = self.counted();
         self.window_moved().or_else(|| input_moved(clicks, keys))
     }
@@ -407,6 +455,27 @@ mod tests {
         assert_eq!(input_moved(0, 3), Some("typed"));
         assert_eq!(input_moved(1, 1), Some("clicked"));
         assert_eq!(input_moved(0, 0), Some("stop-not-seen"), "no count at all is not proof");
+    }
+
+    #[test]
+    fn the_trigger_key_is_found_from_the_shortcut() {
+        set_trigger_key("Alt+Space");
+        assert_eq!(TRIGGER.load(Ordering::Relaxed), 0x20);
+        set_trigger_key("Ctrl+Alt+Shift+V");
+        assert_eq!(TRIGGER.load(Ordering::Relaxed), 0x56);
+        set_trigger_key("Ctrl+KeyD");
+        assert_eq!(TRIGGER.load(Ordering::Relaxed), 0x44);
+        set_trigger_key("Super+F5");
+        assert_eq!(TRIGGER.load(Ordering::Relaxed), 0x74);
+        set_trigger_key("Alt+Space");
+    }
+
+    #[test]
+    fn mouse_buttons_are_not_keys_held_at_the_start() {
+        for vk in [0x01, 0x02, 0x04, 0x05, 0x06] {
+            assert!(is_mouse_button(vk));
+        }
+        assert!(!is_mouse_button(0x25), "Left Arrow is a key");
     }
 
     #[test]
