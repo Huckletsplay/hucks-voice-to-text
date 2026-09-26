@@ -21,6 +21,7 @@ OUT = ROOT / "app" / "desktop" / "icons"
 
 TILE = (224, 224, 224, 255)   # Snip 'n' Clip: gray 0.88
 INK = (10, 10, 10, 255)       # Snip 'n' Clip: gray 0.04
+WIN_TRAY = (150, 150, 150)    # Snip 'n' Clip's Windows tray H (TrayIconFactory.RestingColor)
 SUPERSAMPLE = 4
 
 
@@ -116,10 +117,12 @@ def app_icon(side: int, polys) -> Image.Image:
     return img
 
 
-def tray_icon(side: int, polys) -> Image.Image:
+def tray_icon(side: int, polys, color=(0, 0, 0)) -> Image.Image:
     """Menu bar: a template image (alpha only) of the full mark, sound arcs and words included.
     A plain H did not read as this program, and Snip 'n' Clip's menu-bar H carries its interior
-    too. Overrides the size-band note in icon-spec."""
+    too. Overrides the size-band note in icon-spec.
+
+    Windows does not tint tray icons, so its copy is drawn in `WIN_TRAY` instead of black."""
     # At 18 pt the 2-unit word blocks fall to one faint pixel, so the menu-bar master sets them
     # half again as tall. They stay inside the letter's interior clip (rows at y 25, 32, 39).
     def taller(poly):
@@ -128,7 +131,7 @@ def tray_icon(side: int, polys) -> Image.Image:
         mid = sum(y for _, y in poly) / len(poly)
         return [(x, mid + (y - mid) * 1.5) for x, y in poly]
     ink, _ = masks(side, [polys[0]] + [taller(q) for q in polys[1:]])
-    img = Image.new("RGBA", (side, side), (0, 0, 0, 255))
+    img = Image.new("RGBA", (side, side), (*color, 255))
     img.putalpha(ink)
     return img
 
@@ -147,16 +150,27 @@ def main() -> None:
     tray_icon(18, polys).save(OUT / "tray.png")
     tray_icon(36, polys).save(OUT / "tray@2x.png")
 
-    # .icns for the macOS bundle.
-    iconset = OUT / "icon.iconset"
-    shutil.rmtree(iconset, ignore_errors=True)
-    iconset.mkdir()
-    for size in (16, 32, 128, 256, 512):
-        app_icon(size, polys).save(iconset / f"icon_{size}x{size}.png")
-        app_icon(size * 2, polys).save(iconset / f"icon_{size}x{size}@2x.png")
-    subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(OUT / "icon.icns")],
-                   check=True)
-    shutil.rmtree(iconset, ignore_errors=True)
+    # Windows tray: 32 px, the size a 200% display asks for; Windows scales it down elsewhere.
+    tray_icon(32, polys, WIN_TRAY).save(OUT / "tray-win.png")
+
+    # .ico for the Windows program, one rendering per size so 16 px gets its hand-tuned H.
+    ico_sizes = (16, 24, 32, 48, 64, 128, 256)
+    ico_images = [app_icon(size, polys) for size in ico_sizes]
+    ico_images[-1].save(OUT / "icon.ico", format="ICO",
+                        sizes=[(s, s) for s in ico_sizes], append_images=ico_images[:-1])
+
+    # .icns for the macOS bundle. `iconutil` exists only on a Mac; elsewhere the committed
+    # copy stands.
+    if shutil.which("iconutil"):
+        iconset = OUT / "icon.iconset"
+        shutil.rmtree(iconset, ignore_errors=True)
+        iconset.mkdir()
+        for size in (16, 32, 128, 256, 512):
+            app_icon(size, polys).save(iconset / f"icon_{size}x{size}.png")
+            app_icon(size * 2, polys).save(iconset / f"icon_{size}x{size}@2x.png")
+        subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(OUT / "icon.icns")],
+                       check=True)
+        shutil.rmtree(iconset, ignore_errors=True)
 
     print("wrote:", ", ".join(sorted(p.name for p in OUT.iterdir())))
 

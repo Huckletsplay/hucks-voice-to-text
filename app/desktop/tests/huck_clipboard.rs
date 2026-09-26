@@ -1,9 +1,9 @@
-//! Huck's own clipboard, against the real macOS pasteboards.
+//! Huck's own clipboard, against the real system clipboard (macOS pasteboards, Windows clipboard).
 //!
 //! `#[ignore]`d because the borrow test briefly puts text on the user's actual clipboard. Run on
-//! purpose: `scripts/dev.sh test -- --ignored`.
+//! purpose: `scripts/dev.sh test -- --ignored` (Windows: `scripts\dev.ps1 test --ignored`).
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", windows))]
 
 use hvtt_desktop::clip::huck;
 

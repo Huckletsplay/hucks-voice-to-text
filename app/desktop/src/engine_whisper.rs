@@ -18,6 +18,20 @@ pub struct WhisperEngine {
 
 impl WhisperEngine {
     pub fn load(model_path: &Path) -> Result<Self, EngineError> {
+        // The public Windows build targets AVX2-class processors (Intel 2013 on, AMD 2015 on)
+        // rather than the building machine's own. On anything older, whisper.cpp would stop the
+        // program with an illegal instruction; say so plainly instead.
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            use std::arch::is_x86_feature_detected as has;
+            if !(has!("avx2") && has!("fma") && has!("f16c") && has!("bmi2")) {
+                return Err(EngineError::ModelLoad(
+                    "this PC's processor is too old for the speech engine, which needs AVX2 \
+                     (Intel from 2013, AMD from 2015)."
+                        .into(),
+                ));
+            }
+        }
         if !model_path.exists() {
             return Err(EngineError::ModelMissing {
                 path: model_path.display().to_string(),
@@ -57,8 +71,11 @@ impl WhisperEngine {
         if own.as_deref().is_some_and(Path::exists) {
             return own;
         }
+        // Windows installs keep it in `models\` beside the program.
         let bundled = std::env::current_exe().ok().and_then(|exe| {
-            Some(exe.parent()?.parent()?.join("Resources").join("models").join(model_file))
+            let dir = exe.parent()?;
+            Some(if cfg!(windows) { dir.join("models") } else { dir.parent()?.join("Resources").join("models") }
+                .join(model_file))
         });
         match bundled {
             Some(b) if b.exists() => Some(b),

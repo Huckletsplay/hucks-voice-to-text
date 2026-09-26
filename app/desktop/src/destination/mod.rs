@@ -2,18 +2,25 @@
 //!
 //! One narrow platform seam, exactly as planned from the first commit: everything above this
 //! module is shared and testable, and only what is inside it knows about the Accessibility API
-//! or a browser extension.
+//! (macOS), UI Automation (Windows) or a browser extension.
 //!
 //! **Three ways in, in order.** A silent Accessibility write (native apps, Safari - works even
 //! after he clicks away); the browser extension (Chrome); and a paste for everything else -
 //! Electron apps like VS Code, Slack and Discord, and Chrome without the extension - which is
 //! only made while nothing has moved since the keypress (`macos_paste`). Past that, the words
 //! wait on the clipboard.
+//!
+//! Windows has the same three ways in: UI Automation (`windows_uia`), the same extension, and the
+//! same gated paste (`windows_paste`).
 
 #[cfg(target_os = "macos")]
 pub mod macos_ax;
 #[cfg(target_os = "macos")]
 pub mod macos_paste;
+#[cfg(windows)]
+pub mod windows_paste;
+#[cfg(windows)]
+pub mod windows_uia;
 
 pub mod chromium;
 
@@ -81,12 +88,19 @@ pub fn is_known_unsupported(bundle_id: &str) -> bool {
     ELECTRON_APPS.contains(&bundle_id)
 }
 
+/// The file name at the end of an executable path, lower-cased: `chrome.exe`.
+fn exe_file(exe: &str) -> String {
+    exe.rsplit(['/', '\\']).next().unwrap_or(exe).to_ascii_lowercase()
+}
+
 /// Executable names of Chromium browsers. Matched on the running process rather than a bundle
-/// id so the check needs no `osascript` call.
+/// id so the check needs no `osascript` call. Windows names are matched on the whole file name.
 pub fn is_chromium_executable(exe: &str) -> bool {
     const BROWSERS: &[&str] =
         &["Google Chrome", "Chromium", "Microsoft Edge", "Brave Browser", "Vivaldi"];
-    BROWSERS.iter().any(|b| exe.contains(b))
+    const WINDOWS: &[&str] =
+        &["chrome.exe", "chromium.exe", "msedge.exe", "brave.exe", "vivaldi.exe"];
+    BROWSERS.iter().any(|b| exe.contains(b)) || WINDOWS.contains(&exe_file(exe).as_str())
 }
 
 /// Electron applications, by executable name.
@@ -106,9 +120,21 @@ pub fn is_unsupported_executable(exe: &str) -> Option<String> {
         ("Notion", "Notion"),
         ("Spotify", "Spotify"),
     ];
-    ELECTRON
+    const WINDOWS: &[(&str, &str)] = &[
+        ("code.exe", "VS Code"),
+        ("cursor.exe", "Cursor"),
+        ("slack.exe", "Slack"),
+        ("discord.exe", "Discord"),
+        ("chatgpt.exe", "ChatGPT"),
+        ("claude.exe", "Claude"),
+        ("notion.exe", "Notion"),
+        ("spotify.exe", "Spotify"),
+    ];
+    let file = exe_file(exe);
+    WINDOWS
         .iter()
-        .find(|(needle, _)| exe.contains(needle))
+        .find(|(name, _)| file == *name)
+        .or_else(|| ELECTRON.iter().find(|(needle, _)| exe.contains(needle)))
         .map(|(_, pretty)| pretty.to_string())
 }
 
@@ -154,6 +180,18 @@ mod tests {
         assert!(is_chromium_executable("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"));
         assert!(!is_chromium_executable("/System/Applications/TextEdit.app/Contents/MacOS/TextEdit"));
         assert!(!is_chromium_executable("/Applications/Safari.app/Contents/MacOS/Safari"));
+    }
+
+    #[test]
+    fn windows_programs_are_recognised_by_file_name() {
+        assert!(is_chromium_executable(r"C:\Program Files\Google\Chrome\Application\chrome.exe"));
+        assert!(is_chromium_executable(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"));
+        assert!(!is_chromium_executable(r"C:\Windows\System32\notepad.exe"));
+        assert_eq!(
+            is_unsupported_executable(r"D:\Tools\Microsoft VS Code\Code.exe"),
+            Some("VS Code".into())
+        );
+        assert_eq!(is_unsupported_executable(r"C:\Windows\System32\notepad.exe"), None);
     }
 
     #[test]

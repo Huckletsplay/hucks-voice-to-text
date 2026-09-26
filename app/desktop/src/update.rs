@@ -5,14 +5,17 @@
 //! Clip:
 //!
 //! - an update is offered only for a strictly newer `v<major>.<minor>.<patch>` release that carries
-//!   exactly the DMG and checksum named by [`dmg_name`] and [`checksum_name`], served from this
-//!   repository's GitHub release downloads over HTTPS;
-//! - the DMG is downloaded to a temporary folder, never anywhere of his, and offered only after its
-//!   size matches GitHub's and its SHA-256 matches the published checksum;
-//! - the app never installs over itself: he opens the DMG and drags the new copy across.
+//!   exactly this platform's download and checksum, named by [`download_name`] and
+//!   [`checksum_name`], served from this repository's GitHub release downloads over HTTPS;
+//! - the download goes to a temporary folder, never anywhere of his, and is offered only after
+//!   its size matches GitHub's and its SHA-256 matches the published checksum;
+//! - macOS: the app never installs over itself - he opens the DMG and drags the new copy across.
+//!   Windows: the verified installer is started and the app steps aside for it, as Snip 'n' Clip
+//!   does.
 //!
-//! The rules are plain functions with tests; the network and hashing go through macOS's own
-//! `curl` and `shasum`, so there is no HTTP or crypto dependency to carry.
+//! The rules are plain functions with tests; the network and hashing go through the system's own
+//! tools (`curl` and `shasum` on macOS, `curl.exe` and `certutil` on Windows), so there is no HTTP
+//! or crypto dependency to carry.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -25,12 +28,21 @@ const DOWNLOAD_PREFIX: &str =
 
 /// The one place the release asset names live. `app/scripts/release.sh` produces exactly these;
 /// a future signed or Intel channel has to be added here on purpose, or the updater refuses it.
-pub fn dmg_name(version: &str) -> String {
+#[cfg(not(windows))]
+pub fn download_name(version: &str) -> String {
     format!("HucksVoiceToText-{version}-macOS-arm64-unsigned-beta.dmg")
 }
 
+/// Snip 'n' Clip's Windows naming: one installer per release, `-windows-x64-setup.exe`.
+#[cfg(windows)]
+pub fn download_name(version: &str) -> String {
+    format!("HucksVoiceToText-{version}-windows-x64-setup.exe")
+}
+
+const PLATFORM: &str = if cfg!(windows) { "Windows" } else { "Mac" };
+
 pub fn checksum_name(version: &str) -> String {
-    format!("{}.sha256.txt", dmg_name(version))
+    format!("{}.sha256.txt", download_name(version))
 }
 
 /// `major.minor.patch`, with an optional leading `v`. Anything else is not a release version.
@@ -48,8 +60,8 @@ pub fn parse_version(text: &str) -> Option<Version> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
     pub version: String,
-    pub dmg_url: String,
-    pub dmg_size: u64,
+    pub download_url: String,
+    pub download_size: u64,
     pub checksum_url: String,
 }
 
@@ -81,11 +93,11 @@ pub fn read_release(json: &str, current: &str) -> Result<Check, String> {
             },
         )
     };
-    let missing = || format!("Version {version} is out, but its Mac download is missing.");
-    let (dmg_url, dmg_size) = asset(&dmg_name(&version)).ok_or_else(missing)?;
+    let missing = || format!("Version {version} is out, but its {PLATFORM} download is missing.");
+    let (download_url, download_size) = asset(&download_name(&version)).ok_or_else(missing)?;
     let (checksum_url, _) = asset(&checksum_name(&version)).ok_or_else(missing)?;
-    let dmg_size = dmg_size.ok_or_else(missing)?;
-    Ok(Check::Available(Offer { version: version.clone(), dmg_url, dmg_size, checksum_url }))
+    let download_size = download_size.ok_or_else(missing)?;
+    Ok(Check::Available(Offer { version: version.clone(), download_url, download_size, checksum_url }))
 }
 
 /// The published checksum file: exactly one line, `<64 hex>  <this DMG's name>`.
@@ -111,8 +123,25 @@ pub fn parse_checksum(text: &str, dmg: &str) -> Result<String, String> {
 
 // ---------------------------------------------------------------------------- the network
 
+/// The system's own curl - part of macOS, and of Windows 10 since 1803.
+fn curl_program() -> PathBuf {
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        PathBuf::from(root).join("System32").join("curl.exe")
+    } else {
+        PathBuf::from("/usr/bin/curl")
+    }
+}
+
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("/usr/bin/curl")
+    let mut command = Command::new(curl_program());
+    #[cfg(windows)]
+    {
+        // No console window flashing up behind the floating box.
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = command
         .args(["--fail", "--silent", "--show-error", "--location"])
         // HTTPS only, including every redirect GitHub makes to its download servers.
         .args(["--proto", "=https", "--proto-redir", "=https", "--tlsv1.2"])
@@ -159,7 +188,7 @@ pub fn download(offer: &Offer) -> Result<PathBuf, String> {
 }
 
 fn download_into(offer: &Offer, dir: &std::path::Path) -> Result<PathBuf, String> {
-    let name = dmg_name(&offer.version);
+    let name = download_name(&offer.version);
     let expected = parse_checksum(
         &String::from_utf8_lossy(&curl(&["--max-time", "30", &offer.checksum_url])?),
         &name,
@@ -167,27 +196,50 @@ fn download_into(offer: &Offer, dir: &std::path::Path) -> Result<PathBuf, String
 
     let dmg = dir.join(&name);
     let dmg_text = dmg.to_string_lossy().to_string();
-    curl(&["--max-time", "900", "--output", &dmg_text, &offer.dmg_url])?;
+    curl(&["--max-time", "900", "--output", &dmg_text, &offer.download_url])?;
 
     let size = std::fs::metadata(&dmg).map(|m| m.len()).unwrap_or(0);
-    if size != offer.dmg_size {
+    if size != offer.download_size {
         return Err("The download is incomplete — its size does not match GitHub's.".into());
     }
-    let out = Command::new("/usr/bin/shasum")
-        .args(["-a", "256", &dmg_text])
-        .output()
-        .map_err(|e| format!("Could not check the download ({e})."))?;
-    let actual = String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let actual = sha256_of(&dmg_text)?;
     if actual != expected {
         return Err("The download does not match its published SHA-256 checksum, so it was \
                     deleted."
             .into());
     }
     Ok(dmg)
+}
+
+/// SHA-256 of a file, lower-case hex, from the system's own tool.
+fn sha256_of(path: &str) -> Result<String, String> {
+    let fail = |e: std::io::Error| format!("Could not check the download ({e}).");
+    #[cfg(windows)]
+    let out = {
+        use std::os::windows::process::CommandExt;
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        Command::new(PathBuf::from(root).join("System32").join("certutil.exe"))
+            .args(["-hashfile", path, "SHA256"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+            .map_err(fail)?
+    };
+    #[cfg(not(windows))]
+    let out = Command::new("/usr/bin/shasum").args(["-a", "256", path]).output().map_err(fail)?;
+    Ok(read_sha256(&String::from_utf8_lossy(&out.stdout)).unwrap_or_default())
+}
+
+/// The first 64-hex-digit hash in a tool's output. `certutil` puts a heading line first, and older
+/// versions space the bytes apart; `shasum` puts the hash first.
+fn read_sha256(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let first = line.split_whitespace().next()?;
+        let joined: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        [first.to_string(), joined]
+            .into_iter()
+            .find(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|h| h.to_ascii_lowercase())
+    })
 }
 
 #[cfg(test)]
@@ -204,6 +256,20 @@ mod tests {
 
     fn url(version: &str, file: &str) -> String {
         format!("{DOWNLOAD_PREFIX}v{version}/{file}")
+    }
+
+    #[test]
+    fn hashes_are_read_from_either_tool() {
+        let hash = "ab".repeat(32);
+        assert_eq!(read_sha256(&format!("{hash}  file.dmg\n")), Some(hash.clone()));
+        let certutil = format!(
+            "SHA256 hash of C:\\t\\file.exe:\r\n{}\r\nCertUtil: -hashfile command completed successfully.\r\n",
+            hash.to_uppercase()
+        );
+        assert_eq!(read_sha256(&certutil), Some(hash.clone()));
+        let spaced = hash.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(" ");
+        assert_eq!(read_sha256(&format!("SHA256 hash of file:\n{spaced}\n")), Some(hash));
+        assert_eq!(read_sha256("CertUtil: error\n"), None);
     }
 
     #[test]
@@ -226,26 +292,26 @@ mod tests {
 
     #[test]
     fn a_newer_release_with_both_files_is_offered() {
-        let (dmg, sum) = (dmg_name("0.2.0"), checksum_name("0.2.0"));
+        let (dmg, sum) = (download_name("0.2.0"), checksum_name("0.2.0"));
         let json = release("v0.2.0", &[(&dmg, &url("0.2.0", &dmg), 123), (&sum, &url("0.2.0", &sum), 90)]);
         let Check::Available(offer) = read_release(&json, "0.1.0").unwrap() else {
             panic!("a newer release should be offered")
         };
         assert_eq!(offer.version, "0.2.0");
-        assert_eq!(offer.dmg_size, 123);
-        assert!(offer.dmg_url.ends_with(&dmg));
+        assert_eq!(offer.download_size, 123);
+        assert!(offer.download_url.ends_with(&dmg));
     }
 
     #[test]
     fn a_newer_release_missing_its_checksum_is_refused() {
-        let dmg = dmg_name("0.2.0");
+        let dmg = download_name("0.2.0");
         let json = release("v0.2.0", &[(&dmg, &url("0.2.0", &dmg), 123)]);
         assert!(read_release(&json, "0.1.0").unwrap_err().contains("missing"));
     }
 
     #[test]
     fn a_download_from_anywhere_but_this_repository_is_refused() {
-        let (dmg, sum) = (dmg_name("0.2.0"), checksum_name("0.2.0"));
+        let (dmg, sum) = (download_name("0.2.0"), checksum_name("0.2.0"));
         let elsewhere = format!("https://example.com/{dmg}");
         let json = release("v0.2.0", &[(&dmg, &elsewhere, 123), (&sum, &url("0.2.0", &sum), 90)]);
         assert!(read_release(&json, "0.1.0").is_err());
@@ -264,7 +330,7 @@ mod tests {
 
     #[test]
     fn checksum_files_must_name_this_dmg_on_one_line() {
-        let dmg = dmg_name("0.2.0");
+        let dmg = download_name("0.2.0");
         let hash = "a".repeat(64);
         assert_eq!(parse_checksum(&format!("{hash}  {dmg}\n"), &dmg).unwrap(), hash);
         assert_eq!(parse_checksum(&format!("{}  *{dmg}", hash.to_uppercase()), &dmg).unwrap(), hash);

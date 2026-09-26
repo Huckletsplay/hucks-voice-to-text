@@ -16,7 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+// Windows 10 has Unix domain sockets too - the same file-permission-guarded socket, the same
+// shape. `uds_windows` is the standard library's API for them, which std only offers on Unix.
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};

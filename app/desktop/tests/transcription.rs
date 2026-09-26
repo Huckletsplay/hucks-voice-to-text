@@ -16,30 +16,51 @@ fn model_path() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Synthesize a sentence to 16 kHz mono f32, the format recognition expects.
-fn speak(text: &str, tag: &str) -> Option<Vec<f32>> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-    let dir = std::env::temp_dir();
-    let aiff = dir.join(format!("hvtt-test-{tag}.aiff"));
-    let wav = dir.join(format!("hvtt-test-{tag}.wav"));
-
-    let said = Command::new("say")
-        .args(["-o", aiff.to_str()?, text])
-        .status()
-        .ok()?;
+/// macOS: `say`, then ffmpeg to a 16 kHz mono WAV.
+#[cfg(target_os = "macos")]
+fn synthesize(text: &str, tag: &str, wav: &std::path::Path) -> Option<()> {
+    let aiff = std::env::temp_dir().join(format!("hvtt-test-{tag}.aiff"));
+    let said = Command::new("say").args(["-o", aiff.to_str()?, text]).status().ok()?;
     if !said.success() {
         return None;
     }
-
     let converted = Command::new("ffmpeg")
         .args(["-y", "-i", aiff.to_str()?, "-ar", "16000", "-ac", "1", wav.to_str()?])
         .output()
         .ok()?;
-    if !converted.status.success() {
-        return None;
-    }
+    let _ = std::fs::remove_file(&aiff);
+    converted.status.success().then_some(())
+}
+
+/// Windows: its own speech synthesizer writes the 16 kHz mono WAV directly. No ffmpeg needed.
+#[cfg(windows)]
+fn synthesize(text: &str, _tag: &str, wav: &std::path::Path) -> Option<()> {
+    let script = format!(
+        "Add-Type -AssemblyName System.Speech; \
+         $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
+         $f = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, \
+              [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, \
+              [System.Speech.AudioFormat.AudioChannel]::Mono); \
+         $s.SetOutputToWaveFile('{}', $f); $s.Speak('{}'); $s.Dispose()",
+        wav.to_str()?.replace('\'', "''"),
+        text.replace('\'', "''"),
+    );
+    let said = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .ok()?;
+    said.status.success().then_some(())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn synthesize(_: &str, _: &str, _: &std::path::Path) -> Option<()> {
+    None
+}
+
+/// Synthesize a sentence to 16 kHz mono f32, the format recognition expects.
+fn speak(text: &str, tag: &str) -> Option<Vec<f32>> {
+    let wav = std::env::temp_dir().join(format!("hvtt-test-{tag}.wav"));
+    synthesize(text, tag, &wav)?;
 
     let mut reader = hound::WavReader::open(&wav).ok()?;
     let spec = reader.spec();
@@ -52,7 +73,6 @@ fn speak(text: &str, tag: &str) -> Option<Vec<f32>> {
             .collect(),
     };
 
-    let _ = std::fs::remove_file(&aiff);
     let _ = std::fs::remove_file(&wav);
 
     // Run it through the same conditioning the microphone path uses.
@@ -66,7 +86,7 @@ fn a_spoken_sentence_is_transcribed_locally() {
         return;
     };
     let Some(samples) = speak("The quick brown fox jumps over the lazy dog.", "fox") else {
-        eprintln!("skipping: `say` or `ffmpeg` unavailable");
+        eprintln!("skipping: no speech synthesizer (macOS `say` + ffmpeg, or Windows System.Speech)");
         return;
     };
 
@@ -138,6 +158,7 @@ fn a_transcript_reaches_the_clipboard_even_when_delivery_fails() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn the_real_ax_destination_refuses_when_accessibility_is_not_granted() {
     // Not a mock: this calls the production capture path. Whichever way the permission falls on
     // this machine, it must never panic and never return a destination it cannot verify.

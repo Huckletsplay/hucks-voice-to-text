@@ -53,15 +53,15 @@ pub const DEFAULT_PASTE_SHORTCUT: &str = "Ctrl+Alt+Shift+V";
 
 /// The default global shortcut.
 ///
-/// **Option+Space on macOS.** Close to the thumb, unclaimed by the system (Control+Space is
-/// input sources, Command+Space is Spotlight), and one chord rather than three keys — this is
-/// the front door of a product whose whole promise is feeling instant.
+/// **Option+Space on macOS, Alt+Space on Windows** - the same keys under the same thumb. Close to
+/// the thumb, unclaimed by the system on macOS (Control+Space is input sources, Command+Space is
+/// Spotlight), and one chord rather than three keys — this is the front door of a product whose
+/// whole promise is feeling instant.
 ///
-/// Elsewhere Alt+Space opens the window menu, so it is not reused.
-#[cfg(target_os = "macos")]
+/// On Windows Alt+Space also opens a window's system menu; a registered shortcut takes precedence,
+/// as PowerToys Run's does, so that menu is not reachable by keyboard while the program runs.
+/// Chosen by Quintin 2026-09-26 over the earlier Ctrl+Alt+Space, to match the Mac.
 pub const DEFAULT_SHORTCUT: &str = "Alt+Space";
-#[cfg(not(target_os = "macos"))]
-pub const DEFAULT_SHORTCUT: &str = "Ctrl+Alt+Space";
 
 /// Render an accelerator the way the user's keyboard is labelled.
 ///
@@ -242,12 +242,13 @@ mod tests {
     }
 
     #[test]
-    fn the_macos_default_shortcut_is_option_space() {
+    fn the_default_shortcut_is_option_space_on_the_mac_and_alt_space_on_windows() {
         let s = Settings::default();
-        if cfg!(target_os = "macos") {
-            assert_eq!(s.shortcut, "Alt+Space");
-            assert_eq!(describe_shortcut(&s.shortcut), "Option + Space");
-        }
+        assert_eq!(s.shortcut, "Alt+Space");
+        assert_eq!(
+            describe_shortcut(&s.shortcut),
+            if cfg!(target_os = "macos") { "Option + Space" } else { "Alt + Space" }
+        );
         assert!(shortcut_looks_valid(&s.shortcut));
     }
 

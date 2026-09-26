@@ -9,6 +9,30 @@ pub mod destination;
 pub mod engine_whisper;
 pub mod recorder;
 pub mod update;
+#[cfg(windows)]
+mod win_shortcut;
+#[cfg(windows)]
+mod win_surface;
+
+/// The gated paste rung, whichever platform this is.
+#[cfg(target_os = "macos")]
+use crate::destination::macos_paste as platform_paste;
+#[cfg(windows)]
+use crate::destination::windows_paste as platform_paste;
+
+/// The normal clipboard's paste, as the keyboard labels it.
+const NORMAL_PASTE: &str = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" };
+const OS_NAME: &str = if cfg!(target_os = "macos") { "macOS" } else { "Windows" };
+
+/// Open a folder or file the way double-clicking it would.
+fn open_path(path: std::path::PathBuf) {
+    // Waited on, off the main thread: a spawned child that is never waited for lingers as a
+    // finished-but-unreaped process until the app quits.
+    std::thread::spawn(move || {
+        let opener = if cfg!(windows) { "explorer.exe" } else { "/usr/bin/open" };
+        let _ = std::process::Command::new(opener).arg(path).status();
+    });
+}
 
 use crate::bridge::Bridge;
 use crate::destination::PinError;
@@ -93,9 +117,17 @@ struct App {
     paste_shortcut_error: Mutex<Option<String>>,
     rebinding: Mutex<Option<Rebinding>>,
     rebind_error: Mutex<Option<String>>,
+    /// Windows: the keyboard hook that hears the new shortcut while the prompt is open.
+    #[cfg(windows)]
+    key_capture: Mutex<Option<win_shortcut::Capture>>,
+    /// Windows: the window he was in when the pointer reached the H, given the foreground back
+    /// when a menu item is chosen.
+    #[cfg(windows)]
+    before_menu: Mutex<Option<isize>>,
     update: Mutex<Option<UpdateView>>,
-    /// A downloaded, verified update DMG, waiting to be opened.
-    update_dmg: Mutex<Option<std::path::PathBuf>>,
+    /// A downloaded, verified update - the DMG on macOS, the installer on Windows - waiting to
+    /// be opened.
+    update_file: Mutex<Option<std::path::PathBuf>>,
     /// What the menu was last built from; it is rebuilt only when this changes.
     menu_key: Mutex<String>,
     /// Accessibility, as last checked. Asking macOS is a call to its permission service, so it
@@ -108,6 +140,8 @@ struct App {
     delivered: Mutex<bool>,
     ask_permission: Mutex<bool>,
     /// Set the first time the permission is found missing, so the ask happens once per launch.
+    /// macOS only: Windows asks for no permission.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     permission_asked: Mutex<bool>,
     /// Bumped by every new dictation and every dismiss, so a delayed auto-hide never puts away a
     /// box that is showing something newer than what it was scheduled for.
@@ -181,12 +215,24 @@ fn push(app: &AppHandle) {
 
 /// Bring the composer into view without taking the foreground.
 ///
-/// `show()` alone is correct here: the app runs as a macOS accessory, so showing a window does
-/// not activate it. The never-take-the-foreground rule depends on nothing here calling
-/// `set_focus()`.
+/// `show()` alone is correct on macOS: the app runs as an accessory, so showing a window does
+/// not activate it. Windows has no such policy, so the box is shown without activation by hand.
+/// The never-take-the-foreground rule depends on nothing here calling `set_focus()`.
 fn reveal_composer(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("composer") {
+        #[cfg(windows)]
+        win_surface::show(&w);
+        #[cfg(not(windows))]
         let _ = w.show();
+    }
+}
+
+fn hide_composer(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("composer") {
+        #[cfg(windows)]
+        win_surface::hide(&w);
+        #[cfg(not(windows))]
+        let _ = w.hide();
     }
 }
 
@@ -237,13 +283,19 @@ fn register_shortcut(app: &AppHandle, accelerator: &str, action: Action) -> Resu
         ));
     }
     let parsed = Shortcut::from_str(accelerator)
-        .map_err(|_| format!("{} isn't a shortcut macOS understands.", describe_shortcut(accelerator)))?;
+        .map_err(|_| format!("{} isn't a shortcut {OS_NAME} understands.", describe_shortcut(accelerator)))?;
 
     // `on_shortcut` attaches the handler to this specific binding. The plugin's global
     // `with_handler` did not fire for shortcuts registered separately, which is the kind of
     // silent failure this product must never ship.
     app.global_shortcut()
         .on_shortcut(parsed, move |handle, _shortcut, event| {
+            // Windows: a shortcut holding Alt (Alt+Space) would otherwise leave the app
+            // underneath opening its menu bar when Alt comes up.
+            #[cfg(windows)]
+            if event.state() == ShortcutState::Pressed {
+                platform_paste::mask_menu_key();
+            }
             // Dictation fires on press - the start is the most felt moment in the product.
             // The paste fires as the letter key comes up: macOS drops a synthetic V while the
             // real V is still held, so a paste sent on press never arrived (measured
@@ -319,8 +371,28 @@ fn begin_rebind(app: &AppHandle, which: Rebinding) {
     *state.rebinding.lock() = Some(which);
     *state.rebind_error.lock() = None;
     if let Some(w) = app.get_webview_window("composer") {
-        let _ = w.show();
-        let _ = w.set_focus();
+        // Windows: a keyboard hook hears the keys, so the box never needs the keyboard - and
+        // Alt+Space, which Windows keeps from any page, can be chosen. If the hook cannot start,
+        // the box takes the keyboard as on macOS.
+        #[cfg(windows)]
+        {
+            let handle = app.clone();
+            let capture = win_shortcut::start(move |heard| match heard {
+                win_shortcut::Heard::Keys(accelerator) => finish_rebind(handle.clone(), accelerator),
+                win_shortcut::Heard::Cancel => dismiss(handle.clone()),
+            });
+            if capture.is_some() {
+                win_surface::show(&w);
+            } else {
+                win_surface::show_for_keys(&w);
+            }
+            *state.key_capture.lock() = capture;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
     }
     push(app);
 }
@@ -358,6 +430,9 @@ fn finish_rebind(app: AppHandle, accelerator: String) {
         }
         Err(why) => {
             *state.rebind_error.lock() = Some(why.replace(" Pick a different one in Settings.", ""));
+            // The prompt stays open for another try, with its full time again.
+            #[cfg(windows)]
+            win_shortcut::extend();
             push(&app);
         }
     }
@@ -368,13 +443,14 @@ fn finish_rebind(app: AppHandle, accelerator: String) {
 /// This one is aimed by him, deliberately, at the field in front of him - so unlike delivery it
 /// needs no pin. His normal clipboard is borrowed for the paste and put back afterwards.
 fn paste_last() {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     std::thread::spawn(move || {
         let Some(text) = crate::clip::huck::read().filter(|t| !t.trim().is_empty()) else {
             return;
         };
-        // Immediately, with his fingers still on the keys: see `press_paste`.
-        let _ = crate::destination::macos_paste::paste_borrowing_clipboard(&text);
+        // Immediately, with his fingers still on the keys, on both platforms: see each
+        // platform's `press_paste`.
+        let _ = platform_paste::paste_borrowing_clipboard(&text);
     });
 }
 
@@ -406,7 +482,7 @@ fn check_for_updates(app: &AppHandle) {
         reveal_composer(app);
         return;
     }
-    *state.update_dmg.lock() = None;
+    *state.update_file.lock() = None;
     show_update(app, "checking", "Checking for updates…".into(), "Asking GitHub.".into());
     let app = app.clone();
     std::thread::spawn(move || {
@@ -432,15 +508,20 @@ fn check_for_updates(app: &AppHandle) {
                 );
                 match update::download(&offer) {
                     Err(why) => fail(why),
-                    Ok(dmg) => {
-                        *app.state::<App>().update_dmg.lock() = Some(dmg);
+                    Ok(file) => {
+                        *app.state::<App>().update_file.lock() = Some(file);
+                        let how = if cfg!(windows) {
+                            "Open it and the installer takes over; Huck's Voice to Text closes \
+                             for it and your settings stay."
+                        } else {
+                            "Open it, quit Huck's Voice to Text, and drag the new copy onto \
+                             Applications."
+                        };
                         show_update(
                             &app,
                             "ready",
                             format!("Version {} is ready", offer.version),
-                            "Open it, quit Huck's Voice to Text, and drag the new copy onto \
-                             Applications."
-                                .into(),
+                            how.into(),
                         );
                     }
                 }
@@ -449,13 +530,25 @@ fn check_for_updates(app: &AppHandle) {
     });
 }
 
-/// Open the verified DMG in Finder. It never installs over itself; he drags the new copy across.
+/// macOS: open the verified DMG in Finder - it never installs over itself; he drags the new copy
+/// across. Windows: start the verified installer and step aside, as Snip 'n' Clip does, because a
+/// running program's files cannot be replaced.
 #[tauri::command]
 fn open_update(app: AppHandle) {
-    if let Some(dmg) = app.state::<App>().update_dmg.lock().clone() {
-        std::thread::spawn(move || {
-            let _ = std::process::Command::new("/usr/bin/open").arg(dmg).status();
-        });
+    let file = app.state::<App>().update_file.lock().clone();
+    // Snip 'n' Clip's way: a silent install that closes this copy and starts the new one.
+    #[cfg(windows)]
+    if let Some(installer) = file {
+        // The installer must not find this copy still "running" while it quits.
+        win_surface::release_single_instance();
+        if std::process::Command::new(installer).args(["/SILENT", "/CLOSEAPPLICATIONS"]).spawn().is_ok() {
+            app.exit(0);
+            return;
+        }
+    }
+    #[cfg(not(windows))]
+    if let Some(dmg) = file {
+        open_path(dmg);
     }
     dismiss(app);
 }
@@ -554,7 +647,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     shortcuts.append(&item("reset-shortcuts", "Reset Shortcuts to Defaults".into(), true)?)?;
 
     let clipboard = Submenu::with_id(app, "clipboard", "Clipboard", true)?;
-    clipboard.append(&check("clip-system", "Normal Clipboard — ⌘V", !huck)?)?;
+    clipboard.append(&check("clip-system", &format!("Normal Clipboard — {NORMAL_PASTE}"), !huck)?)?;
     clipboard.append(&check(
         "clip-huck",
         &format!("Huck's Clipboard — {}", keys(&s.paste_shortcut)),
@@ -583,7 +676,24 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
 
 fn on_menu(app: &AppHandle, id: &str) {
     let state: State<App> = app.state();
+    // Windows leaves the menu's hidden window in front; give it back to where he was first.
+    #[cfg(windows)]
+    if let Some(h) = *state.before_menu.lock() {
+        win_surface::give_back_foreground(h);
+    }
     match id {
+        // Windows: a moment for that window to take its focus back, so the dictation is aimed at
+        // the text box he was in - as it is when the menu-bar H starts one on macOS.
+        #[cfg(windows)]
+        "dictate" => {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                let again = app.clone();
+                let _ = app.run_on_main_thread(move || toggle(again));
+            });
+        }
+        #[cfg(not(windows))]
         "dictate" => toggle(app.clone()),
         "allow-ax" => open_accessibility_settings(),
         "check-updates" => check_for_updates(app),
@@ -605,9 +715,7 @@ fn on_menu(app: &AppHandle, id: &str) {
         "open-drafts" => {
             if let Some(dir) = hvtt_core::paths::drafts_dir() {
                 let _ = std::fs::create_dir_all(&dir);
-                std::thread::spawn(move || {
-                    let _ = std::process::Command::new("/usr/bin/open").arg(dir).status();
-                });
+                open_path(dir);
             }
         }
         "quit" => app.exit(0),
@@ -635,15 +743,12 @@ fn accessibility_ready() -> bool {
 #[tauri::command]
 fn open_accessibility_settings() {
     // Without this the app is not in the list at all, and the pane opens with nothing to tick.
+    // Windows needs no grant for UI Automation, so there is nothing to open there.
     #[cfg(target_os = "macos")]
-    crate::destination::macos_ax::request_accessibility();
-    // Waited on, off the main thread: a spawned child that is never waited for lingers as a
-    // finished-but-unreaped process until the app quits.
-    std::thread::spawn(|| {
-        let _ = std::process::Command::new("/usr/bin/open")
-            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-            .status();
-    });
+    {
+        crate::destination::macos_ax::request_accessibility();
+        open_path("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility".into());
+    }
 }
 
 // ---------------------------------------------------------------------------- commands
@@ -682,6 +787,11 @@ fn dismiss(app: AppHandle) {
     // Leaving the key prompt, by any route, puts every shortcut back.
     if state.rebinding.lock().take().is_some() {
         *state.rebind_error.lock() = None;
+        // Let go of the keyboard before the shortcuts go back on.
+        #[cfg(windows)]
+        {
+            *state.key_capture.lock() = None;
+        }
         bind_all(&app);
     }
     if let Some(rec) = state.recording.lock().take() {
@@ -697,9 +807,13 @@ fn dismiss(app: AppHandle) {
     *state.message.lock() = String::new();
     *state.elapsed_ms.lock() = 0;
     state.set_state(SessionState::Idle);
-    if let Some(w) = app.get_webview_window("composer") {
-        let _ = w.hide();
+    // The dictation is over, so let go of where it went. On Windows this is also what ends the
+    // click and key count behind the paste gate, which runs only while a dictation needs it.
+    #[cfg(windows)]
+    {
+        *state.destination.lock() = None;
     }
+    hide_composer(&app);
     push(&app);
 }
 
@@ -751,8 +865,10 @@ fn start_recording(app: AppHandle) {
         &crate::destination::macos_ax::AxFocusSource,
     );
     // What was in front and how much he had touched, for the paste rung's "nothing moved" gate.
-    #[cfg(target_os = "macos")]
-    let stamp = crate::destination::macos_paste::FocusStamp::capture();
+    // On Windows this is the whole keypress capture: the focused element is read from UI
+    // Automation on a worker a moment later, and refused if anything moved in between.
+    #[cfg(any(target_os = "macos", windows))]
+    let stamp = platform_paste::FocusStamp::capture();
 
     // The browser's own pin has to be taken at the same instant, so the request is sent now and
     // waited for later. The extension pins its focused element the moment this arrives.
@@ -791,7 +907,12 @@ fn start_recording(app: AppHandle) {
             spawn_level_pump(app.clone());
         }
         Err(e) => {
-            let msg = format!("{e} Check microphone access in System Settings › Privacy.");
+            let settings = if cfg!(windows) {
+                "Settings › Privacy › Microphone"
+            } else {
+                "System Settings › Privacy"
+            };
+            let msg = format!("{e} Check microphone access in {settings}.");
             *state.message.lock() = msg.clone();
             state.set_state(SessionState::Error { message: msg });
             push(&app);
@@ -805,10 +926,83 @@ fn start_recording(app: AppHandle) {
         let browser = browser_pin.join().ok();
         #[cfg(target_os = "macos")]
         resolve_pin(&app2, pending, stamp, browser);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        resolve_pin_windows(&app2, stamp, browser);
+        #[cfg(not(any(target_os = "macos", windows)))]
         let _ = browser;
         push(&app2);
     });
+}
+
+/// Windows' half of `resolve_pin`: the same three ways in, best first - UI Automation (native
+/// apps, which works even after he clicks away), the browser extension (Chrome, Edge), and a
+/// paste (Electron apps, Chrome without the extension, anything UI Automation cannot write),
+/// made only if nothing has moved since the keypress. No permission step: UI Automation needs
+/// no grant on Windows.
+#[cfg(windows)]
+fn resolve_pin_windows(
+    app: &AppHandle,
+    stamp: Option<crate::destination::windows_paste::FocusStamp>,
+    browser: Option<Result<crate::destination::chromium::ChromiumDestination, String>>,
+) {
+    use crate::destination::windows_paste::PasteDestination;
+    use crate::destination::{is_chromium_executable, is_unsupported_executable, windows_uia};
+
+    let state: State<App> = app.state();
+    let set = |d: Box<dyn Destination>| {
+        *state.message.lock() = format!("Listening — will send to {}", d.label());
+        *state.destination.lock() = Some(d);
+    };
+    let note = |e: PinError| {
+        *state.pin_note.lock() = Some(e.message());
+        if !e.is_expected() {
+            *state.message.lock() = e.message();
+        }
+    };
+    let release_browser = || {
+        let _ = state.bridge.request("unpin", None, std::time::Duration::from_millis(300));
+    };
+
+    // Nothing to type into was in front: the desktop, the taskbar, or the H's own menu.
+    let Some(stamp) = stamp else {
+        if let Some(Ok(_)) = browser {
+            release_browser();
+        }
+        note(PinError::NotATextField);
+        return;
+    };
+
+    let exe = windows_uia::executable_of(stamp.pid());
+    let app_label = is_unsupported_executable(&exe).unwrap_or_else(|| windows_uia::app_name(&exe));
+    let borrow = state.settings.lock().clipboard == ClipboardChoice::Huck;
+    let paste = || PasteDestination::new(stamp.clone(), app_label.clone(), borrow);
+
+    // The extension is the only silent way into Chrome.
+    if is_chromium_executable(&exe) {
+        if let Some(Ok(d)) = browser {
+            set(Box::new(d));
+            return;
+        }
+    } else if let Some(Ok(_)) = browser {
+        // Not our destination; release it so the extension is not left holding a field.
+        release_browser();
+    }
+
+    // Chromium and Electron windows are never asked for their accessibility tree: they have no
+    // native fields to write, and asking flips some (VS Code) into screen-reader mode. Paste.
+    if stamp.is_chromium_window() || is_chromium_executable(&exe) || is_unsupported_executable(&exe).is_some() {
+        set(Box::new(paste()));
+        return;
+    }
+
+    match windows_uia::capture(&stamp).and_then(|el| windows_uia::validate_captured(el, app_label.clone())) {
+        Ok(d) => set(Box::new(d.with_paste_fallback(Some(paste())))),
+        Err(reason) if reason == "secure-field" => note(PinError::SecureField),
+        // Nothing UI Automation could write: paste, gated. That includes focus having moved
+        // before the capture landed - the gate then refuses at delivery, just as it would had he
+        // moved later, and the words wait on the clipboard.
+        Err(_) => set(Box::new(paste())),
+    }
 }
 
 /// Decide what the captured candidate actually is, and refuse rather than substitute.
@@ -981,10 +1175,10 @@ fn stop_and_transcribe(app: AppHandle) {
                 };
                 // One clipboard or the other, never both.
                 let system = clip::SystemClipboard::new(app.clone());
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 let huck = clip::huck::HuckClipboard;
                 let clipboard: &dyn hvtt_core::pipeline::Clipboard = match choice {
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", windows))]
                     ClipboardChoice::Huck => &huck,
                     _ => &system,
                 };
@@ -1006,7 +1200,7 @@ fn stop_and_transcribe(app: AppHandle) {
                 // Where the words wait, and the key that gets them back.
                 let (kept, key) = match choice {
                     ClipboardChoice::Huck => ("on Huck's clipboard", paste_key),
-                    ClipboardChoice::System => ("copied", "⌘V".to_string()),
+                    ClipboardChoice::System => ("copied", NORMAL_PASTE.to_string()),
                 };
                 *state.message.lock() = match &report.delivery {
                     _ if !report.clipboard_ok => report.message.clone(),
@@ -1081,6 +1275,10 @@ fn spawn_engine_load(app: AppHandle) {
 }
 
 pub fn run() {
+    #[cfg(windows)]
+    if !win_surface::claim_single_instance() {
+        return;
+    }
     let settings = Settings::load();
 
     let app_state = App {
@@ -1097,8 +1295,12 @@ pub fn run() {
         paste_shortcut_error: Mutex::new(None),
         rebinding: Mutex::new(None),
         rebind_error: Mutex::new(None),
+        #[cfg(windows)]
+        key_capture: Mutex::new(None),
+        #[cfg(windows)]
+        before_menu: Mutex::new(None),
         update: Mutex::new(None),
-        update_dmg: Mutex::new(None),
+        update_file: Mutex::new(None),
         menu_key: Mutex::new(String::new()),
         ax_trusted: Mutex::new(accessibility_ready()),
         elapsed_ms: Mutex::new(0),
@@ -1136,6 +1338,11 @@ pub fn run() {
             // is shown. This single line is what makes rule 1 achievable on macOS.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            // Windows has no such policy; the box carries never-activate styles instead.
+            #[cfg(windows)]
+            if let Some(w) = app.get_webview_window("composer") {
+                win_surface::prepare(&w);
+            }
 
             {
                 let handle = app.handle().clone();
@@ -1148,15 +1355,21 @@ pub fn run() {
             }
 
             // The menu-bar H holds every setting, as in Snip 'n' Clip. A template image, so
-            // macOS tints it to match the menu bar like every other item there.
+            // macOS tints it to match the menu bar like every other item there. Windows does not
+            // tint tray icons, so there it is Snip 'n' Clip's tray gray, which reads on a light
+            // or a dark taskbar.
             {
                 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
                 let menu = build_menu(app.handle())?;
                 *app.state::<App>().menu_key.lock() = menu_key(&app.state::<App>());
+                #[cfg(windows)]
+                let icon = tauri::include_image!("icons/tray-win.png");
+                #[cfg(not(windows))]
+                let icon = tauri::include_image!("icons/tray@2x.png");
                 TrayIconBuilder::with_id(TRAY)
                     .menu(&menu)
                     .show_menu_on_left_click(true)
-                    .icon(tauri::include_image!("icons/tray@2x.png"))
+                    .icon(icon)
                     .icon_as_template(true)
                     .tooltip("Huck's Voice to Text")
                     .on_tray_icon_event(|tray, event| {
@@ -1168,13 +1381,21 @@ pub fn run() {
                             *state.ax_trusted.lock() = accessibility_ready();
                             refresh_menu(app);
                         }
+                        // Windows: note where he was working before the click takes it away.
+                        #[cfg(windows)]
+                        if matches!(event, TrayIconEvent::Enter { .. } | TrayIconEvent::Move { .. }) {
+                            if let Some(h) = win_surface::outside_foreground() {
+                                *tray.app_handle().state::<App>().before_menu.lock() = Some(h);
+                            }
+                        }
                     })
                     .build(app)?;
                 app.handle().on_menu_event(|app, event| on_menu(app, event.id.as_ref()));
             }
 
             // Listen for the browser extension's native-messaging host. No port, no polling:
-            // it is a Unix socket in the app-data directory that only this user can open.
+            // it is a Unix socket in the app-data directory that only this user can open - on
+            // Windows too, which has had them since Windows 10 1803.
             {
                 let state: State<App> = app.state();
                 if let Err(e) = state.bridge.serve() {
