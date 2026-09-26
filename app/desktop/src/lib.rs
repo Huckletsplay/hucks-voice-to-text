@@ -1065,6 +1065,12 @@ fn resolve_pin(
     });
     let borrow = state.settings.lock().clipboard == ClipboardChoice::Huck;
     let paste = || stamp.map(|s| PasteDestination::new(s, app_label.clone(), borrow));
+    let unsure = || {
+        PinError::Other(
+            "Huck couldn't tell if that's a password box, so it will only copy the words."
+                .into(),
+        )
+    };
 
     let set = |d: Box<dyn Destination>| {
         *state.message.lock() = format!("Listening — will send to {}", d.label());
@@ -1077,11 +1083,20 @@ fn resolve_pin(
         }
     };
 
-    // The extension is the only silent way into Chrome, and it needs no macOS permission.
+    // The extension is the only silent way into Chrome, and it needs no macOS permission. Its
+    // secure-field answer is final: falling through to a paste would type into a field the
+    // extension had just identified as a password box.
     if is_chromium_executable(&exe) {
-        if let Some(Ok(d)) = browser {
-            set(Box::new(d));
-            return;
+        match browser {
+            Some(Ok(d)) => {
+                set(Box::new(d));
+                return;
+            }
+            Some(Err(ref why)) if why == "secure-field" => {
+                note(PinError::SecureField);
+                return;
+            }
+            _ => {}
         }
     } else if let Some(Ok(_)) = browser {
         // Not our destination; release it so the extension is not left holding a field.
@@ -1104,8 +1119,24 @@ fn resolve_pin(
         return;
     }
 
-    // Chrome without the extension and Electron apps have no silent write at all: paste.
-    if is_chromium_executable(&exe) || is_unsupported_executable(&exe).is_some() {
+    // Chrome without the extension has no silent write at all. Paste only after Accessibility's
+    // capture from the keypress says clearly that the field was not a password box. A missing or
+    // unreadable subrole is copy-only.
+    if is_chromium_executable(&exe) {
+        match pending.candidate().and_then(macos_ax::captured_is_password) {
+            Some(false) => match paste() {
+                Some(p) => set(Box::new(p)),
+                None => note(PinError::Unsupported { app: app_label.clone() }),
+            },
+            Some(true) => note(PinError::SecureField),
+            None => note(unsure()),
+        }
+        return;
+    }
+
+    // Desktop Chromium apps are trusted by the user's explicit decision. Their login screens are
+    // the only expected password fields, and asking Accessibility changes how the apps behave.
+    if is_unsupported_executable(&exe).is_some() {
         match paste() {
             Some(p) => set(Box::new(p)),
             None => note(PinError::Unsupported { app: app_label.clone() }),
@@ -1118,6 +1149,8 @@ fn resolve_pin(
         Err(PinResolution::Rejected(reason)) if reason == "secure-field" => {
             note(PinError::SecureField)
         }
+        // Could not tell whether it is a password box: no write and no paste, only the copy.
+        Err(PinResolution::Rejected(reason)) if reason == "password-unknown" => note(unsure()),
         // Nothing Accessibility could read, or not a text field it knows: paste, gated.
         Err(_) => match paste() {
             Some(p) => set(Box::new(p)),

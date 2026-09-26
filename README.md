@@ -17,8 +17,8 @@ and download:
 
 | Platform | Download | Requirement |
 |---|---|---|
-| macOS | `HucksVoiceToText-0.1.1-macOS-arm64-unsigned-beta.dmg` | Apple silicon Mac (M1 or newer), macOS 11 or newer |
-| Windows | `HucksVoiceToText-0.1.1-windows-x64-setup.exe` | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
+| macOS | `HucksVoiceToText-0.1.2-macOS-arm64-unsigned-beta.dmg` | Apple silicon Mac (M1 or newer), macOS 11 or newer |
+| Windows | `HucksVoiceToText-0.1.2-windows-x64-setup.exe` | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
 
 This is an unsigned public beta: macOS Gatekeeper and Windows SmartScreen will both call the
 developer unknown. Installation instructions are below, and each download has a SHA-256 checksum
@@ -63,7 +63,7 @@ for the new copy. Your settings and shortcuts are kept.
 
 ## Install on Windows
 
-1. Download `HucksVoiceToText-0.1.1-windows-x64-setup.exe` and run it.
+1. Download `HucksVoiceToText-0.1.2-windows-x64-setup.exe` and run it.
 2. Because this beta is not code-signed, Windows may show **Windows protected your PC**. Choose
    **More info**, then **Run anyway**.
 3. Follow the installer. It needs no administrator rights: it installs for your account only, into
@@ -117,19 +117,17 @@ explicitly choose **Check for Updates**. To report a security issue privately, s
 Each download has a checksum file beside it on the release page.
 
 ```bash
-shasum -a 256 HucksVoiceToText-0.1.1-macOS-arm64-unsigned-beta.dmg
+shasum -a 256 -c HucksVoiceToText-0.1.2-macOS-arm64-unsigned-beta.dmg.sha256.txt
 ```
 
 ```powershell
-Get-FileHash .\HucksVoiceToText-0.1.1-windows-x64-setup.exe -Algorithm SHA256
+Get-FileHash .\HucksVoiceToText-0.1.2-windows-x64-setup.exe -Algorithm SHA256
+Get-Content .\HucksVoiceToText-0.1.2-windows-x64-setup.exe.sha256.txt
 ```
 
-Expected SHA-256:
-
-```text
-73479b1a0fb7bbe5dd356ce068e2e4be81d0a8ff732876802bb2a4bb81ef110a  HucksVoiceToText-0.1.1-macOS-arm64-unsigned-beta.dmg
-47021d7fde0e20c58e2c9f1e629d94952696afa7922720b8357cdbd62f8e3035  HucksVoiceToText-0.1.1-windows-x64-setup.exe
-```
+On Windows, compare the hash printed by `Get-FileHash` with the first value in the checksum file.
+Keeping the expected hashes beside the release downloads lets both installers be built from the
+same tagged source commit.
 
 ## Support
 

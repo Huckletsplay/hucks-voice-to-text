@@ -36,9 +36,11 @@ const HID_EVENT_TAP: u32 = 0; // kCGHIDEventTap
 const KEY_V: u16 = 9;
 const FLAG_COMMAND: u64 = 0x0010_0000;
 
-/// Key presses allowed between the keypress and delivery: the stop press, plus auto-repeat if
-/// the shortcut is held a moment. Anything more means he typed somewhere.
-const SHORTCUT_KEYS: u32 = 3;
+/// Exactly one key press is allowed between capture and delivery: the stop shortcut's ordinary
+/// key. Core Graphics' cumulative counter includes auto-repeat and cannot identify which key
+/// repeated, so a held stop shortcut refuses the paste instead of granting extra presses that
+/// could hide real typing. The words remain on the chosen clipboard in every refusal.
+const STOP_KEY_PRESSES: u32 = 1;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -84,8 +86,8 @@ impl FocusStamp {
         if clicks() != self.clicks {
             return Some("clicked");
         }
-        if keys().wrapping_sub(self.keys) > SHORTCUT_KEYS {
-            return Some("typed");
+        if let Some(why) = key_change_reason(self.keys, keys()) {
+            return Some(why);
         }
         None
     }
@@ -136,6 +138,14 @@ fn keys() -> u32 {
     unsafe { CGEventSourceCounterForEventType(HID_SYSTEM_STATE, KEY_DOWN) }
 }
 
+fn key_change_reason(before: u32, after: u32) -> Option<&'static str> {
+    match after.wrapping_sub(before) {
+        STOP_KEY_PRESSES => None,
+        0 => Some("stop-key-not-seen"),
+        _ => Some("typed-or-repeated"),
+    }
+}
+
 /// Press Cmd+V in whatever has keyboard focus. Every caller decides first that focus is right.
 ///
 /// Immediate, even with the shortcut's keys still held. The keystroke carries exactly one
@@ -173,11 +183,11 @@ pub fn press_paste() -> Result<(), DeliveryError> {
 /// clipboard when it handles the keystroke, a moment later, so the give-back waits for it.
 pub fn paste_borrowing_clipboard(text: &str) -> Result<(), DeliveryError> {
     let borrowed = crate::clip::huck::borrow_general(text)
-        .ok_or_else(|| DeliveryError::Other("the clipboard refused the text".into()))?;
+        .map_err(DeliveryError::Other)?;
     let pressed = press_paste();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        borrowed.give_back();
+        let _ = borrowed.give_back();
     });
     pressed
 }
@@ -218,5 +228,18 @@ impl Destination for PasteDestination {
         } else {
             press_paste()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_change_reason;
+
+    #[test]
+    fn only_the_single_stop_press_passes_the_key_gate() {
+        assert_eq!(key_change_reason(10, 11), None);
+        assert_eq!(key_change_reason(10, 10), Some("stop-key-not-seen"));
+        assert_eq!(key_change_reason(10, 12), Some("typed-or-repeated"));
+        assert_eq!(key_change_reason(u32::MAX, 0), None, "the system counter may wrap");
     }
 }

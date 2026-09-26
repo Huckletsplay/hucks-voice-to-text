@@ -25,9 +25,13 @@ fn huck_clipboard_holds_its_own_text() {
 #[ignore]
 fn borrowing_the_normal_clipboard_puts_back_exactly_what_was_there() {
     // Whatever he has copied - text, an image, a file - must come back byte for byte.
-    let before = huck::snapshot_general();
+    let before = huck::snapshot_general().expect("clipboard can be read completely");
     let borrowed = huck::borrow_general("borrowed for a paste").expect("clipboard refused");
     assert_eq!(huck::general_text().as_deref(), Some("borrowed for a paste"));
-    borrowed.give_back();
-    assert_eq!(huck::snapshot_general(), before, "the normal clipboard was not restored");
+    assert!(borrowed.give_back(), "the normal clipboard accepted the restore");
+    assert_eq!(
+        huck::snapshot_general().expect("restored clipboard can be read completely"),
+        before,
+        "the normal clipboard was not restored"
+    );
 }

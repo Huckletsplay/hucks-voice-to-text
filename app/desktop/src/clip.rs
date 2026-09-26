@@ -73,36 +73,120 @@ pub mod huck {
     /// Everything on the normal clipboard, every item and every type, so an image or a copied
     /// file comes back exactly as it was - not just its text.
     pub struct Borrowed {
+        board: String,
         items: Vec<Vec<(String, Vec<u8>)>>,
         ours: isize,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Snapshot {
+        items: Vec<Vec<(String, Vec<u8>)>>,
+        change_count: isize,
+    }
+
+    /// Every item and type on `board`, as plain bytes. One unreadable promised/private type makes
+    /// the whole snapshot fail; silently keeping the other types would make the later restore
+    /// destructive. A copy made while the bytes are being read also invalidates the snapshot.
+    fn snapshot(board: &NSPasteboard) -> Result<Snapshot, String> {
+        let change_count = board.changeCount();
+        let mut items = Vec::new();
+        if let Some(list) = board.pasteboardItems() {
+            for item in list.iter() {
+                let mut types = Vec::new();
+                for kind in item.types().iter() {
+                    let data = item
+                        .dataForType(&kind)
+                        .ok_or_else(|| format!("the clipboard type {} could not be read", kind))?;
+                    types.push((kind.to_string(), data.to_vec()));
+                }
+                if types.is_empty() {
+                    return Err("the clipboard contained an item with no readable types".into());
+                }
+                items.push(types);
+            }
+        } else if board
+            .types()
+            .map(|types| types.iter().next().is_some())
+            .unwrap_or(false)
+        {
+            return Err("the clipboard listed types but its items could not be read".into());
+        }
+        if board.changeCount() != change_count {
+            return Err("the clipboard changed while it was being read".into());
+        }
+        Ok(Snapshot { items, change_count })
+    }
+
     /// Every item and type on the normal clipboard, as plain bytes.
-    pub fn snapshot_general() -> Vec<Vec<(String, Vec<u8>)>> {
-        NSPasteboard::generalPasteboard()
-            .pasteboardItems()
-            .map(|list| {
-                list.iter()
-                    .map(|item| {
-                        item.types()
-                            .iter()
-                            .filter_map(|t| {
-                                let data = item.dataForType(&t)?;
-                                Some((t.to_string(), data.to_vec()))
-                            })
-                            .collect()
-                    })
-                    .collect()
+    pub fn snapshot_general() -> Result<Vec<Vec<(String, Vec<u8>)>>, String> {
+        snapshot(&NSPasteboard::generalPasteboard()).map(|snapshot| snapshot.items)
+    }
+
+    fn objects(
+        items: &[Vec<(String, Vec<u8>)>],
+    ) -> Result<Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>>, String> {
+        items
+            .iter()
+            .map(|types| {
+                if types.is_empty() {
+                    return Err("the clipboard snapshot contained an empty item".into());
+                }
+                let item = NSPasteboardItem::new();
+                for (kind, bytes) in types {
+                    if !item.setData_forType(
+                        &NSData::with_bytes(bytes),
+                        &NSString::from_str(kind),
+                    ) {
+                        return Err(format!("the clipboard type {kind} could not be prepared"));
+                    }
+                }
+                Ok(ProtocolObject::from_retained(item))
             })
-            .unwrap_or_default()
+            .collect()
+    }
+
+    fn restore(board: &NSPasteboard, items: &[Vec<(String, Vec<u8>)>]) -> bool {
+        let objects = match objects(items) {
+            Ok(objects) => objects,
+            Err(why) => {
+                eprintln!("[hvtt] {why}; the clipboard was left untouched");
+                return false;
+            }
+        };
+        board.clearContents();
+        items.is_empty() || board.writeObjects(&NSArray::from_retained_slice(&objects))
+    }
+
+    fn borrow_snapshot(
+        board: &NSPasteboard,
+        text: &str,
+        snapshot: Snapshot,
+    ) -> Result<Borrowed, String> {
+        // A copy made after the snapshot wins. Check immediately before the destructive clear;
+        // NSPasteboard offers no transaction or lock, so this is the narrowest possible race.
+        if board.changeCount() != snapshot.change_count {
+            return Err("the clipboard changed before it could be borrowed".into());
+        }
+        if !put(board, text) {
+            let _ = restore(board, &snapshot.items);
+            return Err("the normal clipboard refused the borrowed text".into());
+        }
+        Ok(Borrowed {
+            board: board.name().to_string(),
+            items: snapshot.items,
+            ours: board.changeCount(),
+        })
+    }
+
+    fn borrow(board: &NSPasteboard, text: &str) -> Result<Borrowed, String> {
+        let snapshot = snapshot(board)?;
+        borrow_snapshot(board, text, snapshot)
     }
 
     /// Put `text` on the normal clipboard for a moment, remembering what was there. A paste into
     /// an app like VS Code can only come from the normal clipboard.
-    pub fn borrow_general(text: &str) -> Option<Borrowed> {
-        let items = snapshot_general();
-        let general = NSPasteboard::generalPasteboard();
-        put(&general, text).then(|| Borrowed { items, ours: general.changeCount() })
+    pub fn borrow_general(text: &str) -> Result<Borrowed, String> {
+        borrow(&NSPasteboard::generalPasteboard(), text)
     }
 
     /// What the normal clipboard holds as text, if anything.
@@ -114,27 +198,87 @@ pub mod huck {
 
     impl Borrowed {
         /// Put his clipboard back - unless he copied something new in the meantime, which wins.
-        pub fn give_back(self) {
-            let general = NSPasteboard::generalPasteboard();
-            if general.changeCount() != self.ours {
-                return;
+        pub fn give_back(self) -> bool {
+            let board = NSPasteboard::pasteboardWithName(&NSString::from_str(&self.board));
+            if board.changeCount() != self.ours {
+                return false;
             }
-            general.clearContents();
-            if self.items.is_empty() {
-                return;
+            let restored = restore(&board, &self.items);
+            if !restored {
+                eprintln!("[hvtt] the borrowed clipboard could not be restored completely");
             }
-            let items: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = self
-                .items
-                .iter()
-                .map(|types| {
-                    let item = NSPasteboardItem::new();
-                    for (t, bytes) in types {
-                        item.setData_forType(&NSData::with_bytes(bytes), &NSString::from_str(t));
-                    }
-                    ProtocolObject::from_retained(item)
-                })
-                .collect();
-            general.writeObjects(&NSArray::from_retained_slice(&items));
+            restored
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn private_board() -> Retained<NSPasteboard> {
+            NSPasteboard::pasteboardWithUniqueName()
+        }
+
+        fn seed_two_items(board: &NSPasteboard) {
+            let first = NSPasteboardItem::new();
+            assert!(first.setData_forType(
+                &NSData::with_bytes(b"plain"),
+                &NSString::from_str("public.utf8-plain-text"),
+            ));
+            assert!(first.setData_forType(
+                &NSData::with_bytes(b"<b>plain</b>"),
+                &NSString::from_str("public.html"),
+            ));
+            let second = NSPasteboardItem::new();
+            assert!(second.setData_forType(
+                &NSData::with_bytes(b"file:///tmp/example"),
+                &NSString::from_str("public.file-url"),
+            ));
+            let items: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = vec![
+                ProtocolObject::from_retained(first),
+                ProtocolObject::from_retained(second),
+            ];
+            board.clearContents();
+            assert!(board.writeObjects(&NSArray::from_retained_slice(&items)));
+        }
+
+        #[test]
+        fn a_borrow_restores_every_item_and_type() {
+            let board = private_board();
+            seed_two_items(&board);
+            let before = snapshot(&board).unwrap().items;
+            let borrowed = borrow(&board, "borrowed").expect("private pasteboard can be borrowed");
+            assert_eq!(
+                board
+                    .stringForType(unsafe { NSPasteboardTypeString })
+                    .map(|s| s.to_string())
+                    .as_deref(),
+                Some("borrowed")
+            );
+            assert!(borrowed.give_back());
+            assert_eq!(snapshot(&board).unwrap().items, before);
+        }
+
+        #[test]
+        fn a_copy_between_snapshot_and_write_cancels_the_borrow() {
+            let board = private_board();
+            seed_two_items(&board);
+            let stale = snapshot(&board).unwrap();
+            assert!(put(&board, "newer copy"));
+            let newer = snapshot(&board).unwrap().items;
+            let result = borrow_snapshot(&board, "must not replace it", stale);
+            assert!(result.is_err());
+            assert_eq!(snapshot(&board).unwrap().items, newer);
+        }
+
+        #[test]
+        fn an_empty_clipboard_can_be_borrowed_and_restored() {
+            let board = private_board();
+            board.clearContents();
+            assert!(snapshot(&board).unwrap().items.is_empty());
+            let borrowed = borrow(&board, "borrowed").expect("an empty pasteboard can be borrowed");
+            assert!(borrowed.give_back());
+            assert!(snapshot(&board).unwrap().items.is_empty());
         }
     }
 }
