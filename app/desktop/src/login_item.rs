@@ -4,7 +4,7 @@
 //! The operating system is the authority, so nothing is mirrored into settings: a saved choice
 //! could disagree after he changes Login Items or Startup Apps by hand.
 //!
-//! - **macOS:** `SMAppService.mainApp` (macOS 13 and later), the same call Snip 'n' Clip makes.
+//! - **macOS:** `SMAppService.mainAppService` (Swift's `mainApp`; macOS 13 and later), the same call Snip 'n' Clip makes.
 //!   Older systems show the row switched off and greyed.
 //! - **Windows:** a value under the current user's `Run` key, pointing at the running program.
 //!   The installer removes it on uninstall.
@@ -67,7 +67,9 @@ mod platform {
 
     fn main_app() -> Option<&'static AnyObject> {
         let class = class()?;
-        let service: *mut AnyObject = unsafe { msg_send![class, mainApp] };
+        // `mainApp` is only the Swift name; sending it raises an exception Rust cannot catch,
+        // which aborted the app at launch (0.1.3's first Mac build).
+        let service: *mut AnyObject = unsafe { msg_send![class, mainAppService] };
         unsafe { service.as_ref() }
     }
 
@@ -213,6 +215,13 @@ fn command_points_at(command: &str, exe: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reads only. A wrong selector here raises an Objective-C exception, which aborts the
+    /// process - at launch, because the menu asks for this before anything else.
+    #[test]
+    fn asking_the_system_for_the_login_state_does_not_crash() {
+        let _ = state();
+    }
 
     #[test]
     fn a_run_command_is_matched_to_this_program_only() {

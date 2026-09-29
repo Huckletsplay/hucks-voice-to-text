@@ -1558,6 +1558,7 @@ dependencies = [
 name = "hvtt-desktop"
 version = "0.1.3"
 dependencies = [
+ "block2",
  "core-foundation",
  "core-foundation-sys",
  "cpal",

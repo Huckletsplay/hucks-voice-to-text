@@ -40,6 +40,8 @@ tauri-plugin-global-shortcut = "2.3.2"
 # The Accessibility and CoreGraphics calls behind delivery on macOS.
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
+# The handler for counting clicks on Huck's own windows. Already in the tree through objc2.
+block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSString"] }

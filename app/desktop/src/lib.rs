@@ -936,6 +936,35 @@ fn pause_resume(app: AppHandle, input: BoxInput) {
     }
 }
 
+/// macOS: any click on the box - a button, the bar, a drag - makes this the active app, which
+/// takes the caret out of his text box. Windows' box never activates, so there it stays put.
+/// Once the mouse is let go, give the caret back - to the app he was in, which is not always the
+/// one he is dictating into - unless the click was into the words to fix them (`take_keyboard`)
+/// or the box is the shortcut prompt.
+#[cfg(target_os = "macos")]
+fn box_became_key(app: &AppHandle) {
+    let app = app.clone();
+    let was_in = crate::destination::macos_paste::front_app();
+    std::thread::spawn(move || {
+        let wait = std::time::Duration::from_millis(20);
+        for _ in 0..500 {
+            if !crate::destination::macos_paste::mouse_is_down() {
+                break;
+            }
+            std::thread::sleep(wait);
+        }
+        // Time for the click to reach the page and say whether it wants the keyboard.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let state: State<App> = app.state();
+        let dictating = state.session.lock().is_dictating();
+        if dictating && !*state.box_has_keyboard.lock() && state.rebinding.lock().is_none() {
+            if let Some(pid) = was_in.or(*state.workplace.lock()) {
+                crate::destination::macos_paste::activate(pid);
+            }
+        }
+    });
+}
+
 /// The box's Send button: the same as pressing the shortcut, without the key press.
 #[tauri::command]
 fn send(app: AppHandle, input: BoxInput) {
@@ -943,6 +972,12 @@ fn send(app: AppHandle, input: BoxInput) {
     let dictating = app.state::<App>().session.lock().is_dictating();
     if dictating {
         crate::destination::box_input::set_stopped_by_key(false);
+        // macOS: the click made this the active app, so the box does hold the keyboard; saying so
+        // has `finish` hand it back, and wait for the caret, before anything is pasted.
+        #[cfg(target_os = "macos")]
+        {
+            *app.state::<App>().box_has_keyboard.lock() = true;
+        }
         finish(app.clone(), true);
     }
 }
@@ -1291,7 +1326,15 @@ fn resolve_pin(
         exe.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("that app").to_string()
     });
     let borrow = state.settings.lock().clipboard == ClipboardChoice::Huck;
-    let paste = || stamp.map(|s| PasteDestination::new(s, app_label.clone(), borrow));
+    // The box itself, when the app names it: lets him click away and come back (2026-09-29).
+    let field = pending.candidate().cloned();
+    eprintln!(
+        "[hvtt] {app_label}: focused {}",
+        field.as_ref().map(|f| f.role_name()).unwrap_or_else(|| "nothing".into())
+    );
+    let paste = || {
+        stamp.map(|s| PasteDestination::new(s, app_label.clone(), borrow).with_field(field.clone()))
+    };
 
     let set = |d: Box<dyn Destination>| {
         *state.message.lock() = format!("Listening — will send to {}", d.label());
@@ -1729,6 +1772,9 @@ fn deliver_words(app: &AppHandle, text: String, deliver: bool) {
 
     use hvtt_core::pipeline::{DeliveryError, DeliveryOutcome};
     let delivered = matches!(report.delivery, DeliveryOutcome::Delivered { .. });
+    if let DeliveryOutcome::Failed { label, error, detail } = &report.delivery {
+        eprintln!("[hvtt] not delivered to {label}: {error:?} ({})", detail.as_deref().unwrap_or("-"));
+    }
     // Where the words wait, and the key that gets them back.
     let (kept, key) = match choice {
         ClipboardChoice::Huck => ("on Huck's clipboard", paste_key),
@@ -1873,6 +1919,17 @@ pub fn run() {
             // is shown. This single line is what makes rule 1 achievable on macOS.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            #[cfg(target_os = "macos")]
+            crate::destination::macos_paste::count_own_clicks();
+            #[cfg(target_os = "macos")]
+            if let Some(w) = app.get_webview_window("composer") {
+                let handle = app.handle().clone();
+                w.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Focused(true) = event {
+                        box_became_key(&handle);
+                    }
+                });
+            }
             // Windows has no such policy; the box carries never-activate styles instead.
             #[cfg(windows)]
             if let Some(w) = app.get_webview_window("composer") {

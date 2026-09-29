@@ -145,6 +145,21 @@ impl AxElement {
         }
     }
 
+    /// Its Accessibility role, e.g. `AXTextArea`; empty when the app does not say.
+    pub fn role_name(&self) -> String {
+        self.copy_string("AXRole").unwrap_or_default()
+    }
+
+    /// A box that takes typing - the only kind of element worth recognising again.
+    pub fn is_text_entry(&self) -> bool {
+        matches!(self.role_name().as_str(), "AXTextArea" | "AXTextField" | "AXComboBox")
+    }
+
+    /// The same element of the same app: macOS compares the process and the element itself.
+    pub fn same_as(&self, other: &AxElement) -> bool {
+        unsafe { core_foundation_sys::base::CFEqual(self.0, other.0) != 0 }
+    }
+
     fn pid(&self) -> Option<i32> {
         unsafe {
             let mut pid: i32 = 0;

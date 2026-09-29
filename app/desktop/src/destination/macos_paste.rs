@@ -55,12 +55,44 @@ extern "C" {
     static kCGWindowNumber: CFStringRef;
 }
 
+/// Mouse presses macOS delivered to this app's own windows - the box, the H. Counted natively
+/// because the page cannot see them all: on 2026-09-28 the system saw 6 clicks during a dictation
+/// and the page 5, and a paste into VS Code was refused although he never left the box.
+static OWN_CLICKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Start counting clicks on this app's windows. Main thread, once, at launch. If it cannot start,
+/// clicks in the box look like clicks elsewhere: a paste is refused, never misdirected.
+pub fn count_own_clicks() {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use std::ptr::NonNull;
+    // NSEventMaskLeftMouseDown | RightMouseDown | OtherMouseDown
+    const MASK: u64 = (1 << 1) | (1 << 3) | (1 << 25);
+    let Some(class) = AnyClass::get(c"NSEvent") else { return };
+    let handler = block2::RcBlock::new(|event: NonNull<AnyObject>| -> *mut AnyObject {
+        OWN_CLICKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        event.as_ptr()
+    });
+    unsafe {
+        let monitor: *mut AnyObject =
+            msg_send![class, addLocalMonitorForEventsMatchingMask: MASK, handler: &*handler];
+        // Kept for the life of the app.
+        std::mem::forget(Retained::retain(monitor));
+    }
+}
+
+fn own_clicks() -> u32 {
+    OWN_CLICKS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// What was in front, and how much he had touched, at the moment the shortcut arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FocusStamp {
     pid: i32,
     window: i64,
     clicks: u32,
+    own_clicks: u32,
     keys: u32,
 }
 
@@ -68,7 +100,7 @@ impl FocusStamp {
     /// Microseconds for the counters; under a millisecond for the window list once warm.
     pub fn capture() -> Option<Self> {
         let (pid, window) = front_window()?;
-        Some(FocusStamp { pid, window, clicks: clicks(), keys: keys() })
+        Some(FocusStamp { pid, window, clicks: clicks(), own_clicks: own_clicks(), keys: keys() })
     }
 
     pub fn pid(&self) -> i32 {
@@ -83,9 +115,16 @@ impl FocusStamp {
             Some((_, window)) if window != self.window => return Some("window-changed"),
             Some(_) => {}
         }
-        // What he did inside Huck's own box is expected; the system counter includes auto-repeat.
-        let (box_clicks, expected_keys) = super::box_input::expected(true);
-        if clicks().wrapping_sub(self.clicks) != box_clicks {
+        // What he did inside Huck's own windows is expected; the system counter includes
+        // auto-repeat. Clicks come from the native count, keys from the box.
+        let (page_clicks, expected_keys) = super::box_input::expected(true);
+        let clicked = clicks().wrapping_sub(self.clicks);
+        let own = own_clicks().wrapping_sub(self.own_clicks);
+        if clicked != own {
+            eprintln!(
+                "[hvtt] paste gate: {clicked} click(s) since the keypress, {own} on Huck's windows \
+                 ({page_clicks} seen by the page)"
+            );
             return Some("clicked");
         }
         if let Some(why) = key_change_reason(self.keys, keys(), expected_keys) {
@@ -212,17 +251,71 @@ pub fn activate(pid: i32) {
     }
 }
 
+/// The app whose ordinary window is in front - the one he was in before touching Huck's box,
+/// which floats above every ordinary window.
+pub fn front_app() -> Option<i32> {
+    front_window().map(|(pid, _)| pid)
+}
+
+/// Whether any mouse button is held right now, anywhere on screen.
+pub fn mouse_is_down() -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+    let Some(class) = AnyClass::get(c"NSEvent") else { return false };
+    let buttons: usize = unsafe { msg_send![class, pressedMouseButtons] };
+    buttons != 0
+}
+
 /// Paste into the field that was focused at the keypress, if - and only if - it still is.
 pub struct PasteDestination {
     stamp: FocusStamp,
     label: String,
     /// Huck's own clipboard is chosen, so the normal one does not hold the words yet.
     borrow: bool,
+    /// The text box focused at the keypress, when the app says which one it is.
+    field: Option<super::macos_ax::AxElement>,
 }
 
 impl PasteDestination {
     pub fn new(stamp: FocusStamp, label: String, borrow: bool) -> Self {
-        PasteDestination { stamp, label, borrow }
+        PasteDestination { stamp, label, borrow, field: None }
+    }
+
+    /// Remember the text box itself, so that clicking elsewhere and back into it still sends.
+    pub fn with_field(mut self, field: Option<super::macos_ax::AxElement>) -> Self {
+        self.field = field.filter(|f| f.is_text_entry());
+        self
+    }
+
+    /// Why a paste would not land in his box, or `None` when it would.
+    ///
+    /// Clicks or typing since the keypress may have moved the caret to another box. Decided with
+    /// him 2026-09-29: he clicks away and back into his box before sending, and expects it to
+    /// arrive. So within the same app and window (checked first, by `moved`):
+    /// - when the app names its focused box, the paste goes only if it is the very box from the
+    ///   keypress;
+    /// - when it names none - VS Code, even in Screen Reader Optimized mode - the paste goes
+    ///   where the caret now is. If he left it in another box of that window, the words land
+    ///   there: inserted, never sent, and still on the clipboard.
+    ///
+    /// Another app or window, or the stop press not seen, still refuses.
+    fn gone(&self) -> Option<&'static str> {
+        let why = self.stamp.moved()?;
+        if !matches!(why, "clicked" | "typed-or-repeated") {
+            return Some(why);
+        }
+        let Some(field) = &self.field else {
+            eprintln!("[hvtt] paste gate: {why}, same window - sending where the caret is");
+            return None;
+        };
+        use hvtt_core::pinning::FocusSource;
+        match super::macos_ax::AxFocusSource.focused_now() {
+            Some(now) if now.same_as(field) => {
+                eprintln!("[hvtt] paste gate: {why}, but back in the same box - sending");
+                None
+            }
+            _ => Some("another-box"),
+        }
     }
 }
 
@@ -232,7 +325,7 @@ impl Destination for PasteDestination {
     }
 
     fn is_alive(&self) -> Liveness {
-        match self.stamp.moved() {
+        match self.gone() {
             None => Liveness::Alive,
             Some(why) => Liveness::dead(why),
         }
@@ -240,7 +333,7 @@ impl Destination for PasteDestination {
 
     fn deliver(&self, text: &str) -> Result<(), DeliveryError> {
         // Checked again last thing: transcription took time in which he could have clicked away.
-        if self.stamp.moved().is_some() {
+        if self.gone().is_some() {
             return Err(DeliveryError::DestinationLost);
         }
         if self.borrow {

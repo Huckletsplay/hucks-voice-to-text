@@ -138,7 +138,10 @@ function renderWords(s) {
   ui.controls.hidden = !dictating;
   ui.learning.hidden = !dictating;
   ui.learning.setAttribute("aria-pressed", String(!!s.learning));
-  ui.pause.textContent = s.state === "paused" ? "Resume" : "Pause";
+  // Only when it changes: this runs with every live update, and WebKit (macOS) drops a click
+  // whose word was replaced between press and release - Pause worked only off its label.
+  const pauseLabel = s.state === "paused" ? "Resume" : "Pause";
+  if (ui.pause.textContent !== pauseLabel) ui.pause.textContent = pauseLabel;
 
   const paused = s.state === "paused";
   const showLive = s.state === "recording" || s.state === "transcribing";
@@ -259,8 +262,9 @@ ui.learning.addEventListener("click", () => {
 // Clicking into the words pauses, so they stop changing under him, and gives the box the keyboard.
 ui.live.addEventListener("click", async () => {
   wantCaret = true;
-  if (last === "recording") await invoke("pause_resume", { input: { ...input } });
+  // The keyboard first, so the pause does not hand it back to his app (macOS).
   await invoke("take_keyboard", { input: { ...input } });
+  if (last === "recording") await invoke("pause_resume", { input: { ...input } });
 });
 ui.edit.addEventListener("mousedown", () => invoke("take_keyboard", { input: { ...input } }));
 ui.edit.addEventListener("input", () => {

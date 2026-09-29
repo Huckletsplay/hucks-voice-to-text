@@ -1,6 +1,6 @@
 //! Check for Updates.
 //!
-//! Asks GitHub for the latest release **only when he chooses it** from the menu — there is no
+//! Asks GitHub for its releases **only when he chooses it** from the menu — there is no
 //! background check, and this is the program's only network connection. It mirrors Huck's Snip 'n'
 //! Clip:
 //!
@@ -13,6 +13,11 @@
 //!   Windows: the verified installer is started and the app steps aside for it, as Snip 'n' Clip
 //!   does.
 //!
+//! **Each platform updates on its own (since 0.1.3, 2026-09-29).** The newest release that carries
+//! *this* platform's download is the one that counts, so a Mac-only or Windows-only release is
+//! invisible to the other platform. GitHub's single "latest" release could not do that: a release
+//! for one platform told the other that its download was missing.
+//!
 //! The rules are plain functions with tests; the network and hashing go through the system's own
 //! tools (`curl` and `shasum` on macOS, `curl.exe` and `certutil` on Windows), so there is no HTTP
 //! or crypto dependency to carry.
@@ -21,8 +26,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 pub const REPOSITORY: &str = "Huckletsplay/hucks-voice-to-text";
-const LATEST_RELEASE_API: &str =
-    "https://api.github.com/repos/Huckletsplay/hucks-voice-to-text/releases/latest";
+/// Published releases, newest first. Drafts are never listed for an anonymous request.
+const RELEASES_API: &str =
+    "https://api.github.com/repos/Huckletsplay/hucks-voice-to-text/releases?per_page=30";
 const DOWNLOAD_PREFIX: &str =
     "https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/";
 
@@ -71,15 +77,52 @@ pub enum Check {
     Available(Offer),
 }
 
-/// Read GitHub's "latest release" answer against the running version.
+/// Read GitHub's list of releases against the running version: the newest published, non-
+/// prerelease one that carries this platform's download decides. Releases for the other platform
+/// only are passed over.
+pub fn read_releases(json: &str, current: &str) -> Result<Check, String> {
+    let list: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| "GitHub's answer could not be read.".to_string())?;
+    let running = parse_version(current)
+        .ok_or_else(|| format!("This copy has an unexpected version ({current:?})."))?;
+    let mut releases: Vec<(Version, &serde_json::Value)> = list
+        .as_array()
+        .ok_or_else(|| "GitHub's answer could not be read.".to_string())?
+        .iter()
+        .filter(|r| r["draft"].as_bool() != Some(true) && r["prerelease"].as_bool() != Some(true))
+        .filter_map(|r| Some((parse_version(r["tag_name"].as_str()?)?, r)))
+        .collect();
+    releases.sort_by(|a, b| b.0.cmp(&a.0));
+    for (version, release) in releases {
+        let tag = release["tag_name"].as_str().unwrap_or_default();
+        let name = download_name(tag.trim_start_matches('v'));
+        let has_ours = release["assets"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|a| a["name"].as_str() == Some(name.as_str())));
+        if !has_ours {
+            continue;
+        }
+        if version <= running {
+            return Ok(Check::UpToDate { latest: tag.trim_start_matches('v').to_string() });
+        }
+        return check_release(release, running);
+    }
+    Ok(Check::UpToDate { latest: current.to_string() })
+}
+
+/// Read one release against the running version.
 pub fn read_release(json: &str, current: &str) -> Result<Check, String> {
     let release: serde_json::Value =
         serde_json::from_str(json).map_err(|_| "GitHub's answer could not be read.".to_string())?;
+    let running = parse_version(current)
+        .ok_or_else(|| format!("This copy has an unexpected version ({current:?})."))?;
+    check_release(&release, running)
+}
+
+fn check_release(release: &serde_json::Value, running: Version) -> Result<Check, String> {
     let tag = release["tag_name"].as_str().unwrap_or_default();
     let latest = parse_version(tag)
         .ok_or_else(|| format!("The latest release has an unexpected version tag ({tag:?})."))?;
-    let running = parse_version(current)
-        .ok_or_else(|| format!("This copy has an unexpected version ({current:?})."))?;
     let version = tag.trim_start_matches('v').to_string();
     if latest <= running {
         return Ok(Check::UpToDate { latest: version });
@@ -155,7 +198,7 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
-/// Ask GitHub about the latest release.
+/// Ask GitHub for its releases, and find the newest one for this platform.
 pub fn fetch_latest(current: &str) -> Result<Check, String> {
     let agent = format!("HucksVoiceToText/{current}");
     let body = curl(&[
@@ -165,9 +208,9 @@ pub fn fetch_latest(current: &str) -> Result<Check, String> {
         "Accept: application/vnd.github+json",
         "--user-agent",
         &agent,
-        LATEST_RELEASE_API,
+        RELEASES_API,
     ])?;
-    read_release(&String::from_utf8_lossy(&body), current)
+    read_releases(&String::from_utf8_lossy(&body), current)
 }
 
 /// Where downloads wait. Per-user temporary space, cleared before and on any failure.
@@ -326,6 +369,65 @@ mod tests {
         let other = "HucksVoiceToText-0.2.0-macOS-universal.dmg";
         let json = release("v0.2.0", &[(other, &url("0.2.0", other), 123), (&sum, &url("0.2.0", &sum), 90)]);
         assert!(read_release(&json, "0.1.0").is_err());
+    }
+
+    fn listed(tag: &str, files: &[String], extra: serde_json::Value) -> serde_json::Value {
+        let v = tag.trim_start_matches('v');
+        let assets: Vec<_> = files
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "browser_download_url": url(v, n), "size": 10}))
+            .collect();
+        let mut r = serde_json::json!({"tag_name": tag, "assets": assets});
+        r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        r
+    }
+
+    fn ours(v: &str) -> Vec<String> {
+        vec![download_name(v), checksum_name(v)]
+    }
+
+    #[test]
+    fn a_release_for_the_other_platform_only_is_passed_over() {
+        let other = vec!["HucksVoiceToText-0.1.5-other-platform.bin".to_string()];
+        let list = serde_json::json!([
+            listed("v0.1.5", &other, serde_json::json!({})),
+            listed("v0.1.4", &ours("0.1.4"), serde_json::json!({})),
+            listed("v0.1.3", &ours("0.1.3"), serde_json::json!({})),
+        ]);
+        let Check::Available(offer) = read_releases(&list.to_string(), "0.1.3").unwrap() else {
+            panic!("0.1.4 carries this platform's download")
+        };
+        assert_eq!(offer.version, "0.1.4");
+        assert_eq!(read_releases(&list.to_string(), "0.1.4").unwrap(),
+                   Check::UpToDate { latest: "0.1.4".into() });
+    }
+
+    #[test]
+    fn drafts_and_prereleases_are_never_offered() {
+        let list = serde_json::json!([
+            listed("v0.2.0", &ours("0.2.0"), serde_json::json!({"draft": true})),
+            listed("v0.1.9", &ours("0.1.9"), serde_json::json!({"prerelease": true})),
+            listed("v0.1.3", &ours("0.1.3"), serde_json::json!({})),
+        ]);
+        assert!(matches!(read_releases(&list.to_string(), "0.1.3").unwrap(), Check::UpToDate { .. }));
+    }
+
+    #[test]
+    fn the_newest_is_found_whatever_order_github_lists_them_in() {
+        let list = serde_json::json!([
+            listed("v0.1.3", &ours("0.1.3"), serde_json::json!({})),
+            listed("v0.1.10", &ours("0.1.10"), serde_json::json!({})),
+        ]);
+        let Check::Available(offer) = read_releases(&list.to_string(), "0.1.3").unwrap() else {
+            panic!("0.1.10 is newer")
+        };
+        assert_eq!(offer.version, "0.1.10");
+    }
+
+    #[test]
+    fn a_half_published_release_for_this_platform_says_so() {
+        let list = serde_json::json!([listed("v0.1.4", &[download_name("0.1.4")], serde_json::json!({}))]);
+        assert!(read_releases(&list.to_string(), "0.1.3").unwrap_err().contains("missing"));
     }
 
     #[test]
