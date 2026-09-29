@@ -2,10 +2,10 @@
 //! Electron (VS Code, Slack, Discord, the Claude and ChatGPT apps), Chrome without the extension,
 //! Windows Terminal, Word.
 //!
-//! A paste lands in *whatever is focused*, so it is gated on the one thing that makes it safe:
-//! **nothing has moved since the keypress**. Same foreground window, same focused control, no
-//! mouse click, no typing beyond the shortcut itself. If any of that changed it refuses, and the
-//! words wait on the clipboard.
+//! A paste lands in *whatever is focused*, so it is gated: **the same foreground window and the
+//! same focused control as at the keypress**. If either changed it refuses, and the words wait on
+//! the clipboard. Clicks and key presses are counted too; since 2026-09-29 they no longer refuse
+//! on their own inside that window and control (`PasteDestination::gone`), as on the Mac.
 //!
 //! Windows keeps no system-wide input counters the way macOS does, so clicks and key presses are
 //! counted by low-level input hooks - **only while a dictation is in flight**. The hooks are
@@ -417,6 +417,38 @@ impl PasteDestination {
     pub fn new(stamp: FocusStamp, label: String, borrow: bool) -> Self {
         PasteDestination { stamp, label, borrow }
     }
+
+    /// Why a paste would not land in his box, or `None` when it would.
+    ///
+    /// Clicks or typing since the keypress may have moved the caret to another box. Decided with
+    /// him 2026-09-29, the twin of `macos_paste`'s rule: he clicks away and back into his box
+    /// before sending, and expects it to arrive. So within the same window and focused control:
+    /// - a native app's text box is its own control, so the paste goes only if it is the very box
+    ///   from the keypress (`focus-changed` otherwise);
+    /// - Chromium and Electron (VS Code, Slack, Chrome) draw every box into one control, which
+    ///   names none of them, so the paste goes where the caret now is. If he left it in another
+    ///   box of that window, the words land there: inserted, never sent, and still on the
+    ///   clipboard.
+    ///
+    /// Another window or control, or the stop press not seen, still refuses.
+    fn gone(&self) -> Option<&'static str> {
+        let why = self.stamp.moved()?;
+        if !same_window_allows(why) {
+            return Some(why);
+        }
+        // `moved` answers a key held at the start before it looks at the window.
+        if let Some(moved) = self.stamp.window_moved() {
+            return Some(moved);
+        }
+        eprintln!("[hvtt] paste gate: {why}, same window and control - sending where the caret is");
+        None
+    }
+}
+
+/// What he may have done since the keypress, inside the same window and control, without the
+/// paste being refused.
+fn same_window_allows(why: &str) -> bool {
+    matches!(why, "clicked" | "typed" | "key-held-at-start")
 }
 
 impl Destination for PasteDestination {
@@ -425,7 +457,7 @@ impl Destination for PasteDestination {
     }
 
     fn is_alive(&self) -> Liveness {
-        match self.stamp.moved() {
+        match self.gone() {
             None => Liveness::Alive,
             Some(why) => Liveness::dead(why),
         }
@@ -433,7 +465,7 @@ impl Destination for PasteDestination {
 
     fn deliver(&self, text: &str) -> Result<(), DeliveryError> {
         // Checked again last thing: transcription took time in which he could have clicked away.
-        if self.stamp.moved().is_some() {
+        if self.gone().is_some() {
             return Err(DeliveryError::DestinationLost);
         }
         if self.borrow {
@@ -472,6 +504,17 @@ mod tests {
         assert_eq!(input_moved(1, 7, edited), Some("clicked"), "counts that do not add up refuse");
         // Sent with the button: no stop press is expected.
         assert_eq!(input_moved(1, 0, (1, 0)), None);
+    }
+
+    #[test]
+    fn clicking_away_and_back_in_the_same_window_still_sends() {
+        // Decided with him 2026-09-29: the same rule as the Mac.
+        for why in ["clicked", "typed", "key-held-at-start"] {
+            assert!(same_window_allows(why), "{why} in the same window and control");
+        }
+        for why in ["window-changed", "focus-changed", "no-front-window", "stop-not-seen"] {
+            assert!(!same_window_allows(why), "{why} still refuses");
+        }
     }
 
     #[test]
