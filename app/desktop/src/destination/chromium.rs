@@ -92,7 +92,6 @@ impl Destination for ChromiumDestination {
             Some("element-detached") | Some("not-in-document") | Some("page-navigated") => {
                 DeliveryError::DestinationLost
             }
-            Some("secure-field") => DeliveryError::RefusedSecureField,
             _ => DeliveryError::NotVerified,
         })
     }

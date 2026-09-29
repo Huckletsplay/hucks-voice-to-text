@@ -135,16 +135,16 @@ mod tests {
 
     #[test]
     fn a_candidate_that_fails_validation_fails_closed() {
-        // Field A was captured but turns out to be unusable - a password box, a dead reference,
+        // Field A was captured but turns out to be unusable - not a text field, a dead reference,
         // an app with no safe write path. The answer is a refusal, never Field B.
         let focus = MovingFocus::on("Field A");
         let pending = PendingPin::capture(&focus);
         focus.user_clicks_into("Field B");
 
         let resolved: Result<String, PinResolution<&str>> =
-            pending.resolve(|_| Err("secure-field"));
+            pending.resolve(|_| Err("not-a-text-field"));
 
-        assert_eq!(resolved, Err(PinResolution::Rejected("secure-field")));
+        assert_eq!(resolved, Err(PinResolution::Rejected("not-a-text-field")));
     }
 
     #[test]

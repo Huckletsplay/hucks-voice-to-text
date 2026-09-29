@@ -17,8 +17,8 @@ and download:
 
 | Platform | Download | Requirement |
 |---|---|---|
-| macOS | `HucksVoiceToText-0.1.2-macOS-arm64-unsigned-beta.dmg` | Apple silicon Mac (M1 or newer), macOS 11 or newer |
-| Windows | `HucksVoiceToText-0.1.2-windows-x64-setup.exe` | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
+| macOS | `HucksVoiceToText-0.1.3-macOS-arm64-unsigned-beta.dmg` | Apple silicon Mac (M1 or newer), macOS 11 or newer |
+| Windows | `HucksVoiceToText-0.1.3-windows-x64-setup.exe` | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
 
 This is an unsigned public beta: macOS Gatekeeper and Windows SmartScreen will both call the
 developer unknown. Installation instructions are below, and each download has a SHA-256 checksum
@@ -31,15 +31,21 @@ Windows 10 22H2; other versions have not yet been tested. Intel Macs are not sup
   is remembered. Go and check something while you talk; the words still go back where they belong.
 - **Never lose what you said.** Before anything is typed, a recovery copy is saved and the words
   are put on the clipboard. If the text box has gone, they are one paste away.
+- **See your words as you talk.** A small floating panel fills in while you speak. Send with the
+  shortcut or the **Send** button; **Pause** when you need to think, and click into the words to fix
+  one before it goes. Then the panel says **Sent** or **Copied** and disappears.
+- **It learns your words.** Fix a word it got wrong — a name, a brand, some jargon — and it
+  remembers, and writes it correctly from then on. Switch it off in the panel or under
+  **Settings > Learn From My Fixes**.
 - **Stay out of the way.** No window to manage and no Dock or taskbar button — just an H in the
-  menu bar or notification area and a small floating panel while you speak, which says **Sent** or
-  **Copied** and disappears.
+  menu bar or notification area.
 - **Keep it private.** Recognition runs entirely on your computer with
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Audio and text never leave it.
 - **Keep your clipboard yours.** Choose the normal clipboard, or Huck's Clipboard, which leaves
   whatever you copied alone and pastes dictation with its own shortcut.
-- **Stay safe.** It never types into password fields, never writes into a text box that has closed
-  or been replaced, and never presses Enter for you.
+- **Stay safe.** It never writes into a text box that has closed or been replaced, and never
+  presses Enter for you.
+- **Start with your computer.** H › Settings › Start at Login (Start with Windows on a PC).
 
 ## Install on macOS
 
@@ -63,7 +69,7 @@ for the new copy. Your settings and shortcuts are kept.
 
 ## Install on Windows
 
-1. Download `HucksVoiceToText-0.1.2-windows-x64-setup.exe` and run it.
+1. Download `HucksVoiceToText-0.1.3-windows-x64-setup.exe` and run it.
 2. Because this beta is not code-signed, Windows may show **Windows protected your PC**. Choose
    **More info**, then **Run anyway**.
 3. Follow the installer. It needs no administrator rights: it installs for your account only, into
@@ -87,7 +93,10 @@ published SHA-256 checksum and verifies both. **Open Update** installs it and st
 
 | To | Do this |
 |---|---|
-| Start and stop dictation | **Option + Space** (Windows: **Alt + Space**), or **Start Dictation** in the H |
+| Start and send dictation | **Option + Space** (Windows: **Alt + Space**), or **Start Dictation** in the H; the panel's **Send** button sends too |
+| Stop to think, or fix a word | **Pause** in the panel (the microphone stops), or click into the words; **Resume** carries on |
+| Choose how hard it works while you talk | **Settings > Live Words**: **As You Talk**, **Lighter** (easier on older computers and battery) or **Off** (words appear when you send) |
+| See or forget what it learned | **Settings > Learned Fixes** — choose one to forget it |
 | Change a shortcut | **Settings > Shortcuts**, pick one, and press the new keys |
 | Choose the clipboard | **Settings > Clipboard**: **Normal Clipboard** (⌘V; Windows: Ctrl + V) or **Huck's Clipboard** (Control + Option + V; Windows: Ctrl + Alt + Shift + V) |
 | Find a lost dictation | **Settings > Open Drafts Folder** — the last 20 are kept, and **Keep Recovery Drafts** turns this off |
@@ -108,7 +117,8 @@ source (`app/extension/`) but is not yet published in the Chrome Web Store.
 Huck's Voice to Text does not require an account, upload audio or text, or collect analytics.
 Speech is recognized on your computer, and recovery copies of your dictations stay in
 `~/Library/Application Support/com.huck.voice-to-text/drafts/` on a Mac and
-`%LOCALAPPDATA%\Huck's Voice to Text\drafts` on Windows. It contacts GitHub only when you
+`%LOCALAPPDATA%\Huck's Voice to Text\drafts` on Windows. The words Learning remembers are kept
+only in the program's settings file, next to that drafts folder. It contacts GitHub only when you
 explicitly choose **Check for Updates**. To report a security issue privately, see
 [SECURITY.md](SECURITY.md).
 
@@ -117,12 +127,12 @@ explicitly choose **Check for Updates**. To report a security issue privately, s
 Each download has a checksum file beside it on the release page.
 
 ```bash
-shasum -a 256 -c HucksVoiceToText-0.1.2-macOS-arm64-unsigned-beta.dmg.sha256.txt
+shasum -a 256 -c HucksVoiceToText-0.1.3-macOS-arm64-unsigned-beta.dmg.sha256.txt
 ```
 
 ```powershell
-Get-FileHash .\HucksVoiceToText-0.1.2-windows-x64-setup.exe -Algorithm SHA256
-Get-Content .\HucksVoiceToText-0.1.2-windows-x64-setup.exe.sha256.txt
+Get-FileHash .\HucksVoiceToText-0.1.3-windows-x64-setup.exe -Algorithm SHA256
+Get-Content .\HucksVoiceToText-0.1.3-windows-x64-setup.exe.sha256.txt
 ```
 
 On Windows, compare the hash printed by `Get-FileHash` with the first value in the checksum file.

@@ -15,7 +15,7 @@ the field as writable, returns success, and changes nothing. Measured, repeatedl
 - **Every write is verified** by reading the value back.
 - **Silence is refusal.** If the page, tab or browser is gone, nothing answers, and the desktop
   app keeps your text on the clipboard instead of guessing.
-- **Password fields are refused**, at pin time and again before writing.
+- **Any text box counts**, password boxes included: what goes into one is your call.
 - It never presses Enter, and never brings the browser to the front.
 
 ## Permissions

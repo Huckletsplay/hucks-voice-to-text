@@ -15,6 +15,9 @@ pub enum SessionState {
     Idle,
     /// The microphone is open.
     Recording,
+    /// Held by him: the microphone is closed and the words so far wait in the box, where he can
+    /// fix them. Resume carries on; the shortcut or Send finishes.
+    Paused,
     /// Audio captured, recognition running.
     Transcribing,
     /// Words are in the composer, on the clipboard, and waiting for the user.
@@ -34,6 +37,7 @@ impl SessionState {
         match self {
             SessionState::Idle => "idle",
             SessionState::Recording => "recording",
+            SessionState::Paused => "paused",
             SessionState::Transcribing => "transcribing",
             SessionState::Ready => "ready",
             SessionState::Error { .. } => "error",
@@ -43,6 +47,11 @@ impl SessionState {
     /// True while the microphone is open. The tray and composer use this, not string matching.
     pub fn is_capturing(&self) -> bool {
         matches!(self, SessionState::Recording)
+    }
+
+    /// True from the start of a dictation until it is sent: listening or paused.
+    pub fn is_dictating(&self) -> bool {
+        matches!(self, SessionState::Recording | SessionState::Paused)
     }
 
     /// True when the hotkey should start a new recording rather than stop one.
@@ -64,10 +73,11 @@ impl SessionState {
             (_, Error { .. }) => true,
             // Starting over is always allowed from a resting state.
             (s, Recording) if s.accepts_start() => true,
-            (Recording, Transcribing) => true,
+            (Recording, Transcribing) | (Paused, Transcribing) => true,
+            (Recording, Paused) | (Paused, Recording) => true,
             (Transcribing, Ready) => true,
             // Dismissing the composer, or abandoning a recording.
-            (Ready, Idle) | (Error { .. }, Idle) | (Recording, Idle) | (Idle, Idle) => true,
+            (Ready, Idle) | (Error { .. }, Idle) | (Recording, Idle) | (Paused, Idle) | (Idle, Idle) => true,
             _ => false,
         };
 
@@ -99,6 +109,18 @@ mod tests {
         let s = s.transition_to(SessionState::Transcribing).unwrap();
         let s = s.transition_to(SessionState::Ready).unwrap();
         assert_eq!(s, SessionState::Ready);
+    }
+
+    #[test]
+    fn a_dictation_can_pause_resume_and_finish_from_either() {
+        let s = SessionState::Recording.transition_to(SessionState::Paused).unwrap();
+        assert!(s.is_dictating() && !s.is_capturing(), "paused: dictating, microphone closed");
+        let s = s.transition_to(SessionState::Recording).unwrap();
+        assert!(s.transition_to(SessionState::Transcribing).is_ok());
+        assert!(SessionState::Paused.transition_to(SessionState::Transcribing).is_ok());
+        assert!(SessionState::Paused.transition_to(SessionState::Idle).is_ok());
+        assert!(!SessionState::Paused.accepts_start(), "the shortcut finishes a paused dictation");
+        assert!(SessionState::Idle.transition_to(SessionState::Paused).is_err());
     }
 
     #[test]

@@ -68,9 +68,124 @@ pub fn is_long_enough(sample_count: usize, sample_rate: u32) -> bool {
     duration_secs(sample_count, sample_rate) >= MIN_USEFUL_SECS
 }
 
+// ---------------------------------------------------------------------------- live recognition
+//
+// While he talks, finished stretches of speech are recognised in the background so the box fills
+// in and the stop press only has the last few seconds left to do. A stretch ends at a pause, so
+// no word is ever cut in half; if he never pauses, it ends at the quietest moment instead.
+
+/// Loudness is judged in windows this long (20 ms at 16 kHz).
+const WINDOW: usize = 320;
+/// A pause this long between words is a place to cut.
+const PAUSE_WINDOWS: usize = 15; // 300 ms
+/// Quieter than this, a window is silence, whatever the microphone's gain.
+const SILENCE_FLOOR: f32 = 0.004;
+
+fn window_rms(samples: &[f32]) -> Vec<f32> {
+    samples
+        .chunks(WINDOW)
+        .map(|w| (w.iter().map(|s| s * s).sum::<f32>() / w.len() as f32).sqrt())
+        .collect()
+}
+
+/// Where to end the next finished stretch of `samples` (16 kHz), or `None` to wait for more.
+///
+/// A stretch is at least `min_secs` long. The cut goes in the middle of the last pause of
+/// 300 ms or more; with no pause by `max_secs`, at the quietest moment after `min_secs`.
+pub fn commit_point(samples: &[f32], min_secs: f32, max_secs: f32) -> Option<usize> {
+    let min = (min_secs * WHISPER_SAMPLE_RATE as f32) as usize / WINDOW;
+    let max = (max_secs * WHISPER_SAMPLE_RATE as f32) as usize / WINDOW;
+    let rms = window_rms(samples);
+    if rms.len() <= min + PAUSE_WINDOWS {
+        return None;
+    }
+    // Quiet relative to how loudly he is speaking, so a hot or a distant microphone both work.
+    let mut sorted = rms.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let loud = sorted[sorted.len() * 9 / 10];
+    let quiet = (loud * 0.15).max(SILENCE_FLOOR);
+
+    // The last pause long enough to cut in, not counting one still running at the very end:
+    // he may only be drawing breath, and the next pass will see it either way.
+    let mut best = None;
+    let mut run = 0;
+    for (i, level) in rms.iter().enumerate() {
+        if *level < quiet {
+            run += 1;
+        } else {
+            if run >= PAUSE_WINDOWS && i - run / 2 > min {
+                best = Some((i - run / 2) * WINDOW);
+            }
+            run = 0;
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+    if rms.len() >= max {
+        let (at, _) = rms[min..max]
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))?;
+        return Some((min + at) * WINDOW);
+    }
+    None
+}
+
+/// Is there any speech in this audio at all? Whisper invents words for silence ("Thank you."),
+/// so a silent stretch is never sent to it.
+pub fn has_speech(samples: &[f32]) -> bool {
+    window_rms(samples).iter().any(|r| *r >= SILENCE_FLOOR * 2.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `secs` of speech-like sound, then `gap` of silence, repeated.
+    fn talk(pattern: &[(f32, bool)]) -> Vec<f32> {
+        let mut out = Vec::new();
+        for (secs, loud) in pattern {
+            let n = (secs * 16_000.0) as usize;
+            out.extend((0..n).map(|i| if *loud { 0.2 * ((i as f32) * 0.3).sin() } else { 0.0 }));
+        }
+        out
+    }
+
+    #[test]
+    fn a_stretch_ends_in_the_middle_of_a_pause() {
+        let audio = talk(&[(4.0, true), (0.6, false), (1.0, true)]);
+        let cut = commit_point(&audio, 3.0, 12.0).expect("the pause is a place to cut");
+        let secs = cut as f32 / 16_000.0;
+        assert!((4.1..4.5).contains(&secs), "cut at {secs}s");
+    }
+
+    #[test]
+    fn nothing_is_cut_too_early_or_mid_breath() {
+        // Too short to be worth a pass on its own.
+        assert_eq!(commit_point(&talk(&[(1.5, true), (0.6, false), (0.5, true)]), 3.0, 12.0), None);
+        // A pause still running at the end may just be a breath.
+        assert_eq!(commit_point(&talk(&[(4.0, true), (0.6, false)]), 3.0, 12.0), None);
+        // A short gap between words is not a pause.
+        assert_eq!(commit_point(&talk(&[(4.0, true), (0.1, false), (1.0, true)]), 3.0, 12.0), None);
+    }
+
+    #[test]
+    fn talking_without_a_pause_is_cut_at_the_quietest_moment() {
+        let mut audio = talk(&[(13.0, true)]);
+        let dip = 6 * 16_000;
+        for s in &mut audio[dip..dip + 640] {
+            *s *= 0.3;
+        }
+        let cut = commit_point(&audio, 3.0, 12.0).expect("forced by the length");
+        assert!((dip..dip + 640).contains(&cut), "cut at {cut}");
+    }
+
+    #[test]
+    fn silence_is_never_sent_for_recognition() {
+        assert!(!has_speech(&talk(&[(2.0, false)])));
+        assert!(has_speech(&talk(&[(1.0, false), (0.5, true)])));
+    }
 
     #[test]
     fn stereo_averages_down_to_mono() {

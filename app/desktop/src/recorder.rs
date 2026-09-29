@@ -12,6 +12,8 @@ use std::sync::Arc;
 struct Buffer {
     samples: Vec<f32>,
     peak: f32,
+    /// Paused by him: whatever the device still delivers is thrown away, never kept.
+    paused: bool,
 }
 
 pub struct Recording {
@@ -111,18 +113,52 @@ impl Recording {
         peak
     }
 
-    /// Stop capturing and return 16 kHz mono audio, ready for recognition.
-    pub fn finish(self) -> Vec<f32> {
+    /// Pause: the stream is stopped, and anything already in flight from the device is dropped,
+    /// so nothing said while paused is ever kept or recognised.
+    pub fn pause(&self) {
+        self.buffer.lock().paused = true;
+        let _ = self.stream.pause();
+    }
+
+    pub fn resume(&self) {
+        self.buffer.lock().paused = false;
+        let _ = self.stream.play();
+    }
+
+    /// What was captured from `start` (a position in 16 kHz samples) until now, as 16 kHz mono,
+    /// without stopping - for recognising while he talks. Only the part not yet recognised is
+    /// copied, so a ten-minute dictation costs no more per pass than a ten-second one.
+    pub fn peek_from(&self, start: usize) -> Vec<f32> {
+        let first = self.raw_index(start);
+        let raw = self.buffer.lock().samples.get(first..).map(<[f32]>::to_vec).unwrap_or_default();
+        hvtt_core::audio::condition(&raw, self.channels, self.sample_rate)
+    }
+
+    /// Where a position in 16 kHz samples falls in the device's own interleaved samples.
+    fn raw_index(&self, start: usize) -> usize {
+        let rate = hvtt_core::audio::WHISPER_SAMPLE_RATE as u64;
+        let frame = start as u64 * self.sample_rate as u64 / rate;
+        frame as usize * self.channels as usize
+    }
+
+    /// Stop capturing and return the audio from `start` (16 kHz samples) on, as 16 kHz mono,
+    /// ready for recognition - the part the live passes have not already recognised.
+    pub fn finish_from(self, start: usize) -> Vec<f32> {
+        let first = self.raw_index(start);
         // Dropping the stream stops it; do it explicitly so intent is visible.
         drop(self.stream);
         let raw = std::mem::take(&mut self.buffer.lock().samples);
-        hvtt_core::audio::condition(&raw, self.channels, self.sample_rate)
+        let rest = raw.get(first..).unwrap_or_default();
+        hvtt_core::audio::condition(rest, self.channels, self.sample_rate)
     }
 }
 
 fn append(buffer: &Arc<Mutex<Buffer>>, data: &[f32]) {
     let peak = hvtt_core::audio::peak_level(data);
     let mut b = buffer.lock();
+    if b.paused {
+        return;
+    }
     b.samples.extend_from_slice(data);
     if peak > b.peak {
         b.peak = peak;

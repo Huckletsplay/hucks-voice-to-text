@@ -13,6 +13,7 @@
 //! Windows has the same three ways in: UI Automation (`windows_uia`), the same extension, and the
 //! same gated paste (`windows_paste`).
 
+pub mod box_input;
 #[cfg(target_os = "macos")]
 pub mod macos_ax;
 #[cfg(target_os = "macos")]
@@ -29,8 +30,6 @@ pub mod chromium;
 pub enum PinError {
     /// macOS Accessibility permission has not been granted yet.
     AccessibilityPermissionMissing,
-    /// The focused thing is a password box. Never pinned, never dictated into.
-    SecureField,
     /// Focus is not in a text field at all.
     NotATextField,
     /// A Chromium browser is frontmost but the extension is not installed or not running.
@@ -46,9 +45,6 @@ impl PinError {
         match self {
             PinError::AccessibilityPermissionMissing => {
                 "Huck needs Accessibility permission to type into other apps.".into()
-            }
-            PinError::SecureField => {
-                "That is a password field — Huck will not dictate into it.".into()
             }
             PinError::NotATextField => "Click into a text field first.".into(),
             PinError::BrowserExtensionMissing => {
@@ -155,7 +151,6 @@ mod tests {
     fn every_pin_error_has_a_short_plain_message() {
         for e in [
             PinError::AccessibilityPermissionMissing,
-            PinError::SecureField,
             PinError::NotATextField,
             PinError::BrowserExtensionMissing,
             PinError::Unsupported { app: "VS Code".into() },
@@ -202,11 +197,5 @@ mod tests {
                    Some("Slack".into()));
         assert_eq!(is_unsupported_executable(".../Visual Studio Code"), Some("VS Code".into()));
         assert_eq!(is_unsupported_executable(".../TextEdit"), None);
-    }
-
-    #[test]
-    fn a_secure_field_is_never_treated_as_expected() {
-        // It must stand out: dictating into a password box is a safety failure, not routine.
-        assert!(!PinError::SecureField.is_expected());
     }
 }

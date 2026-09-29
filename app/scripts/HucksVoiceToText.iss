@@ -75,6 +75,11 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 ; The loose Start menu entry a developer install (app\scripts\install.ps1) leaves behind.
 Type: files; Name: "{userprograms}\{#AppName}.lnk"
 
+[Registry]
+; Start with Windows is switched on from the H, never by the installer. This only makes sure an
+; uninstall does not leave the startup entry pointing at a program that is gone.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "HucksVoiceToText"; Flags: uninsdeletevalue dontcreatekey
+
 [Run]
 ; No skipifsilent: an update from the app itself runs /SILENT and should come back running.
 Filename: "{app}\{#AppExeName}"; Description: "Start {#AppName}"; Flags: nowait postinstall

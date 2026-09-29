@@ -36,11 +36,11 @@ const HID_EVENT_TAP: u32 = 0; // kCGHIDEventTap
 const KEY_V: u16 = 9;
 const FLAG_COMMAND: u64 = 0x0010_0000;
 
-/// Exactly one key press is allowed between capture and delivery: the stop shortcut's ordinary
-/// key. Core Graphics' cumulative counter includes auto-repeat and cannot identify which key
-/// repeated, so a held stop shortcut refuses the paste instead of granting extra presses that
-/// could hide real typing. The words remain on the chosen clipboard in every refusal.
-const STOP_KEY_PRESSES: u32 = 1;
+// Exactly one key press is allowed between capture and delivery beyond what he typed inside
+// Huck's box: the stop shortcut's ordinary key (`box_input::expected`). Core Graphics' cumulative
+// counter includes auto-repeat and cannot identify which key repeated, so a held stop shortcut
+// refuses the paste instead of granting extra presses that could hide real typing. The words
+// remain on the chosen clipboard in every refusal.
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -83,10 +83,12 @@ impl FocusStamp {
             Some((_, window)) if window != self.window => return Some("window-changed"),
             Some(_) => {}
         }
-        if clicks() != self.clicks {
+        // What he did inside Huck's own box is expected; the system counter includes auto-repeat.
+        let (box_clicks, expected_keys) = super::box_input::expected(true);
+        if clicks().wrapping_sub(self.clicks) != box_clicks {
             return Some("clicked");
         }
-        if let Some(why) = key_change_reason(self.keys, keys()) {
+        if let Some(why) = key_change_reason(self.keys, keys(), expected_keys) {
             return Some(why);
         }
         None
@@ -138,11 +140,13 @@ fn keys() -> u32 {
     unsafe { CGEventSourceCounterForEventType(HID_SYSTEM_STATE, KEY_DOWN) }
 }
 
-fn key_change_reason(before: u32, after: u32) -> Option<&'static str> {
-    match after.wrapping_sub(before) {
-        STOP_KEY_PRESSES => None,
-        0 => Some("stop-key-not-seen"),
-        _ => Some("typed-or-repeated"),
+/// `expected` is the stop press plus any keys typed inside Huck's box, or
+/// only the latter when the Send button finished the dictation.
+fn key_change_reason(before: u32, after: u32, expected: u32) -> Option<&'static str> {
+    match after.wrapping_sub(before).cmp(&expected) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Less => Some("stop-key-not-seen"),
+        std::cmp::Ordering::Greater => Some("typed-or-repeated"),
     }
 }
 
@@ -192,6 +196,22 @@ pub fn paste_borrowing_clipboard(text: &str) -> Result<(), DeliveryError> {
     pressed
 }
 
+/// Hand the keyboard back to the app he was dictating into, after he fixed words in Huck's box.
+/// Only Huck's box had it, and only because he clicked into it; the paste gate still checks that
+/// the same window is in front before anything is pasted.
+pub fn activate(pid: i32) {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    let Some(class) = AnyClass::get(c"NSRunningApplication") else { return };
+    unsafe {
+        let app: *mut AnyObject = msg_send![class, runningApplicationWithProcessIdentifier: pid];
+        if let Some(app) = app.as_ref() {
+            // NSApplicationActivateIgnoringOtherApps; macOS 14 ignores it, harmlessly.
+            let _: Bool = msg_send![app, activateWithOptions: 2usize];
+        }
+    }
+}
+
 /// Paste into the field that was focused at the keypress, if - and only if - it still is.
 pub struct PasteDestination {
     stamp: FocusStamp,
@@ -237,9 +257,13 @@ mod tests {
 
     #[test]
     fn only_the_single_stop_press_passes_the_key_gate() {
-        assert_eq!(key_change_reason(10, 11), None);
-        assert_eq!(key_change_reason(10, 10), Some("stop-key-not-seen"));
-        assert_eq!(key_change_reason(10, 12), Some("typed-or-repeated"));
-        assert_eq!(key_change_reason(u32::MAX, 0), None, "the system counter may wrap");
+        assert_eq!(key_change_reason(10, 11, 1), None);
+        assert_eq!(key_change_reason(10, 10, 1), Some("stop-key-not-seen"));
+        assert_eq!(key_change_reason(10, 12, 1), Some("typed-or-repeated"));
+        assert_eq!(key_change_reason(u32::MAX, 0, 1), None, "the system counter may wrap");
+        // Six keys typed in the box, then the shortcut; or the Send button and no stop press.
+        assert_eq!(key_change_reason(10, 17, 7), None);
+        assert_eq!(key_change_reason(10, 18, 7), Some("typed-or-repeated"));
+        assert_eq!(key_change_reason(10, 10, 0), None);
     }
 }

@@ -3,9 +3,10 @@
 // No bundler and no npm: this project lives on an exFAT volume that cannot store the symlinks a
 // package manager needs, so the UI uses Tauri's injected global directly.
 //
-// This is a voice layer, not an application. The surface shows one state, says briefly where the
-// words went, and leaves by itself. The words are never shown back afterwards: they are in the
-// text box, or on the clipboard.
+// This is a voice layer, not an application. While he talks the words fill in here (decided with
+// him 2026-09-28); he can pause, fix them, and send with the shortcut or the Send button. After
+// that the surface says briefly where the words went and leaves by itself - they are in the text
+// box, or on the clipboard.
 
 import { H_BODY, ARCS, WORDS } from "./mark.js";
 
@@ -21,7 +22,27 @@ const ui = {
   close: el("close"), note: el("note"),
   permission: el("permission"), permOpen: el("permission-open"), permLater: el("permission-later"),
   updateActions: el("update-actions"), updateOpen: el("update-open"), updateLater: el("update-later"),
+  learning: el("learning"), controls: el("controls"), pause: el("pause"), send: el("send"),
+  live: el("live"), liveText: el("live-text"), liveTail: el("live-tail"), edit: el("edit"),
 };
+
+// ------------------------------------------------------------------ what he does in the box
+
+// The paste into apps like VS Code is only made if nothing moved since the shortcut, which is
+// judged by counting clicks and key presses. Clicks and keys in this box are his work here, not a
+// sign he went elsewhere, so the box counts its own and reports them; the program allows exactly
+// those. Modifier keys are not counted anywhere. Windows counts a held key once, macOS every
+// repeat, so both counts are kept.
+const MODIFIERS = ["Shift", "Control", "Alt", "Meta", "AltGraph", "CapsLock", "Fn", "OS"];
+let input = { generation: 0, clicks: 0, keys: 0, keys_repeated: 0 };
+const report = () => invoke("box_input", { input: { ...input } });
+document.addEventListener("mousedown", () => { input.clicks += 1; report(); }, true);
+document.addEventListener("keydown", (e) => {
+  if (MODIFIERS.includes(e.key)) return;
+  input.keys_repeated += 1;
+  if (!e.repeat) input.keys += 1;
+  report();
+}, true);
 
 // ------------------------------------------------------------------ the mark
 
@@ -70,8 +91,12 @@ function wordsFromSpeech(state, level, wasRecording) {
 
 // The window is the interface, so it is only ever as big as what it is showing.
 async function fit() {
+  if (!ui.edit.hidden) {
+    ui.edit.style.height = "auto";
+    ui.edit.style.height = `${Math.min(ui.edit.scrollHeight + 2, 168)}px`;
+  }
   const h = Math.ceil(document.querySelector(".surface").getBoundingClientRect().height);
-  try { await getCurrentWindow().setSize(new LogicalSize(380, Math.max(64, h))); } catch {}
+  try { await getCurrentWindow().setSize(new LogicalSize(420, Math.max(64, h))); } catch {}
 }
 
 // ------------------------------------------------------------------ render
@@ -79,12 +104,14 @@ async function fit() {
 const LABEL = {
   idle: "Ready",
   recording: "Listening",
+  paused: "Paused",
   transcribing: "Transcribing",
   error: "Problem",
 };
 
 function stateLabel(s) {
   if (s.shortcut_error) return "Shortcut not working";
+  if (s.state === "paused" && s.settling) return "Pausing…";
   if (s.state !== "ready") return LABEL[s.state] ?? s.state;
   if (s.delivered) return "Sent";
   return (s.text || "").trim() ? "Copied" : "Nothing heard";
@@ -93,8 +120,48 @@ function stateLabel(s) {
 let last = null;
 let panelClosed = false;
 let rebinding = null;
+// He has typed in the box since it was last filled; his text is never overwritten.
+let dirty = false;
+// He clicked into the words while listening: put the caret there once they are ready.
+let wantCaret = false;
 
 const REBIND_FOR = { dictation: "Dictation", paste: "Huck's Clipboard" };
+
+// The words while he dictates: live and read-only while listening, his to fix while paused.
+function renderWords(s) {
+  if (s.generation !== input.generation) {
+    input = { generation: s.generation, clicks: 0, keys: 0, keys_repeated: 0 };
+    dirty = false;
+    wantCaret = false;
+  }
+  const dictating = s.state === "recording" || s.state === "paused";
+  ui.controls.hidden = !dictating;
+  ui.learning.hidden = !dictating;
+  ui.learning.setAttribute("aria-pressed", String(!!s.learning));
+  ui.pause.textContent = s.state === "paused" ? "Resume" : "Pause";
+
+  const paused = s.state === "paused";
+  const showLive = s.state === "recording" || s.state === "transcribing";
+  ui.live.hidden = !showLive || (s.state === "transcribing" && !s.live_text);
+  ui.edit.hidden = !paused;
+  if (showLive) {
+    ui.liveText.textContent = s.live_text || "";
+    ui.liveTail.textContent = s.live_tail || "";
+    ui.live.dataset.empty = String(!s.live_text && !s.live_tail);
+    ui.live.dataset.off = String(s.live_words === "off");
+    dirty = false;
+  }
+  if (paused) {
+    ui.edit.disabled = !!s.settling;
+    ui.edit.placeholder = s.settling ? "Finishing your last words…" : "Nothing yet — Resume to keep talking.";
+    if (!dirty && document.activeElement !== ui.edit) ui.edit.value = s.live_text || "";
+    if (wantCaret && !s.settling) {
+      wantCaret = false;
+      ui.edit.focus();
+      ui.edit.setSelectionRange(ui.edit.value.length, ui.edit.value.length);
+    }
+  }
+}
 
 function render(s) {
   // Chosen from the menu: the box becomes the key prompt, as in Snip 'n' Clip.
@@ -149,13 +216,15 @@ function render(s) {
 
   // A shortcut that did not register outranks everything else: without it the product has no
   // front door, and the failure must never be silent. "Sent" needs no second line.
-  const note = s.shortcut_error || (s.delivered || s.state === "recording" ? "" : s.message) || "";
+  const quiet = s.delivered || s.state === "recording" || s.state === "paused";
+  const note = s.shortcut_error || (quiet ? "" : s.message) || "";
   ui.note.textContent = note;
   ui.note.hidden = !note;
 
   // ~100 ms of recognition is the only moment closing is held back.
   ui.close.hidden = s.state === "transcribing";
 
+  renderWords(s);
   arcsFromLevel(s.state, s.level ?? 0);
   wordsFromSpeech(s.state, s.level ?? 0, last === "recording");
 
@@ -169,7 +238,7 @@ function done() {
   // Mid-recording the panel only closes itself; afterwards the whole box can go.
   panelClosed = true;
   ui.permission.hidden = true;
-  if (last === "recording") { fit(); return; }
+  if (last === "recording" || last === "paused") { fit(); return; }
   invoke("dismiss");
 }
 
@@ -178,6 +247,27 @@ ui.updateOpen.addEventListener("click", () => invoke("open_update"));
 ui.updateLater.addEventListener("click", () => invoke("dismiss"));
 ui.permOpen.addEventListener("click", () => { invoke("open_accessibility_settings"); done(); });
 ui.permLater.addEventListener("click", done);
+
+ui.pause.addEventListener("click", () => invoke("pause_resume", { input: { ...input } }));
+ui.send.addEventListener("click", () => invoke("send", { input: { ...input } }));
+ui.learning.addEventListener("click", () => {
+  const on = ui.learning.getAttribute("aria-pressed") !== "true";
+  ui.learning.setAttribute("aria-pressed", String(on));
+  invoke("set_learning", { on });
+});
+
+// Clicking into the words pauses, so they stop changing under him, and gives the box the keyboard.
+ui.live.addEventListener("click", async () => {
+  wantCaret = true;
+  if (last === "recording") await invoke("pause_resume", { input: { ...input } });
+  await invoke("take_keyboard", { input: { ...input } });
+});
+ui.edit.addEventListener("mousedown", () => invoke("take_keyboard", { input: { ...input } }));
+ui.edit.addEventListener("input", () => {
+  dirty = true;
+  invoke("edit_text", { text: ui.edit.value, input: { ...input } });
+  fit();
+});
 
 // Build a shortcut from the keys actually pressed, so nobody ever types shortcut syntax.
 function accelerator(e) {

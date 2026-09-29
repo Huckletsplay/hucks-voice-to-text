@@ -11,6 +11,10 @@ use hvtt_core::engine::Transcriber;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Recognition takes every core; two tests recognising at once slowed each other from seconds to
+/// a minute and a half (2026-09-28). They take turns.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn model_path() -> Option<PathBuf> {
     let p = hvtt_core::paths::models_dir()?.join("ggml-base.en.bin");
     p.exists().then_some(p)
@@ -81,6 +85,7 @@ fn speak(text: &str, tag: &str) -> Option<Vec<f32>> {
 
 #[test]
 fn a_spoken_sentence_is_transcribed_locally() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(model) = model_path() else {
         eprintln!("skipping: no model - run scripts/fetch-model.sh base.en");
         return;
@@ -102,6 +107,8 @@ fn a_spoken_sentence_is_transcribed_locally() {
         .transcribe(&hvtt_core::engine::TranscriptionRequest {
             samples,
             vocabulary_prompt: None,
+            give_up: None,
+            provisional: false,
         })
         .expect("recognition should succeed");
 
@@ -178,4 +185,125 @@ fn the_real_ax_destination_refuses_when_accessibility_is_not_granted() {
             );
         }
     }
+}
+
+/// Live recognition: the audio is fed in as it would arrive, half a second at a time, cut at the
+/// pauses exactly as the running program cuts it, and each stretch recognised on its own. Every
+/// sentence must survive the cuts - a word lost at a join would be dictation lost.
+#[test]
+fn speech_recognised_a_stretch_at_a_time_keeps_every_sentence() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(model) = model_path() else {
+        eprintln!("skipping: no model");
+        return;
+    };
+    let passage = "The weather was cold this morning. We walked the dog down to the river. \
+                   Later we made pancakes for breakfast. Then everyone went back to sleep.";
+    let Some(samples) = speak(passage, "live") else {
+        eprintln!("skipping: no speech synthesizer");
+        return;
+    };
+    let engine = hvtt_desktop::engine_whisper::WhisperEngine::load(&model).expect("the model loads");
+    let recognise = |audio: &[f32]| {
+        if !hvtt_core::audio::has_speech(audio) {
+            return String::new();
+        }
+        engine
+            .transcribe(&hvtt_core::engine::TranscriptionRequest {
+                samples: audio.to_vec(),
+                vocabulary_prompt: None,
+            give_up: None,
+            provisional: false,
+            })
+            .expect("recognition succeeds")
+            .text
+    };
+
+    let step = hvtt_core::audio::WHISPER_SAMPLE_RATE as usize / 2;
+    let (mut heard, mut text, mut stretches) = (0usize, String::new(), 0);
+    let mut upto = step;
+    while upto < samples.len() {
+        if let Some(cut) = hvtt_core::audio::commit_point(&samples[heard..upto], 3.0, 12.0) {
+            text.push_str(&recognise(&samples[heard..heard + cut]));
+            text.push(' ');
+            heard += cut;
+            stretches += 1;
+        }
+        upto += step;
+    }
+    let started = std::time::Instant::now();
+    text.push_str(&recognise(&samples[heard..]));
+    let last_ms = started.elapsed().as_millis();
+    eprintln!(
+        "{:.1}s of speech in {stretches} finished stretches + the last {:.1}s ({last_ms} ms at the stop): {text:?}",
+        samples.len() as f32 / 16_000.0,
+        (samples.len() - heard) as f32 / 16_000.0,
+    );
+
+    assert!(stretches >= 1, "a passage this long is recognised before the stop, not all at it");
+    // The quick, one-attempt pass shown while he talks still hears the same words.
+    let quick = engine
+        .transcribe(&hvtt_core::engine::TranscriptionRequest {
+            samples: samples[heard..].to_vec(),
+            vocabulary_prompt: None,
+            give_up: None,
+            provisional: true,
+        })
+        .expect("a provisional pass succeeds")
+        .text
+        .to_lowercase();
+    assert!(quick.contains("sleep"), "provisional pass heard {quick:?}");
+    let got = text.to_lowercase();
+    for word in ["weather", "cold", "dog", "river", "pancakes", "breakfast", "sleep"] {
+        assert!(got.contains(word), "expected {word:?}, got {got:?}");
+    }
+}
+
+/// Pausing or sending abandons a live pass part-way, so the final pass never waits behind it.
+#[test]
+fn a_live_pass_gives_up_when_asked() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(model) = model_path() else { return };
+    let Some(one) = speak(
+        "The weather was cold this morning. We walked the dog down to the river. \
+         Later we made pancakes for breakfast. Then everyone went back to sleep.",
+        "give-up",
+    ) else {
+        return;
+    };
+    // Four times over: long enough that finishing it would take clearly longer than giving up.
+    let samples: Vec<f32> = one.iter().chain(&one).chain(&one).chain(&one).copied().collect();
+    let engine = hvtt_desktop::engine_whisper::WhisperEngine::load(&model).expect("the model loads");
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let request = |give_up| hvtt_core::engine::TranscriptionRequest {
+        samples: samples.clone(),
+        vocabulary_prompt: None,
+        provisional: false,
+        give_up,
+    };
+
+    let started = std::time::Instant::now();
+    let _ = engine.transcribe(&request(None));
+    let whole = started.elapsed();
+
+    // Left alone, a pass that could give up must finish with the words. whisper-rs's own "safe"
+    // callback gave up every time, and this test missed it by only ever asking it to give up.
+    let kept = engine
+        .transcribe(&request(Some(hvtt_core::engine::GiveUp { counter: counter.clone(), value: 0 })))
+        .expect("a pass nobody abandoned finishes");
+    assert!(kept.text.to_lowercase().contains("pancakes"), "got {:?}", kept.text);
+
+    let bump = counter.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        bump.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    let abandoned = engine.transcribe(&request(Some(hvtt_core::engine::GiveUp {
+        counter: counter.clone(),
+        value: 0,
+    })));
+    let given_up = started.elapsed();
+    eprintln!("whole pass {whole:?}; abandoned after {given_up:?} ({:?})", abandoned.as_ref().map(|r| r.text.len()));
+    assert!(given_up < whole / 2, "gave up in {given_up:?}, a whole pass takes {whole:?}");
 }

@@ -4,7 +4,8 @@
 //!   look-alike is indistinguishable and must never be written to.
 //! - **Liveness gates delivery** (enforced in `hvtt_core::pipeline`, checked here).
 //! - **Writes are verified by reading back.** A return code proves nothing.
-//! - **Password boxes are refused** (`IsPassword`), checked before any write.
+//! - **Password boxes are not special.** Any text box is a destination (decided with him
+//!   2026-09-28: what someone dictates into a password box is their business).
 //! - **No fallback steals the foreground.** When both silent writes fail, the only further rung
 //!   is `windows_paste`, and only while nothing has moved since the keypress.
 //!
@@ -32,7 +33,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
-    UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_PaneControlTypeId, UIA_ValuePatternId,
+    UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_ValuePatternId,
     UIA_CONTROLTYPE_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -112,13 +113,6 @@ pub fn capture(stamp: &FocusStamp) -> Result<UiaElement, String> {
 pub fn validate_captured(captured: UiaElement, app: String) -> Result<UiaDestination, String> {
     let element = captured.element;
     unsafe {
-        // Never dictate into a password box. Checked first, and closed on doubt: a field that
-        // cannot say whether it is one is not written to, silently or by paste.
-        match password_box(&element) {
-            Some(false) => {}
-            Some(true) => return Err("secure-field".into()),
-            None => return Err("password-unknown".into()),
-        }
         let role = element.CurrentControlType().map_err(|_| "element-unreachable".to_string())?;
         if role != UIA_EditControlTypeId && role != UIA_DocumentControlTypeId {
             return Err(format!("not-a-text-field:{}", role.0));
@@ -141,37 +135,6 @@ pub fn validate_captured(captured: UiaElement, app: String) -> Result<UiaDestina
             paste: None,
         })
     }
-}
-
-/// Is the focused field in a browser a password box? For browsers, whose fields are not native
-/// controls and get no silent write, so this is all UI Automation is asked. `None` when it cannot
-/// say - including when anything moved since the keypress.
-///
-/// Measured in Edge, 2026-09-26: a password input is always an Edit with IsPassword set; text
-/// inputs and textareas are Edits without it; a contenteditable composer (ChatGPT's, Claude's) is
-/// a Group and a page with no field a Document - neither can be a password input. Until the
-/// browser has built its accessibility tree, which the first question switches on, the focused
-/// element is the page's Pane; so a Pane is asked again for up to a second, and then counts as
-/// "cannot say".
-pub fn focused_is_password(stamp: &FocusStamp) -> Option<bool> {
-    for _ in 0..8 {
-        let captured = capture(stamp).ok()?;
-        let role = unsafe { captured.element.CurrentControlType() }.ok()?;
-        if role == UIA_EditControlTypeId {
-            return password_box(&captured.element);
-        }
-        if role != UIA_PaneControlTypeId {
-            return Some(false);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(125));
-    }
-    None
-}
-
-/// Is this a password box? `None` when UI Automation will not say - which is treated as yes
-/// (Codex's review, 2026-09-26: an error used to count as "no").
-fn password_box(element: &IUIAutomationElement) -> Option<bool> {
-    unsafe { element.CurrentIsPassword() }.ok().map(|b| b.as_bool())
 }
 
 /// Classic Win32 text controls that take `EM_REPLACESEL` - Notepad's is `Edit` on Windows 10 and
@@ -298,14 +261,6 @@ impl Destination for UiaDestination {
 
     fn deliver(&self, text: &str) -> Result<(), DeliveryError> {
         let _ = automation();
-        // Re-check immediately before writing: a field can become a password box. Closed on
-        // doubt here too - and then not even the paste rung is tried.
-        match password_box(&self.element) {
-            Some(false) => {}
-            Some(true) => return Err(DeliveryError::RefusedSecureField),
-            None => return Err(DeliveryError::DestinationLost),
-        }
-
         let before = self.value().unwrap_or_default();
 
         // Politest first: insert at the caret without rewriting the field.

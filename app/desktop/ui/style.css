@@ -99,6 +99,49 @@ button.quiet { background: transparent; color: var(--dim); }
 button.quiet:hover:not(:disabled) { color: var(--ink); }
 
 
+/* ------------------------------------------------------------------ dictation */
+
+.state-row { display: flex; align-items: center; gap: 7px; min-width: 0; }
+
+/* Learning: a quiet switch beside the state. Filled dot on, hollow off. */
+.pill {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px;
+  padding: 1px 8px 1px 6px; border-radius: 999px;
+  background: transparent; border: 1px solid var(--edge);
+  color: var(--dim); font-size: 10.5px; font-weight: 500;
+}
+.pill::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  border: 1.2px solid currentColor; box-sizing: border-box;
+}
+.pill[aria-pressed="true"] { color: var(--ink); }
+.pill[aria-pressed="true"]::before { background: currentColor; }
+.pill:hover:not(:disabled) { color: var(--ink); background: var(--raised); }
+
+.controls { flex: 0 0 auto; display: flex; gap: 5px; }
+.ctl { padding: 4px 10px; font-size: 11.5px; }
+button.quiet-fill { background: var(--raised); color: var(--ink); border: 1px solid var(--edge); }
+button.quiet-fill:hover:not(:disabled) { color: var(--ink); background: rgba(255, 255, 255, 0.16); }
+body[data-state="paused"] #pause { background: var(--button); color: var(--glyph); border-color: transparent; }
+
+/* The words: live while he talks, editable while paused. */
+.words {
+  margin: 0; width: 100%;
+  padding: 7px 9px; border-radius: 8px;
+  background: var(--raised); border: 1px solid var(--edge);
+  color: var(--ink); font: inherit; font-size: 13px; line-height: 1.45;
+  max-height: 168px; overflow-y: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  user-select: text; cursor: text;
+}
+.words .tail { color: var(--dim); }
+#live[data-empty="true"]::before { content: "Start talking — your words appear here."; color: var(--dim); }
+#live[data-empty="true"][data-off="true"]::before { content: "Live Words is off — your words appear when you send or pause."; }
+textarea.words { display: block; resize: none; outline: none; min-height: 36px; }
+textarea.words:focus { border-color: var(--focus); }
+textarea.words::placeholder { color: var(--dim); }
+textarea.words:disabled { opacity: .7; cursor: default; }
+
 /* ------------------------------------------------------------------ one-line note */
 
 .note {

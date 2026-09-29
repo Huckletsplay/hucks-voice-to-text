@@ -8,8 +8,8 @@
 //! - **Liveness gates delivery** (enforced in `hvtt_core::pipeline`, checked here).
 //! - **Writes are verified by reading back.** `AXSelectedText` returns success on WebKit while
 //!   inserting nothing, so a return code proves nothing.
-//! - **Secure fields are refused by subrole**, before any write. Password prompts advertise
-//!   themselves as writable.
+//! - **Password boxes are not special.** Any text box is a destination (decided with him
+//!   2026-09-28, after Gmail's "Help me write" box was refused for giving no subrole).
 //! - **No fallback steals the foreground.** When both silent writes fail, the only further rung
 //!   is `macos_paste`, and only while nothing has moved since the keypress - so the field being
 //!   pasted into is still the pinned one.
@@ -153,19 +153,6 @@ impl AxElement {
     }
 }
 
-/// Whether a captured field is a password box.
-///
-/// `None` is deliberately different from `Some(false)`: Accessibility failing to answer must
-/// never be treated as permission to paste or write. Secure fields advertise themselves as
-/// writable, so this check is the only reliable guard.
-pub fn captured_is_password(element: &AxElement) -> Option<bool> {
-    password_state(element.copy_string("AXSubrole").as_deref())
-}
-
-fn password_state(subrole: Option<&str>) -> Option<bool> {
-    subrole.map(|value| value == "AXSecureTextField")
-}
-
 impl Clone for AxElement {
     fn clone(&self) -> Self {
         unsafe {
@@ -293,15 +280,6 @@ pub struct AxDestination {
 impl AxDestination {
     fn from_element(element: AxElement) -> Result<Self, String> {
         let role = element.copy_string("AXRole").unwrap_or_default();
-
-        // Never dictate into a password box. Checked on the subrole, before anything else,
-        // because secure fields falsely advertise themselves as writable. Failure to read the
-        // subrole is also refusal: "could not tell" is not the same as "not secure".
-        match captured_is_password(&element) {
-            Some(true) => return Err("secure-field".into()),
-            None => return Err("password-unknown".into()),
-            Some(false) => {}
-        }
         if !matches!(role.as_str(), "AXTextArea" | "AXTextField" | "AXComboBox") {
             return Err(format!("not-a-text-field:{role}"));
         }
@@ -370,15 +348,6 @@ impl Destination for AxDestination {
     }
 
     fn deliver(&self, text: &str) -> Result<(), DeliveryError> {
-        // Re-check the subrole immediately before writing: a field can become secure.
-        match captured_is_password(&self.element) {
-            Some(true) => return Err(DeliveryError::RefusedSecureField),
-            None => return Err(DeliveryError::Other(
-                "could not confirm that the field is not secure".into(),
-            )),
-            Some(false) => {}
-        }
-
         let before = self.value().unwrap_or_default();
 
         // Politest first: insert at the caret without rewriting the field.
@@ -419,16 +388,3 @@ fn verified(after: &Option<String>, before: &str, text: &str) -> bool {
 
 // Keep the unused-import warning honest about what the FFI needs.
 const _: Option<*mut c_void> = None;
-
-#[cfg(test)]
-mod tests {
-    use super::password_state;
-
-    #[test]
-    fn password_subroles_fail_closed() {
-        assert_eq!(password_state(Some("AXSecureTextField")), Some(true));
-        assert_eq!(password_state(Some("")), Some(false));
-        assert_eq!(password_state(Some("AXStandardTextField")), Some(false));
-        assert_eq!(password_state(None), None);
-    }
-}

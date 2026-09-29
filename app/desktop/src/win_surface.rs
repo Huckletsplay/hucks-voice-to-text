@@ -205,7 +205,22 @@ pub fn give_back_foreground(to: Remembered) {
     }
 }
 
-/// The one time the box takes the keyboard: Settings › Shortcuts, which he chose from the menu.
+/// The window he is in now, if it is somewhere he could be typing - read at the dictation's
+/// keypress, so the keyboard can be handed back to it after he fixes words in the box.
+pub fn front_workplace() -> Option<Remembered> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    identify(unsafe { GetForegroundWindow() }).filter(is_workplace)
+}
+
+/// Back to never-activate, the box still showing, once he is done typing in it.
+pub fn release_keyboard(w: &WebviewWindow) {
+    if let Some(h) = hwnd(w) {
+        set_no_activate(h, true);
+    }
+}
+
+/// The times the box takes the keyboard, both chosen by him: Settings › Shortcuts, and clicking
+/// into the words to fix them.
 pub fn show_for_keys(w: &WebviewWindow) {
     let Some(h) = hwnd(w) else { return };
     set_no_activate(h, false);

@@ -111,15 +111,18 @@ fn counts_as_typing(vk: u32, injected: bool, repeat: bool) -> bool {
     !injected && !repeat && !is_modifier(vk)
 }
 
-/// The input half of the gate, from what the hooks counted since the keypress.
-fn input_moved(clicks: u32, keys: u32) -> Option<&'static str> {
-    if clicks != 0 {
+/// The input half of the gate, from what the hooks counted since the keypress and what the gate
+/// expects: the clicks and keys he made inside Huck's box, plus the stop press when the shortcut
+/// ended the dictation (`box_input`).
+fn input_moved(clicks: u32, keys: u32, expected: (u32, u32)) -> Option<&'static str> {
+    let (box_clicks, expected_keys) = expected;
+    if clicks != box_clicks {
         return Some("clicked");
     }
-    match keys {
-        1 => None,
-        0 => Some("stop-not-seen"),
-        _ => Some("typed"),
+    match keys.cmp(&expected_keys) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Less => Some("stop-not-seen"),
+        std::cmp::Ordering::Greater => Some("typed"),
     }
 }
 
@@ -294,7 +297,8 @@ impl FocusStamp {
             return Some("key-held-at-start");
         }
         let (clicks, keys) = self.counted();
-        self.window_moved().or_else(|| input_moved(clicks, keys))
+        let expected = super::box_input::expected(false);
+        self.window_moved().or_else(|| input_moved(clicks, keys, expected))
     }
 }
 
@@ -450,11 +454,24 @@ mod tests {
         for vk in [0x25, 0x26, 0x27, 0x28, 0x41, 0x31, 0x08, 0x0D, 0x2E, 0x20] {
             assert!(counts_as_typing(vk, false, false), "{vk:#x} can move the caret");
         }
-        assert_eq!(input_moved(0, 1), None, "the stop press alone");
-        assert_eq!(input_moved(0, 2), Some("typed"), "an arrow or a letter, then the stop press");
-        assert_eq!(input_moved(0, 3), Some("typed"));
-        assert_eq!(input_moved(1, 1), Some("clicked"));
-        assert_eq!(input_moved(0, 0), Some("stop-not-seen"), "no count at all is not proof");
+        let plain = (0, 1);
+        assert_eq!(input_moved(0, 1, plain), None, "the stop press alone");
+        assert_eq!(input_moved(0, 2, plain), Some("typed"), "an arrow or a letter, then the stop press");
+        assert_eq!(input_moved(0, 3, plain), Some("typed"));
+        assert_eq!(input_moved(1, 1, plain), Some("clicked"));
+        assert_eq!(input_moved(0, 0, plain), Some("stop-not-seen"), "no count at all is not proof");
+    }
+
+    #[test]
+    fn work_in_the_box_is_allowed_and_nothing_more() {
+        // Paused, fixed a word (two clicks, six keys), then pressed the shortcut.
+        let edited = (2, 7);
+        assert_eq!(input_moved(2, 7, edited), None);
+        assert_eq!(input_moved(3, 7, edited), Some("clicked"), "a click outside the box");
+        assert_eq!(input_moved(2, 8, edited), Some("typed"), "a key outside the box");
+        assert_eq!(input_moved(1, 7, edited), Some("clicked"), "counts that do not add up refuse");
+        // Sent with the button: no stop press is expected.
+        assert_eq!(input_moved(1, 0, (1, 0)), None);
     }
 
     #[test]

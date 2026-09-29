@@ -7,6 +7,7 @@ pub mod bridge;
 pub mod clip;
 pub mod destination;
 pub mod engine_whisper;
+pub mod login_item;
 pub mod recorder;
 pub mod update;
 #[cfg(windows)]
@@ -42,7 +43,7 @@ use hvtt_core::drafts::DraftStore;
 use hvtt_core::pipeline::Destination;
 use hvtt_core::engine::{Transcriber, TranscriptionRequest};
 use hvtt_core::session::SessionState;
-use hvtt_core::settings::{ClipboardChoice, Settings};
+use hvtt_core::settings::{ClipboardChoice, LiveWords, Settings};
 use hvtt_core::transcript::Transcript;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -88,6 +89,18 @@ struct Snapshot {
     update: Option<UpdateView>,
     /// Perceived-latency budget, measured rather than assumed.
     timings: Timings,
+    /// The words so far, as they will be sent - his fixes included.
+    live_text: String,
+    /// Words still being recognised: shown fainter, and may still change.
+    live_tail: String,
+    /// Paused, and the last words are still being finished; the text cannot be fixed yet.
+    settling: bool,
+    /// Learning from his fixes, on or off.
+    learning: bool,
+    /// H › Settings › Live Words.
+    live_words: LiveWords,
+    /// Which dictation this is, so the box's own click and key counts are never mixed up.
+    generation: u64,
 }
 
 /// The product's latency numbers. Measured every session so a regression shows up in normal use
@@ -146,6 +159,46 @@ struct App {
     generation: Mutex<u64>,
     timings: Mutex<Timings>,
     bridge: Bridge,
+    /// The words recognised so far in this dictation, while he talks.
+    live: Mutex<Live>,
+    /// Pausing and finishing hold this while they settle the last words, and a live pass holds
+    /// it to write its result, so the two never interleave.
+    live_pass: Mutex<()>,
+    /// Bumped by every start, pause, resume, finish and close. A live pass started before one is
+    /// abandoned part-way and its result discarded.
+    live_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// He clicked into the box to fix words, so it has the keyboard; it goes back before delivery.
+    box_has_keyboard: Mutex<bool>,
+    /// Where the keyboard goes back to: the window he was in at the keypress.
+    #[cfg(windows)]
+    workplace: Mutex<Option<win_surface::Remembered>>,
+    #[cfg(target_os = "macos")]
+    workplace: Mutex<Option<i32>>,
+}
+
+/// One dictation's words, recognised a stretch at a time while he talks.
+#[derive(Debug, Clone, Default)]
+struct Live {
+    /// How much of the recording (16 kHz samples) is recognised for good.
+    heard_upto: usize,
+    /// What recognition produced, untouched - compared with `text` to learn from his fixes.
+    recognised: String,
+    /// What will be sent: the recognised words, with his fixes.
+    text: String,
+    /// The stretch he is still in the middle of, recognised provisionally.
+    tail: String,
+    /// He changed the words in the box.
+    edited: bool,
+    /// Pausing: the last words are being finished.
+    settling: bool,
+}
+
+fn join_words(a: &str, b: &str) -> String {
+    match (a.trim().is_empty(), b.trim().is_empty()) {
+        (true, _) => b.trim().to_string(),
+        (_, true) => a.to_string(),
+        _ => format!("{} {}", a.trim_end(), b.trim()),
+    }
 }
 
 impl App {
@@ -154,10 +207,11 @@ impl App {
         // ONE settings lock. `parking_lot::Mutex` is not reentrant, so locking it twice while
         // building this struct deadlocks the thread - which silently stopped the engine from
         // loading and made the hotkey look like it was never registered.
-        let (shortcut, clipboard, paste_shortcut) = {
+        let (shortcut, clipboard, paste_shortcut, learning, live_words) = {
             let s = self.settings.lock();
-            (s.shortcut.clone(), s.clipboard, s.paste_shortcut.clone())
+            (s.shortcut.clone(), s.clipboard, s.paste_shortcut.clone(), s.learning, s.live_words)
         };
+        let live = self.live.lock().clone();
         Snapshot {
             state: session.name().to_string(),
             message: self.message.lock().clone(),
@@ -180,6 +234,12 @@ impl App {
             rebind_error: self.rebind_error.lock().clone(),
             update: self.update.lock().clone(),
             timings: self.timings.lock().clone(),
+            live_text: live.text,
+            live_tail: live.tail,
+            settling: live.settling,
+            learning,
+            live_words,
+            generation: *self.generation.lock(),
         }
     }
 
@@ -245,7 +305,9 @@ fn hide_after(app: &AppHandle, delay: std::time::Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(delay);
         let state: State<App> = app.state();
-        if *state.generation.lock() == scheduled_for && !state.session.lock().is_capturing() {
+        // One lock at a time: `snapshot` holds the session while it reads the generation.
+        let same = *state.generation.lock() == scheduled_for;
+        if same && !state.session.lock().is_dictating() {
             dismiss(app.clone());
         }
     });
@@ -365,7 +427,7 @@ enum Rebinding {
 fn begin_rebind(app: &AppHandle, which: Rebinding) {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
     let state: State<App> = app.state();
-    if matches!(*state.session.lock(), SessionState::Recording | SessionState::Transcribing) {
+    if matches!(*state.session.lock(), SessionState::Recording | SessionState::Paused | SessionState::Transcribing) {
         return;
     }
     let _ = app.global_shortcut().unregister_all();
@@ -472,7 +534,7 @@ fn show_update(app: &AppHandle, stage: &'static str, title: String, detail: Stri
     let state: State<App> = app.state();
     *state.update.lock() = Some(UpdateView { stage, title, detail });
     // Dictation outranks this: it waits in the state and shows when the box is next free.
-    if !matches!(*state.session.lock(), SessionState::Recording | SessionState::Transcribing) {
+    if !matches!(*state.session.lock(), SessionState::Recording | SessionState::Paused | SessionState::Transcribing) {
         reveal_composer(app);
     }
     push(app);
@@ -566,8 +628,8 @@ const TRAY: &str = "hvtt";
 fn menu_key(state: &App) -> String {
     let s = state.settings.lock().clone();
     format!(
-        "{}|{}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}",
-        state.session.lock().is_capturing(),
+        "{}|{}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}",
+        state.session.lock().is_dictating(),
         s.shortcut,
         s.paste_shortcut,
         s.clipboard,
@@ -577,6 +639,9 @@ fn menu_key(state: &App) -> String {
         state.shortcut_error.lock(),
         state.paste_shortcut_error.lock(),
         state.rebinding.lock(),
+        s.learning,
+        s.fixes,
+        s.live_words,
     )
 }
 
@@ -609,7 +674,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
 
     let state: State<App> = app.state();
     let s = state.settings.lock().clone();
-    let recording = state.session.lock().is_capturing();
+    let recording = state.session.lock().is_dictating();
     let huck = s.clipboard == ClipboardChoice::Huck;
     let taken = |error: &Mutex<Option<String>>| if error.lock().is_some() { " (in use by another app)" } else { "" };
     let item = |id: &str, text: String, enabled: bool| {
@@ -657,9 +722,44 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
         huck,
     )?)?;
 
+    // Plain words, so nobody has to know what processor they have.
+    let live = Submenu::with_id(app, "live-words", "Live Words", true)?;
+    live.append(&check("live-as-you-talk", "As You Talk", s.live_words == LiveWords::AsYouTalk)?)?;
+    live.append(&check(
+        "live-lighter",
+        "Lighter — easier on older computers and battery",
+        s.live_words == LiveWords::Lighter,
+    )?)?;
+    live.append(&check("live-off", "Off — words appear when you send", s.live_words == LiveWords::Off)?)?;
+
     let settings = Submenu::with_id(app, "settings", "Settings", true)?;
     settings.append(&shortcuts)?;
     settings.append(&clipboard)?;
+    settings.append(&live)?;
+    settings.append(&PredefinedMenuItem::separator(app)?)?;
+    let login = login_item::state();
+    let (login_title, login_on) = login_item::presentation(login);
+    settings.append(&CheckMenuItem::with_id(
+        app,
+        "start-at-login",
+        login_title,
+        login != login_item::LoginState::Unavailable,
+        login_on,
+        None::<&str>,
+    )?)?;
+    settings.append(&check("learning", "Learn From My Fixes", s.learning)?)?;
+    let learned = Submenu::with_id(app, "learned", "Learned Fixes", true)?;
+    if s.fixes.is_empty() {
+        learned.append(&item("learned-none", "Nothing learned yet".into(), false)?)?;
+    } else {
+        learned.append(&item("learned-how", "Choose one to forget it".into(), false)?)?;
+        for (i, fix) in s.fixes.iter().enumerate() {
+            learned.append(&item(&format!("forget-{i}"), format!("{} → {}", fix.from, fix.to), true)?)?;
+        }
+        learned.append(&PredefinedMenuItem::separator(app)?)?;
+        learned.append(&item("forget-all", "Forget Everything Learned".into(), true)?)?;
+    }
+    settings.append(&learned)?;
     settings.append(&PredefinedMenuItem::separator(app)?)?;
     settings.append(&check("keep-drafts", "Keep Recovery Drafts", s.keep_drafts)?)?;
     settings.append(&item("open-drafts", "Open Drafts Folder".into(), true)?)?;
@@ -714,7 +814,27 @@ fn on_menu(app: &AppHandle, id: &str) {
             update_settings(app, |s| s.clipboard = choice);
             bind_all(app);
         }
+        "start-at-login" => {
+            if let Err(e) = login_item::toggle() {
+                eprintln!("[hvtt] startup setting: {e}");
+                *state.message.lock() = e;
+            }
+        }
         "keep-drafts" => update_settings(app, |s| s.keep_drafts = !s.keep_drafts),
+        "learning" => update_settings(app, |s| s.learning = !s.learning),
+        "live-as-you-talk" => update_settings(app, |s| s.live_words = LiveWords::AsYouTalk),
+        "live-lighter" => update_settings(app, |s| s.live_words = LiveWords::Lighter),
+        "live-off" => update_settings(app, |s| s.live_words = LiveWords::Off),
+        "forget-all" => update_settings(app, |s| s.fixes.clear()),
+        other if other.starts_with("forget-") => {
+            if let Ok(i) = other["forget-".len()..].parse::<usize>() {
+                update_settings(app, |s| {
+                    if i < s.fixes.len() {
+                        s.fixes.remove(i);
+                    }
+                });
+            }
+        }
         "open-drafts" => {
             if let Some(dir) = hvtt_core::paths::drafts_dir() {
                 let _ = std::fs::create_dir_all(&dir);
@@ -761,31 +881,147 @@ fn get_snapshot(state: State<App>) -> Snapshot {
     state.snapshot()
 }
 
-/// The hotkey and the on-screen button both land here.
+/// The dictation shortcut: start, or - listening or paused - send.
 #[tauri::command]
 fn toggle(app: AppHandle) {
     let state: State<App> = app.state();
     if state.rebinding.lock().is_some() {
         return;
     }
-    let is_recording = state.session.lock().is_capturing();
-    if is_recording {
-        stop_and_transcribe(app.clone());
-    } else {
+    let (dictating, busy) = {
+        let session = state.session.lock();
+        (session.is_dictating(), matches!(*session, SessionState::Transcribing))
+    };
+    if dictating {
+        crate::destination::box_input::set_stopped_by_key(true);
+        finish(app.clone(), true);
+    } else if !busy {
         start_recording(app.clone());
     }
 }
 
+/// The box's running count of clicks and key presses inside it, for the paste gate.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+struct BoxInput {
+    generation: u64,
+    clicks: u32,
+    keys: u32,
+    keys_repeated: u32,
+}
+
+fn note_input(input: BoxInput) {
+    crate::destination::box_input::record(
+        input.generation,
+        input.clicks,
+        input.keys,
+        input.keys_repeated,
+    );
+}
+
+#[tauri::command]
+fn box_input(input: BoxInput) {
+    note_input(input);
+}
+
+/// The box's Pause / Resume button.
+#[tauri::command]
+fn pause_resume(app: AppHandle, input: BoxInput) {
+    note_input(input);
+    let state: State<App> = app.state();
+    let now = state.session.lock().clone();
+    match now {
+        SessionState::Recording => pause(app.clone()),
+        SessionState::Paused => resume(app.clone()),
+        _ => {}
+    }
+}
+
+/// The box's Send button: the same as pressing the shortcut, without the key press.
+#[tauri::command]
+fn send(app: AppHandle, input: BoxInput) {
+    note_input(input);
+    let dictating = app.state::<App>().session.lock().is_dictating();
+    if dictating {
+        crate::destination::box_input::set_stopped_by_key(false);
+        finish(app.clone(), true);
+    }
+}
+
+/// He fixed the words in the box. Only while paused, and once the last words are in.
+#[tauri::command]
+fn edit_text(app: AppHandle, text: String, input: BoxInput) {
+    note_input(input);
+    let state: State<App> = app.state();
+    let paused = matches!(*state.session.lock(), SessionState::Paused);
+    let mut live = state.live.lock();
+    if paused && !live.settling && live.text != text {
+        live.text = text;
+        live.edited = true;
+    }
+}
+
+/// He clicked into the words to fix them: the box takes the keyboard until the words are sent.
+#[tauri::command]
+fn take_keyboard(app: AppHandle, input: BoxInput) {
+    note_input(input);
+    let state: State<App> = app.state();
+    if !state.session.lock().is_dictating() {
+        return;
+    }
+    *state.box_has_keyboard.lock() = true;
+    if let Some(w) = app.get_webview_window("composer") {
+        #[cfg(windows)]
+        win_surface::show_for_keys(&w);
+        #[cfg(not(windows))]
+        let _ = w.set_focus();
+    }
+}
+
+/// The Learning switch in the box, the same setting as H › Settings › Learn From My Fixes.
+#[tauri::command]
+fn set_learning(app: AppHandle, on: bool) {
+    update_settings(&app, |s| s.learning = on);
+    push(&app);
+}
+
+/// Anything worth keeping: words already recognised, or speech not yet recognised.
+fn dictation_has_words(state: &App) -> bool {
+    let (has_text, from) = {
+        let live = state.live.lock();
+        (!live.text.trim().is_empty(), live.heard_upto)
+    };
+    has_text
+        || state
+            .recording
+            .lock()
+            .as_ref()
+            .is_some_and(|r| hvtt_core::audio::has_speech(&r.peek_from(from)))
+}
+
 /// Put the box away. Always available, in every state, so the box can never get stuck on screen.
 ///
-/// Mid-recording this abandons the recording; there are no words yet to lose.
+/// Mid-dictation with words already heard, they are kept - recognised, saved as a draft and
+/// copied - but not sent anywhere. With nothing heard, the recording is simply dropped.
 #[tauri::command]
 fn dismiss(app: AppHandle) {
     let state: State<App> = app.state();
-    if matches!(*state.session.lock(), SessionState::Transcribing) {
-        // ~100 ms of work whose result is about to be copied and delivered.
+    let (busy, dictating) = {
+        let session = state.session.lock();
+        (matches!(*session, SessionState::Transcribing), session.is_dictating())
+    };
+    if busy {
+        // The words are about to be copied and delivered.
         return;
     }
+    if dictating && dictation_has_words(&state) {
+        finish(app.clone(), false);
+        return;
+    }
+    if std::mem::take(&mut *state.box_has_keyboard.lock()) {
+        hand_back_keyboard(&app, false);
+    }
+    state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    *state.live.lock() = Live::default();
     *state.generation.lock() += 1;
     // Leaving the key prompt, by any route, puts every shortcut back.
     // Let go of the keyboard - always, whatever state the prompt is in - before the shortcuts go
@@ -796,9 +1032,8 @@ fn dismiss(app: AppHandle) {
         *state.rebind_error.lock() = None;
         bind_all(&app);
     }
-    if let Some(rec) = state.recording.lock().take() {
-        drop(rec.finish());
-    }
+    // Nothing heard worth keeping (checked above): the recording just stops.
+    drop(state.recording.lock().take());
     *state.level.lock() = 0.0;
     *state.delivered.lock() = false;
     *state.ask_permission.lock() = false;
@@ -871,6 +1106,15 @@ fn start_recording(app: AppHandle) {
     // Automation on a worker a moment later, and refused if anything moved in between.
     #[cfg(any(target_os = "macos", windows))]
     let stamp = platform_paste::FocusStamp::capture();
+    // Where the keyboard goes back to if he clicks into the box to fix words.
+    #[cfg(windows)]
+    {
+        *state.workplace.lock() = win_surface::front_workplace();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        *state.workplace.lock() = stamp.map(|s| s.pid());
+    }
 
     // The browser's own pin has to be taken at the same instant, so the request is sent now and
     // waited for later. The extension pins its focused element the moment this arrives.
@@ -883,7 +1127,15 @@ fn start_recording(app: AppHandle) {
     //    visible; it is the most felt number in the product.
     // A new dictation starts empty. The previous words are already in their text box, or on
     // the clipboard and in the recovery draft; appending them would send old words somewhere new.
-    *state.generation.lock() += 1;
+    let generation = {
+        let mut g = state.generation.lock();
+        *g += 1;
+        *g
+    };
+    crate::destination::box_input::reset(generation);
+    state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    *state.live.lock() = Live::default();
+    *state.box_has_keyboard.lock() = false;
     *state.transcript.lock() = Transcript::empty();
     *state.delivered.lock() = false;
     *state.ask_permission.lock() = false;
@@ -907,6 +1159,7 @@ fn start_recording(app: AppHandle) {
             *state.recording.lock() = Some(rec);
             state.timings.lock().shortcut_to_capture_ms = pressed.elapsed().as_millis();
             spawn_level_pump(app.clone());
+            spawn_live(app.clone(), generation);
         }
         Err(e) => {
             let settings = if cfg!(windows) {
@@ -979,43 +1232,21 @@ fn resolve_pin_windows(
     let borrow = state.settings.lock().clipboard == ClipboardChoice::Huck;
     let paste = || PasteDestination::new(stamp.clone(), app_label.clone(), borrow);
 
-    let unsure = || {
-        PinError::Other("Huck couldn't tell if that's a password box, so it will only copy the words.".into())
-    };
-
-    // The extension is the only silent way into Chrome - and its "that's a password box" is final.
+    // The extension is the only silent way into Chrome. Without it, a paste, gated.
+    // Any text box is a destination, password boxes included (decided with him 2026-09-28).
     if is_chromium_executable(&exe) {
         match browser {
-            Some(Ok(d)) => {
-                set(Box::new(d));
-                return;
-            }
-            Some(Err(ref why)) if why == "secure-field" => {
-                note(PinError::SecureField);
-                return;
-            }
-            _ => {}
+            Some(Ok(d)) => set(Box::new(d)),
+            _ => set(Box::new(paste())),
         }
+        return;
     } else if let Some(Ok(_)) = browser {
         // Not our destination; release it so the extension is not left holding a field.
         release_browser();
     }
 
-    // A browser without the extension: a paste, but only once UI Automation has said the field
-    // is not a password box - yes or no answer, only the copy. Browsers can be asked without side
-    // effects. (Decided with him 2026-09-26, from Codex's second review.)
-    if is_chromium_executable(&exe) {
-        match windows_uia::focused_is_password(&stamp) {
-            Some(false) => set(Box::new(paste())),
-            Some(true) => note(PinError::SecureField),
-            None => note(unsure()),
-        }
-        return;
-    }
-
     // Desktop apps built on Chromium (VS Code, Slack, Discord, the Claude and ChatGPT apps) are
-    // never asked: asking flips VS Code into screen-reader mode. Their only password boxes are
-    // login screens, and he chose to keep the paste here. Gated, like every paste.
+    // never asked: asking flips VS Code into screen-reader mode. Gated, like every paste.
     if stamp.is_chromium_window() || is_unsupported_executable(&exe).is_some() {
         set(Box::new(paste()));
         return;
@@ -1023,9 +1254,6 @@ fn resolve_pin_windows(
 
     match windows_uia::capture(&stamp).and_then(|el| windows_uia::validate_captured(el, app_label.clone())) {
         Ok(d) => set(Box::new(d.with_paste_fallback(Some(paste())))),
-        Err(reason) if reason == "secure-field" => note(PinError::SecureField),
-        // Could not tell whether it is a password box: no write and no paste, only the copy.
-        Err(reason) if reason == "password-unknown" => note(unsure()),
         // Nothing UI Automation could write: paste, gated. That includes focus having moved
         // before the capture landed - the gate then refuses at delivery, just as it would had he
         // moved later, and the words wait on the clipboard.
@@ -1048,7 +1276,6 @@ fn resolve_pin(
 ) {
     use crate::destination::macos_paste::PasteDestination;
     use crate::destination::{is_chromium_executable, is_unsupported_executable, macos_ax};
-    use hvtt_core::pinning::PinResolution;
 
     let state: State<App> = app.state();
 
@@ -1065,12 +1292,6 @@ fn resolve_pin(
     });
     let borrow = state.settings.lock().clipboard == ClipboardChoice::Huck;
     let paste = || stamp.map(|s| PasteDestination::new(s, app_label.clone(), borrow));
-    let unsure = || {
-        PinError::Other(
-            "Huck couldn't tell if that's a password box, so it will only copy the words."
-                .into(),
-        )
-    };
 
     let set = |d: Box<dyn Destination>| {
         *state.message.lock() = format!("Listening — will send to {}", d.label());
@@ -1083,20 +1304,12 @@ fn resolve_pin(
         }
     };
 
-    // The extension is the only silent way into Chrome, and it needs no macOS permission. Its
-    // secure-field answer is final: falling through to a paste would type into a field the
-    // extension had just identified as a password box.
+    // The extension is the only silent way into Chrome, and it needs no macOS permission.
+    // Any text box is a destination, password boxes included (decided with him 2026-09-28).
     if is_chromium_executable(&exe) {
-        match browser {
-            Some(Ok(d)) => {
-                set(Box::new(d));
-                return;
-            }
-            Some(Err(ref why)) if why == "secure-field" => {
-                note(PinError::SecureField);
-                return;
-            }
-            _ => {}
+        if let Some(Ok(d)) = browser {
+            set(Box::new(d));
+            return;
         }
     } else if let Some(Ok(_)) = browser {
         // Not our destination; release it so the extension is not left holding a field.
@@ -1119,24 +1332,9 @@ fn resolve_pin(
         return;
     }
 
-    // Chrome without the extension has no silent write at all. Paste only after Accessibility's
-    // capture from the keypress says clearly that the field was not a password box. A missing or
-    // unreadable subrole is copy-only.
-    if is_chromium_executable(&exe) {
-        match pending.candidate().and_then(macos_ax::captured_is_password) {
-            Some(false) => match paste() {
-                Some(p) => set(Box::new(p)),
-                None => note(PinError::Unsupported { app: app_label.clone() }),
-            },
-            Some(true) => note(PinError::SecureField),
-            None => note(unsure()),
-        }
-        return;
-    }
-
-    // Desktop Chromium apps are trusted by the user's explicit decision. Their login screens are
-    // the only expected password fields, and asking Accessibility changes how the apps behave.
-    if is_unsupported_executable(&exe).is_some() {
+    // Chrome without the extension has no silent write at all, and desktop Chromium apps change
+    // how they behave when Accessibility asks them anything: paste, gated.
+    if is_chromium_executable(&exe) || is_unsupported_executable(&exe).is_some() {
         match paste() {
             Some(p) => set(Box::new(p)),
             None => note(PinError::Unsupported { app: app_label.clone() }),
@@ -1146,11 +1344,6 @@ fn resolve_pin(
 
     match pending.resolve(macos_ax::validate_captured) {
         Ok(d) => set(Box::new(d.with_paste_fallback(paste()))),
-        Err(PinResolution::Rejected(reason)) if reason == "secure-field" => {
-            note(PinError::SecureField)
-        }
-        // Could not tell whether it is a password box: no write and no paste, only the copy.
-        Err(PinResolution::Rejected(reason)) if reason == "password-unknown" => note(unsure()),
         // Nothing Accessibility could read, or not a text field it knows: paste, gated.
         Err(_) => match paste() {
             Some(p) => set(Box::new(p)),
@@ -1159,7 +1352,7 @@ fn resolve_pin(
     }
 }
 
-/// Feed the listening animation while the microphone is open.
+/// Feed the listening animation while the microphone is open. Paused, the H rests.
 fn spawn_level_pump(app: AppHandle) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(60));
@@ -1171,138 +1364,409 @@ fn spawn_level_pump(app: AppHandle) {
                 None => break,
             }
         };
-        if !state.session.lock().is_capturing() {
+        let (dictating, listening) = {
+            let session = state.session.lock();
+            (session.is_dictating(), session.is_capturing())
+        };
+        if !dictating {
             break;
         }
-        *state.level.lock() = level;
+        let level = if listening { level } else { 0.0 };
+        let changed = std::mem::replace(&mut *state.level.lock(), level) != level;
+        if listening || changed {
+            push(&app);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------- live words
+
+/// What recognition is told before it listens, and the fixes applied to what it hears.
+struct Hints {
+    prompt: Option<String>,
+    fixes: Vec<hvtt_core::learning::Fix>,
+}
+
+/// His vocabulary (with what Learning taught, while it is on), plus the last words already
+/// recognised, so each stretch carries on from the one before it.
+fn hints(state: &App, before: &str) -> Hints {
+    let s = state.settings.lock().clone();
+    let fixes = if s.learning { s.fixes.clone() } else { Vec::new() };
+    let vocabulary = Settings { fixes: fixes.clone(), ..s }.vocabulary_prompt();
+    let words: Vec<&str> = before.split_whitespace().collect();
+    let context = words[words.len().saturating_sub(25)..].join(" ");
+    let prompt = match (vocabulary, context.is_empty()) {
+        (Some(v), false) => Some(format!("{v}. {context}")),
+        (Some(v), true) => Some(v),
+        (None, false) => Some(context),
+        (None, true) => None,
+    };
+    Hints { prompt, fixes }
+}
+
+/// Recognise one stretch. Silence is never sent: Whisper invents words for it.
+fn recognise(
+    engine: &Arc<dyn Transcriber>,
+    samples: &[f32],
+    hints: &Hints,
+    give_up: Option<hvtt_core::engine::GiveUp>,
+    provisional: bool,
+) -> Result<Option<String>, String> {
+    if samples.len() < hvtt_core::audio::WHISPER_SAMPLE_RATE as usize / 4
+        || !hvtt_core::audio::has_speech(samples)
+    {
+        return Ok(None);
+    }
+    let req = TranscriptionRequest {
+        samples: samples.to_vec(),
+        vocabulary_prompt: hints.prompt.clone(),
+        provisional,
+        give_up,
+    };
+    let heard = engine.transcribe(&req).map_err(|e| e.to_string())?.text;
+    let text = hvtt_core::learning::apply(heard.trim(), &hints.fixes);
+    Ok((!text.trim().is_empty()).then_some(text))
+}
+
+/// Recognise while he talks, so the box fills in and the stop press has only the last few
+/// seconds left to do. Every 0.3 s: a finished stretch, ended at a pause, is recognised for good;
+/// the stretch he is still in is recognised provisionally and shown fainter.
+///
+/// Recognition takes nearly every core, so the rest between passes scales with how long the last
+/// one took (H › Settings › Live Words, `LiveWords::rest_after`): a slow machine refreshes less
+/// often rather than stuttering. With Live Words off, nothing is recognised until he pauses or
+/// sends.
+fn spawn_live(app: AppHandle, generation: u64) {
+    let mut breather = std::time::Duration::from_millis(300);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(breather);
+        let pass_started = std::time::Instant::now();
+        let state: State<App> = app.state();
+        // One lock at a time: `snapshot` holds the session while it reads the generation.
+        let same = *state.generation.lock() == generation;
+        if !same || !state.session.lock().is_dictating() {
+            break;
+        }
+        let live_words = state.settings.lock().live_words;
+        if !state.session.lock().is_capturing() || live_words == LiveWords::Off {
+            breather = std::time::Duration::from_millis(300);
+            continue;
+        }
+        let Some(engine) = state.engine.lock().clone() else { break };
+        let epoch = state.live_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let give_up = || {
+            Some(hvtt_core::engine::GiveUp { counter: state.live_epoch.clone(), value: epoch })
+        };
+        let (from, before) = {
+            let live = state.live.lock();
+            (live.heard_upto, live.text.clone())
+        };
+        // Only what is not yet recognised for good.
+        let Some(rest) = state.recording.lock().as_ref().map(|r| r.peek_from(from)) else { break };
+
+        let (cut, settled) = match hvtt_core::audio::commit_point(&rest, 3.0, 12.0) {
+            Some(cut) => {
+                // These words are kept and sent: recognised with full care.
+                let words =
+                    recognise(&engine, &rest[..cut], &hints(&state, &before), give_up(), false);
+                (cut, words.ok().flatten())
+            }
+            None => (0, None),
+        };
+        let upto = from + cut;
+        let so_far = join_words(&before, settled.as_deref().unwrap_or(""));
+        // Only shown, and replaced moments later: one quick attempt.
+        let tail = recognise(&engine, &rest[cut..], &hints(&state, &so_far), give_up(), true)
+            .ok()
+            .flatten();
+        breather = live_words
+            .rest_after(pass_started.elapsed())
+            .unwrap_or(std::time::Duration::from_millis(300));
+
+        // Written only if nothing paused, resumed or finished the dictation in the meantime.
+        {
+            let _pass = state.live_pass.lock();
+            let same = *state.generation.lock() == generation;
+            let current = same && state.session.lock().is_capturing();
+            let stale = state.live_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch;
+            let mut live = state.live.lock();
+            if !current || stale || live.heard_upto != from {
+                continue;
+            }
+            live.heard_upto = upto;
+            if let Some(words) = &settled {
+                live.recognised = join_words(&live.recognised, words);
+                live.text = join_words(&live.text, words);
+            }
+            live.tail = tail.unwrap_or_default();
+        }
         push(&app);
     });
 }
 
-fn stop_and_transcribe(app: AppHandle) {
-    let state: State<App> = app.state();
-
-    let samples = match state.recording.lock().take() {
-        Some(rec) => rec.finish(),
-        None => return,
-    };
-    *state.level.lock() = 0.0;
-
-    if !hvtt_core::audio::is_long_enough(samples.len(), hvtt_core::audio::WHISPER_SAMPLE_RATE) {
-        // A mis-press. Say so plainly and go back to resting without an error state.
-        *state.message.lock() = "That was too short to transcribe.".into();
-        state.set_state(SessionState::Transcribing);
-        state.set_state(SessionState::Ready);
-        push(&app);
-        hide_after(&app, std::time::Duration::from_millis(1800));
-        return;
-    }
-
-    state.set_state(SessionState::Transcribing);
-    *state.message.lock() = "Transcribing…".into();
-    push(&app);
-
-    let engine = state.engine.lock().clone();
-    let prompt = state.settings.lock().vocabulary_prompt();
-
+/// Pause: the microphone stops, the words he was in the middle of are finished, and the text
+/// can be fixed in the box. Nothing said while paused is kept.
+fn pause(app: AppHandle) {
     std::thread::spawn(move || {
         let state: State<App> = app.state();
-        let Some(engine) = engine else { return };
+        let _pass = state.live_pass.lock();
+        if !state.session.lock().is_capturing() {
+            return;
+        }
+        state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Nothing else moves `heard_upto` while this holds `live_pass`.
+        let (from, before) = {
+            let live = state.live.lock();
+            (live.heard_upto, live.text.clone())
+        };
+        let rest = {
+            let rec = state.recording.lock();
+            let Some(r) = rec.as_ref() else { return };
+            r.pause();
+            r.peek_from(from)
+        };
+        state.set_state(SessionState::Paused);
+        state.live.lock().settling = true;
+        *state.level.lock() = 0.0;
+        push(&app);
 
-        let req = TranscriptionRequest { samples, vocabulary_prompt: prompt };
-
-        match engine.transcribe(&req) {
-            Ok(result) => {
-                *state.elapsed_ms.lock() = result.elapsed_ms;
-                state.timings.lock().transcribe_ms = result.elapsed_ms;
-
-                if result.text.trim().is_empty() {
-                    *state.message.lock() =
-                        "No speech was recognised in that recording.".into();
-                    state.set_state(SessionState::Ready);
-                    log_latency(&state);
-                    push(&app);
-                    hide_after(&app, std::time::Duration::from_millis(1800));
-                    return;
-                }
-
-                *state.transcript.lock() = Transcript::settled(result.text.trim().to_string());
-
-                // The product rule, in one call: draft to disk, then clipboard, then delivery.
-                // Nothing here loses the text, and the paste rung relies on the clipboard copy.
-                let (choice, paste_key) = {
-                    let s = state.settings.lock();
-                    (s.clipboard, hvtt_core::settings::describe_shortcut(&s.paste_shortcut))
-                };
-                // One clipboard or the other, never both.
-                let system = clip::SystemClipboard::new(app.clone());
-                #[cfg(any(target_os = "macos", windows))]
-                let huck = clip::huck::HuckClipboard;
-                let clipboard: &dyn hvtt_core::pipeline::Clipboard = match choice {
-                    #[cfg(any(target_os = "macos", windows))]
-                    ClipboardChoice::Huck => &huck,
-                    _ => &system,
-                };
-                let transcript = state.transcript.lock().clone();
-                let deliver_started = std::time::Instant::now();
-                let report = {
-                    let dest = state.destination.lock();
-                    hvtt_core::complete_transcription(
-                        &transcript,
-                        clipboard,
-                        dest.as_deref(),
-                        state.drafts.as_ref().filter(|_| state.settings.lock().keep_drafts),
-                    )
-                };
-                state.timings.lock().deliver_ms = deliver_started.elapsed().as_millis();
-
-                use hvtt_core::pipeline::{DeliveryError, DeliveryOutcome};
-                let delivered = matches!(report.delivery, DeliveryOutcome::Delivered { .. });
-                // Where the words wait, and the key that gets them back.
-                let (kept, key) = match choice {
-                    ClipboardChoice::Huck => ("on Huck's clipboard", paste_key),
-                    ClipboardChoice::System => ("copied", NORMAL_PASTE.to_string()),
-                };
-                *state.message.lock() = match &report.delivery {
-                    _ if !report.clipboard_ok => report.message.clone(),
-                    DeliveryOutcome::NotAttempted => {
-                        let mut kept = kept.to_string();
-                        kept[..1].make_ascii_uppercase();
-                        format!("{kept} — press {key} to paste.")
-                    }
-                    DeliveryOutcome::Failed { label, error: DeliveryError::DestinationLost, .. } => {
-                        format!("Couldn't reach {label} — {kept}. Press {key} to paste.")
-                    }
-                    DeliveryOutcome::Failed { error: DeliveryError::RefusedSecureField, .. } => {
-                        format!("That's a password box, so Huck left it alone — {kept}.")
-                    }
-                    DeliveryOutcome::Failed { label, .. } => {
-                        format!("Couldn't type into {label} — {kept}. Press {key} to paste.")
-                    }
-                    _ => report.message.clone(),
-                };
-                *state.delivered.lock() = delivered;
-                state.set_state(SessionState::Ready);
-                log_latency(&state);
-                push(&app);
-                // No text box afterwards: the words are in the field, or on the clipboard. Say
-                // which, briefly, and get out of the way. Two things hold the box up: a failed
-                // clipboard (the words are only here and in the draft) and the one-time
-                // permission ask, which needs a click.
-                let hold = !report.clipboard_ok || *state.ask_permission.lock();
-                if !hold {
-                    let ms = if delivered { 1200 } else { 2600 };
-                    hide_after(&app, std::time::Duration::from_millis(ms));
-                }
+        let engine = state.engine.lock().clone();
+        let words = engine
+            .and_then(|e| recognise(&e, &rest, &hints(&state, &before), None, false).ok().flatten());
+        {
+            let mut live = state.live.lock();
+            live.heard_upto = from + rest.len();
+            if let Some(words) = &words {
+                live.recognised = join_words(&live.recognised, words);
+                live.text = join_words(&live.text, words);
             }
-            Err(e) => {
-                let msg = e.to_string();
-                *state.message.lock() = msg.clone();
-                state.set_state(SessionState::Error { message: msg });
-                push(&app);
-            }
+            live.tail.clear();
+            live.settling = false;
+        }
+        push(&app);
+    });
+}
+
+/// Resume: the microphone opens again and new words carry on after the ones in the box.
+fn resume(app: AppHandle) {
+    std::thread::spawn(move || {
+        let state: State<App> = app.state();
+        let _pass = state.live_pass.lock();
+        if !matches!(*state.session.lock(), SessionState::Paused) {
+            return;
+        }
+        if let Some(r) = state.recording.lock().as_ref() {
+            r.resume();
+        }
+        state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state.set_state(SessionState::Recording);
+        push(&app);
+    });
+}
+
+/// The keyboard goes back to the window he was dictating into, after he fixed words in the box.
+fn hand_back_keyboard(app: &AppHandle, settle: bool) {
+    let state: State<App> = app.state();
+    #[cfg(windows)]
+    {
+        if let Some(w) = app.get_webview_window("composer") {
+            win_surface::release_keyboard(&w);
+        }
+        if let Some(to) = *state.workplace.lock() {
+            win_surface::give_back_foreground(to);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = *state.workplace.lock() {
+        crate::destination::macos_paste::activate(pid);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = &state;
+    // A moment for that app to put its caret back in the field before anything is pasted.
+    if settle {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+}
+
+/// Remember what his fixes in the box say the recogniser gets wrong, while Learning is on.
+fn learn_from(app: &AppHandle, recognised: &str, sent: &str) {
+    if !app.state::<App>().settings.lock().learning {
+        return;
+    }
+    let found = hvtt_core::learning::learn(recognised, sent);
+    if found.is_empty() {
+        return;
+    }
+    eprintln!("[hvtt] learned {} fix(es)", found.len());
+    update_settings(app, |s| {
+        for fix in found {
+            hvtt_core::learning::remember(&mut s.fixes, fix);
         }
     });
+}
+
+/// Finish the dictation: recognise the last few seconds, then deliver - or, when he closed the
+/// box instead of sending, only keep the words (draft and clipboard) and put the box away.
+fn finish(app: AppHandle, deliver: bool) {
+    std::thread::spawn(move || {
+        let state: State<App> = app.state();
+        let (from, before, rest) = {
+            // A pause still finishing its words completes first.
+            let _pass = state.live_pass.lock();
+            if !state.session.lock().is_dictating() {
+                return;
+            }
+            let Some(rec) = state.recording.lock().take() else { return };
+            state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            state.set_state(SessionState::Transcribing);
+            let (from, before) = {
+                let live = state.live.lock();
+                (live.heard_upto, live.text.clone())
+            };
+            (from, before, rec.finish_from(from))
+        };
+        // The whole recording's length, for telling a mis-press from a silent one.
+        let recorded = from + rest.len();
+        *state.level.lock() = 0.0;
+        *state.message.lock() = "Transcribing…".into();
+        push(&app);
+
+        let engine = state.engine.lock().clone();
+        let started = std::time::Instant::now();
+        let last = match engine {
+            Some(e) => recognise(&e, &rest, &hints(&state, &before), None, false),
+            None => Ok(None),
+        };
+        let elapsed = started.elapsed().as_millis();
+        *state.elapsed_ms.lock() = elapsed;
+        state.timings.lock().transcribe_ms = elapsed;
+        let last = match last {
+            Ok(words) => words,
+            // The words already in the box are still sent; only the last stretch is missing.
+            Err(why) if !before.trim().is_empty() => {
+                eprintln!("[hvtt] last words not recognised: {why}");
+                None
+            }
+            Err(why) => {
+                *state.message.lock() = why.clone();
+                state.set_state(SessionState::Error { message: why });
+                push(&app);
+                return;
+            }
+        };
+        let (recognised, text, edited) = {
+            let mut live = state.live.lock();
+            if let Some(words) = &last {
+                live.recognised = join_words(&live.recognised, words);
+                live.text = join_words(&live.text, words);
+            }
+            live.tail.clear();
+            (live.recognised.clone(), live.text.trim().to_string(), live.edited)
+        };
+
+        let had_keyboard = std::mem::take(&mut *state.box_has_keyboard.lock());
+        if text.is_empty() {
+            *state.message.lock() = if hvtt_core::audio::is_long_enough(
+                recorded,
+                hvtt_core::audio::WHISPER_SAMPLE_RATE,
+            ) {
+                "No speech was recognised in that recording.".into()
+            } else {
+                // A mis-press. Say so plainly and go back to resting without an error state.
+                "That was too short to transcribe.".into()
+            };
+            if had_keyboard {
+                hand_back_keyboard(&app, false);
+            }
+            state.set_state(SessionState::Ready);
+            log_latency(&state);
+            push(&app);
+            hide_after(&app, std::time::Duration::from_millis(1800));
+            return;
+        }
+        if edited {
+            learn_from(&app, &recognised, &text);
+        }
+        if had_keyboard {
+            hand_back_keyboard(&app, deliver);
+        }
+        deliver_words(&app, text, deliver);
+    });
+}
+
+/// The product rule, in one call: draft to disk, then clipboard, then delivery. Nothing here
+/// loses the text, and the paste rung relies on the clipboard copy.
+fn deliver_words(app: &AppHandle, text: String, deliver: bool) {
+    let state: State<App> = app.state();
+    *state.transcript.lock() = Transcript::settled(text);
+
+    let (choice, paste_key) = {
+        let s = state.settings.lock();
+        (s.clipboard, hvtt_core::settings::describe_shortcut(&s.paste_shortcut))
+    };
+    // One clipboard or the other, never both.
+    let system = clip::SystemClipboard::new(app.clone());
+    #[cfg(any(target_os = "macos", windows))]
+    let huck = clip::huck::HuckClipboard;
+    let clipboard: &dyn hvtt_core::pipeline::Clipboard = match choice {
+        #[cfg(any(target_os = "macos", windows))]
+        ClipboardChoice::Huck => &huck,
+        _ => &system,
+    };
+    let transcript = state.transcript.lock().clone();
+    let keep_drafts = state.settings.lock().keep_drafts;
+    let deliver_started = std::time::Instant::now();
+    let report = {
+        let dest = state.destination.lock();
+        hvtt_core::complete_transcription(
+            &transcript,
+            clipboard,
+            dest.as_deref().filter(|_| deliver),
+            state.drafts.as_ref().filter(|_| keep_drafts),
+        )
+    };
+    state.timings.lock().deliver_ms = deliver_started.elapsed().as_millis();
+
+    use hvtt_core::pipeline::{DeliveryError, DeliveryOutcome};
+    let delivered = matches!(report.delivery, DeliveryOutcome::Delivered { .. });
+    // Where the words wait, and the key that gets them back.
+    let (kept, key) = match choice {
+        ClipboardChoice::Huck => ("on Huck's clipboard", paste_key),
+        ClipboardChoice::System => ("copied", NORMAL_PASTE.to_string()),
+    };
+    *state.message.lock() = match &report.delivery {
+        _ if !report.clipboard_ok => report.message.clone(),
+        DeliveryOutcome::NotAttempted => {
+            let mut kept = kept.to_string();
+            kept[..1].make_ascii_uppercase();
+            format!("{kept} — press {key} to paste.")
+        }
+        DeliveryOutcome::Failed { label, error: DeliveryError::DestinationLost, .. } => {
+            format!("Couldn't reach {label} — {kept}. Press {key} to paste.")
+        }
+        DeliveryOutcome::Failed { label, .. } => {
+            format!("Couldn't type into {label} — {kept}. Press {key} to paste.")
+        }
+        _ => report.message.clone(),
+    };
+    *state.delivered.lock() = delivered;
+    state.set_state(SessionState::Ready);
+    log_latency(&state);
+    push(app);
+    // Closed rather than sent: the words are kept, and the box goes as he asked.
+    if !deliver && report.clipboard_ok {
+        dismiss(app.clone());
+        return;
+    }
+    // No text box afterwards: the words are in the field, or on the clipboard. Say which,
+    // briefly, and get out of the way. Two things hold the box up: a failed clipboard (the
+    // words are only here and in the draft) and the one-time permission ask, which needs a
+    // click.
+    let hold = !report.clipboard_ok || *state.ask_permission.lock();
+    if !hold {
+        let ms = if delivered { 1200 } else { 2600 };
+        hide_after(app, std::time::Duration::from_millis(ms));
+    }
 }
 
 // ---------------------------------------------------------------------------- startup
@@ -1371,6 +1835,12 @@ pub fn run() {
         generation: Mutex::new(0),
         timings: Mutex::new(Timings::default()),
         bridge: Bridge::new(),
+        live: Mutex::new(Live::default()),
+        live_pass: Mutex::new(()),
+        live_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        box_has_keyboard: Mutex::new(false),
+        #[cfg(any(windows, target_os = "macos"))]
+        workplace: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -1391,6 +1861,12 @@ pub fn run() {
             open_accessibility_settings,
             finish_rebind,
             open_update,
+            box_input,
+            pause_resume,
+            send,
+            edit_text,
+            take_keyboard,
+            set_learning,
         ])
         .setup(move |app| {
             // An accessory app has no Dock icon and never steals the foreground when a window

@@ -30,6 +30,42 @@ pub struct Settings {
     /// Pastes from Huck's clipboard. Only bound while Huck's clipboard is the choice; on the
     /// normal clipboard, Cmd+V already does the job.
     pub paste_shortcut: String,
+    /// Remember his fixes in the box and apply them from then on. On unless he turns it off,
+    /// from the box or H › Settings.
+    pub learning: bool,
+    /// What Learning has remembered, oldest first.
+    pub fixes: Vec<crate::learning::Fix>,
+    /// How hard the box works to show the words while he talks.
+    pub live_words: LiveWords,
+}
+
+/// H › Settings › Live Words: how much of the processor showing the words while he talks may
+/// take. Decided with him 2026-09-28, so a slower computer is never bogged down. Whichever is
+/// chosen, the words that are sent are the same.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveWords {
+    /// Refreshed about three times a second; the processor at most about half busy.
+    #[default]
+    AsYouTalk,
+    /// Refreshed about once a second; the processor at most about a quarter busy.
+    Lighter,
+    /// Nothing recognised until he pauses or sends, as the first version did.
+    Off,
+}
+
+impl LiveWords {
+    /// The rest before the next live pass, given how long the last one took; `None` when live
+    /// words are off. The rest scales with the pass, so a slow machine refreshes less often
+    /// instead of being kept busy.
+    pub fn rest_after(self, pass: std::time::Duration) -> Option<std::time::Duration> {
+        use std::time::Duration;
+        match self {
+            LiveWords::AsYouTalk => Some(pass.max(Duration::from_millis(300))),
+            LiveWords::Lighter => Some((pass * 3).max(Duration::from_millis(1000))),
+            LiveWords::Off => None,
+        }
+    }
 }
 
 /// Where the safety-net copy of every dictation goes - one clipboard, never both.
@@ -112,6 +148,9 @@ impl Default for Settings {
             vocabulary: Vec::new(),
             clipboard: ClipboardChoice::System,
             paste_shortcut: DEFAULT_PASTE_SHORTCUT.to_string(),
+            learning: true,
+            fixes: Vec::new(),
+            live_words: LiveWords::AsYouTalk,
         }
     }
 }
@@ -152,11 +191,20 @@ impl Settings {
     }
 
     /// The initial prompt biasing Whisper toward the user's own jargon.
+    ///
+    /// The words his fixes taught are part of it, so the model starts hearing them right, not
+    /// only being corrected afterwards.
     pub fn vocabulary_prompt(&self) -> Option<String> {
-        if self.vocabulary.is_empty() {
+        let mut words: Vec<&str> = self.vocabulary.iter().map(String::as_str).collect();
+        for fix in &self.fixes {
+            if !words.contains(&fix.to.as_str()) {
+                words.push(&fix.to);
+            }
+        }
+        if words.is_empty() {
             None
         } else {
-            Some(self.vocabulary.join(", "))
+            Some(words.join(", "))
         }
     }
 }
@@ -284,5 +332,45 @@ mod tests {
         assert_eq!(Settings::default().vocabulary_prompt(), None);
         let s = Settings { vocabulary: vec!["Huck".into(), "exFAT".into()], ..Default::default() };
         assert_eq!(s.vocabulary_prompt().as_deref(), Some("Huck, exFAT"));
+    }
+
+    #[test]
+    fn live_words_never_keep_the_processor_busier_than_chosen() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        // A fast machine: refreshed as often as the floor allows.
+        assert_eq!(LiveWords::AsYouTalk.rest_after(ms(100)), Some(ms(300)));
+        assert_eq!(LiveWords::Lighter.rest_after(ms(100)), Some(ms(1000)));
+        // A slow machine: resting at least as long as it worked (half), or three times (a quarter).
+        assert_eq!(LiveWords::AsYouTalk.rest_after(ms(800)), Some(ms(800)));
+        assert_eq!(LiveWords::Lighter.rest_after(ms(800)), Some(ms(2400)));
+        assert_eq!(LiveWords::Off.rest_after(ms(100)), None);
+        assert_eq!(serde_json::to_string(&LiveWords::AsYouTalk).unwrap(), "\"as_you_talk\"");
+    }
+
+    #[test]
+    fn learned_words_join_the_prompt_once() {
+        use crate::learning::Fix;
+        let s = Settings {
+            vocabulary: vec!["Huck's".into()],
+            fixes: vec![
+                Fix { from: "hux".into(), to: "Huck's".into() },
+                Fix { from: "github".into(), to: "GitHub".into() },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(s.vocabulary_prompt().as_deref(), Some("Huck's, GitHub"));
+    }
+
+    #[test]
+    fn a_settings_file_from_before_learning_still_loads_with_learning_on() {
+        let p = temp_path("pre-learning");
+        std::fs::write(&p, r#"{"shortcut":"Alt+Space","keep_drafts":false}"#).unwrap();
+        let s = Settings::load_from(&p);
+        assert!(!s.keep_drafts, "the old file was read, not replaced by defaults");
+        assert!(s.learning);
+        assert!(s.fixes.is_empty());
+        assert_eq!(s.live_words, LiveWords::AsYouTalk);
+        let _ = std::fs::remove_file(&p);
     }
 }

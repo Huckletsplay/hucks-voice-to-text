@@ -5,6 +5,8 @@
 //! rather than a rewrite: nothing above it knows which engine is underneath.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct TranscriptionRequest {
@@ -12,6 +14,26 @@ pub struct TranscriptionRequest {
     pub samples: Vec<f32>,
     /// Bias the recogniser toward the user's own jargon.
     pub vocabulary_prompt: Option<String>,
+    /// Abandon this recognition part-way when it is no longer wanted.
+    pub give_up: Option<GiveUp>,
+    /// A live pass, shown while he talks and replaced moments later: one quick attempt with a
+    /// length limit, never Whisper's slow retries. The words that are sent never use this.
+    pub provisional: bool,
+}
+
+/// Lets a recognition already running be abandoned: it stops once `counter` no longer holds
+/// `value`. The passes made while he talks carry one, so pausing or sending never waits behind
+/// words that are about to be recognised again anyway.
+#[derive(Debug, Clone)]
+pub struct GiveUp {
+    pub counter: Arc<AtomicU64>,
+    pub value: u64,
+}
+
+impl GiveUp {
+    pub fn now(&self) -> bool {
+        self.counter.load(Ordering::SeqCst) != self.value
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

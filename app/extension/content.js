@@ -22,12 +22,8 @@
     !!el &&
     (el.tagName === "TEXTAREA" ||
       (el.tagName === "INPUT" &&
-        /^(text|search|url|email|tel)$/i.test(el.type || "text")) ||
+        /^(text|search|url|email|tel|password)$/i.test(el.type || "text")) ||
       el.isContentEditable);
-
-  // A password box is never a destination. Checked at pin time and again before writing.
-  const isSecure = (el) =>
-    !!el && el.tagName === "INPUT" && /^password$/i.test(el.type || "");
 
   document.addEventListener(
     "focusin",
@@ -49,7 +45,6 @@
     if (!el.isConnected) return { alive: false, why: "element-detached" };
     if (!document.contains(el)) return { alive: false, why: "not-in-document" };
     if (location.href !== pinned.docURL) return { alive: false, why: "page-navigated" };
-    if (isSecure(el)) return { alive: false, why: "secure-field" };
     return { alive: true, why: "ok" };
   }
 
@@ -104,7 +99,6 @@
         (document.hasFocus() && lastFocusedEditable) ||
         null;
       if (!el || !el.isConnected) return null;          // stay silent; another page may answer
-      if (isSecure(el)) return { id: req.id, ok: false, error: "secure-field" };
       pinned = { el, docURL: location.href };
       return {
         id: req.id,

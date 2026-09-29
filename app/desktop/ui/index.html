@@ -8,7 +8,7 @@
   </head>
   <body data-state="idle">
     <main class="surface" data-tauri-drag-region>
-      <!-- The whole normal-use interface: the H, one status line, and a close button. -->
+      <!-- The H, one status line with the Learning switch, the dictation's buttons, close. -->
       <header class="bar" data-tauri-drag-region>
         <svg class="mark" viewBox="0 0 64 64" aria-hidden="true">
           <defs>
@@ -22,8 +22,17 @@
         </svg>
 
         <div class="status" data-tauri-drag-region>
-          <p class="state" id="state-line">Ready</p>
+          <div class="state-row" data-tauri-drag-region>
+            <p class="state" id="state-line">Ready</p>
+            <!-- Same setting as H › Settings › Learn From My Fixes. -->
+            <button id="learning" class="pill" aria-pressed="true" title="Remember the words you fix" hidden>Learning</button>
+          </div>
           <p class="target" id="target-line"></p>
+        </div>
+
+        <div class="controls" id="controls" hidden>
+          <button id="pause" class="ctl quiet-fill">Pause</button>
+          <button id="send" class="ctl">Send</button>
         </div>
 
         <!-- Always there: the box must never be something he cannot get rid of. -->
@@ -31,6 +40,10 @@
           <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 2L10 10M10 2L2 10" /></svg>
         </button>
       </header>
+
+      <!-- The words as they are heard. Paused, they can be fixed before sending. -->
+      <div class="words" id="live" hidden><span id="live-text"></span> <span class="tail" id="live-tail"></span></div>
+      <textarea class="words" id="edit" rows="1" spellcheck="true" hidden></textarea>
 
       <!-- One line, never a dialog. -->
       <p class="note" id="note" hidden></p>

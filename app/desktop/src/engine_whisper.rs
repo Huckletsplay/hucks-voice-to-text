@@ -84,6 +84,11 @@ impl WhisperEngine {
     }
 }
 
+/// Whisper asks this between steps; `true` abandons the recognition.
+unsafe extern "C" fn should_give_up(data: *mut std::ffi::c_void) -> bool {
+    (*(data as *const hvtt_core::engine::GiveUp)).now()
+}
+
 impl Transcriber for WhisperEngine {
     fn name(&self) -> &str {
         &self.label
@@ -103,11 +108,41 @@ impl Transcriber for WhisperEngine {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_suppress_blank(true);
+        // Whisper works on a 30-second window whatever the length of the audio, and most of the
+        // time goes on that window. Sized to the audio instead (50 frames a second, with a margin),
+        // a few seconds of speech costs a fraction as much.
+        let secs = req.samples.len() as f32 / hvtt_core::audio::WHISPER_SAMPLE_RATE as f32;
+        if secs < 29.0 {
+            params.set_audio_ctx(((secs * 50.0).ceil() as i32 + 64).min(1500));
+        }
+        // Unsure of a scrap of audio, Whisper can loop on a word, and each time it rejects its
+        // own guess it starts over, up to five times - one live pass then took seconds and showed
+        // words nobody said ("Rob Syke", 2026-09-28). Live passes get one attempt, no longer than
+        // anyone speaks (about 3 tokens a second; 6 allowed, plus a margin).
+        if req.provisional {
+            params.set_temperature_inc(0.0);
+            params.set_max_tokens((secs * 6.0).ceil() as i32 + 8);
+        }
 
         if let Some(prompt) = req.vocabulary_prompt.as_deref() {
             params.set_initial_prompt(prompt);
         }
+        // Not `set_abort_callback_safe`: in whisper-rs 0.16 its trampoline reads the boxed closure
+        // as the closure itself, so it answered "give up" at the first check, every time - and no
+        // word ever filled in while he talked (found 2026-09-28). The plain C callback, with the
+        // request's own `GiveUp` as its data, which outlives the recognition below.
+        if let Some(give_up) = req.give_up.as_ref() {
+            unsafe {
+                params.set_abort_callback(Some(should_give_up));
+                params.set_abort_callback_user_data(
+                    give_up as *const hvtt_core::engine::GiveUp as *mut std::ffi::c_void,
+                );
+            }
+        }
 
+        // One recognition at a time: two at once each take every core and slow each other
+        // down many times over (measured 2026-09-28). A pass made while he talks is abandoned
+        // instead, the moment he pauses or sends (`GiveUp`).
         let ctx = self.ctx.lock();
         let mut state = ctx
             .create_state()

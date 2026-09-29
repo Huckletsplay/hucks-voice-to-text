@@ -68,8 +68,6 @@ pub trait Destination: Send + Sync {
 pub enum DeliveryError {
     /// The field is gone, or its reference went stale and could not be re-found.
     DestinationLost,
-    /// Refused on purpose: never dictate into a password box.
-    RefusedSecureField,
     /// A silent write was not available and taking the foreground is never acceptable.
     WouldStealForeground,
     /// The write reported success but the text could not be read back. Both platforms do this,
@@ -206,9 +204,6 @@ fn build_message(
         DeliveryOutcome::Failed { error, .. } => {
             let why = match error {
                 DeliveryError::DestinationLost => "The linked text field could not be reached.",
-                DeliveryError::RefusedSecureField => {
-                    "That field is a password box, so Huck refused to type into it."
-                }
                 DeliveryError::WouldStealForeground => {
                     "The linked text field needs to be in front to receive text, and Huck will \
                      not pull you out of what you are doing."
@@ -378,16 +373,6 @@ mod tests {
         let r = complete_transcription(&Transcript::settled("hello"), &clip, Some(&dest), None);
         assert!(matches!(r.delivery,
             DeliveryOutcome::Failed { error: DeliveryError::NoResponse, .. }));
-        assert!(r.clipboard_ok);
-    }
-
-    #[test]
-    fn a_password_box_is_refused_and_the_user_is_told_why() {
-        let clip = FakeClipboard::working();
-        let dest = SpyDestination::failing(DeliveryError::RefusedSecureField);
-        let r = complete_transcription(&Transcript::settled("hunter two"), &clip,
-                                       Some(&dest), None);
-        assert!(r.message.contains("password box"), "got: {}", r.message);
         assert!(r.clipboard_ok);
     }
 
