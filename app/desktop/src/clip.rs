@@ -37,6 +37,8 @@ pub mod huck {
     use objc2::runtime::ProtocolObject;
     use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSPasteboardWriting};
     use objc2_foundation::{NSArray, NSData, NSString};
+    use parking_lot::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
 
     pub const NAME: &str = "com.huck.clipboard";
 
@@ -70,12 +72,101 @@ pub mod huck {
         }
     }
 
+    /// One borrow of his clipboard at a time, from the moment it is snapshotted until it has been
+    /// given back. Without that, a second paste inside the half second the first has it on loan
+    /// snapshots the first one's *temporary words* as "his clipboard": the first then declines to
+    /// restore (the clipboard changed under it) and the second gives those words back - his real
+    /// clipboard is gone. (Codex's review of 0.1.6.) It can also be *closed*, for Quit: from then
+    /// on no borrow starts and one still waiting for its turn gives up, so that Quit sees "nothing
+    /// on loan" once and that stays true - otherwise a queued paste could take the turn in the
+    /// instant Quit saw the clipboard idle, and the program would leave with it on loan. (Codex's
+    /// second review.)
+    struct Gate {
+        state: Mutex<GateState>,
+        changed: Condvar,
+    }
+
+    struct GateState {
+        /// A borrow is out: taken, and not yet given back.
+        busy: bool,
+        /// Quit has begun: nothing may borrow.
+        closed: bool,
+    }
+
+    /// Held by a `Borrowed` until it is given back or dropped. Not a lock guard, because the
+    /// give-back happens on another thread than the borrow.
+    struct Turn(&'static Gate);
+
+    impl Gate {
+        const fn new() -> Self {
+            Gate {
+                state: Mutex::new(GateState { busy: false, closed: false }),
+                changed: Condvar::new(),
+            }
+        }
+
+        /// Wait, up to `limit`, for the borrow in flight to end, then take the turn. `None` if the
+        /// wait ran out, or the gate is - or becomes, while waiting - closed.
+        fn take(&'static self, limit: Duration) -> Option<Turn> {
+            let deadline = Instant::now() + limit;
+            let mut state = self.state.lock();
+            loop {
+                if state.closed {
+                    return None;
+                }
+                if !state.busy {
+                    state.busy = true;
+                    return Some(Turn(self));
+                }
+                if self.changed.wait_until(&mut state, deadline).timed_out() && state.busy {
+                    return None;
+                }
+            }
+        }
+
+        /// Quit: close the gate - atomically with looking at it, so nothing slips in - then wait,
+        /// up to `limit`, for the borrow on loan to be given back. `true` when none is on loan.
+        fn close(&self, limit: Duration) -> bool {
+            let deadline = Instant::now() + limit;
+            let mut state = self.state.lock();
+            state.closed = true;
+            // Wake the paste that is queued, so it gives up now rather than at its own deadline.
+            self.changed.notify_all();
+            while state.busy {
+                if self.changed.wait_until(&mut state, deadline).timed_out() {
+                    break;
+                }
+            }
+            !state.busy
+        }
+
+        /// Quit could not finish: borrowing works again.
+        fn reopen(&self) {
+            self.state.lock().closed = false;
+        }
+    }
+
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            self.0.state.lock().busy = false;
+            self.0.changed.notify_all();
+        }
+    }
+
+    static GATE: Gate = Gate::new();
+
+    /// How long a paste waits for another paste's give-back before it gives up - and leaves his
+    /// clipboard alone, the words still on Huck's. A borrow lasts about half a second.
+    const TURN_LIMIT: Duration = Duration::from_secs(3);
+
     /// Everything on the normal clipboard, every item and every type, so an image or a copied
     /// file comes back exactly as it was - not just its text.
     pub struct Borrowed {
         board: String,
         items: Vec<Vec<(String, Vec<u8>)>>,
         ours: isize,
+        /// Released when this is given back (or dropped).
+        _turn: Option<Turn>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +266,7 @@ pub mod huck {
             board: board.name().to_string(),
             items: snapshot.items,
             ours: board.changeCount(),
+            _turn: None,
         })
     }
 
@@ -183,10 +275,35 @@ pub mod huck {
         borrow_snapshot(board, text, snapshot)
     }
 
+    /// `borrow`, but only once any other borrow through `gate` has been given back - and the turn
+    /// is kept until this one is.
+    fn borrow_in_turn(gate: &'static Gate, board: &NSPasteboard, text: &str) -> Result<Borrowed, String> {
+        let turn = gate
+            .take(TURN_LIMIT)
+            .ok_or("another paste was still using his clipboard, so his clipboard was left alone")?;
+        let mut borrowed = borrow(board, text)?;
+        borrowed._turn = Some(turn);
+        Ok(borrowed)
+    }
+
     /// Put `text` on the normal clipboard for a moment, remembering what was there. A paste into
-    /// an app like VS Code can only come from the normal clipboard.
+    /// an app like VS Code can only come from the normal clipboard. One at a time: a second paste
+    /// waits (a moment) for the first to be given back.
     pub fn borrow_general(text: &str) -> Result<Borrowed, String> {
-        borrow(&NSPasteboard::generalPasteboard(), text)
+        borrow_in_turn(&GATE, &NSPasteboard::generalPasteboard(), text)
+    }
+
+    /// Quit, step one: no paste may borrow his clipboard from now on (one waiting for its turn
+    /// gives up), and the borrow already on loan is waited for, up to `limit`. Leaving in the half
+    /// second a paste has it would leave the pasted words there instead of what he had copied.
+    /// `true` when nothing is on loan - and it stays that way, so the program may exit.
+    pub fn stop_borrowing(limit: Duration) -> bool {
+        GATE.close(limit)
+    }
+
+    /// Quit could not finish (a give-back is stuck): pasting borrows his clipboard again.
+    pub fn resume_borrowing() {
+        GATE.reopen();
     }
 
     /// What the normal clipboard holds as text, if anything.
@@ -279,6 +396,89 @@ pub mod huck {
             let borrowed = borrow(&board, "borrowed").expect("an empty pasteboard can be borrowed");
             assert!(borrowed.give_back());
             assert!(snapshot(&board).unwrap().items.is_empty());
+        }
+
+        #[test]
+        fn two_overlapping_pastes_give_back_his_own_clipboard_not_the_first_ones_words() {
+            // Codex's review of 0.1.6: the second paste snapshotted the first one's borrowed words
+            // as "his clipboard", the first then declined to restore, and the second handed those
+            // words back. Two pastes inside the half second the first has it on loan.
+            static TEST_GATE: Gate = Gate::new();
+            let board = private_board();
+            seed_two_items(&board);
+            let name = board.name().to_string();
+            let before = snapshot(&board).unwrap().items;
+
+            let paste = |text: &'static str, start_after_ms: u64| {
+                let name = name.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(start_after_ms));
+                    let board = NSPasteboard::pasteboardWithName(&NSString::from_str(&name));
+                    let borrowed = borrow_in_turn(&TEST_GATE, &board, text).expect("borrowed");
+                    std::thread::sleep(Duration::from_millis(150)); // the app reads it a moment later
+                    assert!(borrowed.give_back(), "{text}: his clipboard went back");
+                })
+            };
+            let first = paste("first paste", 0);
+            let second = paste("second paste", 50); // inside the first one's loan
+            first.join().unwrap();
+            second.join().unwrap();
+            assert_eq!(snapshot(&board).unwrap().items, before, "his own clipboard, exactly");
+        }
+
+        #[test]
+        fn a_second_borrow_waits_for_the_first_to_be_given_back() {
+            static TEST_GATE: Gate = Gate::new();
+            let first = TEST_GATE.take(Duration::from_millis(100)).expect("nothing is borrowed yet");
+            assert!(TEST_GATE.take(Duration::from_millis(50)).is_none(), "one at a time");
+            let waiting = std::thread::spawn(|| TEST_GATE.take(Duration::from_secs(2)).is_some());
+            std::thread::sleep(Duration::from_millis(100));
+            drop(first); // given back
+            assert!(waiting.join().unwrap(), "it went ahead the moment the first was given back");
+        }
+
+        #[test]
+        fn quit_waits_for_a_borrow_on_loan_and_does_not_wait_when_there_is_none() {
+            static TEST_GATE: Gate = Gate::new();
+            assert!(TEST_GATE.close(Duration::from_millis(10)), "nothing on loan: no wait");
+            TEST_GATE.reopen();
+            let turn = TEST_GATE.take(Duration::from_millis(10)).unwrap();
+            let giving_back = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                drop(turn);
+            });
+            assert!(TEST_GATE.close(Duration::from_secs(2)), "waited until it was given back");
+            giving_back.join().unwrap();
+        }
+
+        #[test]
+        fn once_quit_has_begun_no_paste_can_start_and_a_queued_one_gives_up() {
+            // Codex's second review of 0.1.6: a second paste queued behind the first could take the
+            // turn in the instant Quit saw the clipboard idle - and the program left with it on loan.
+            static TEST_GATE: Gate = Gate::new();
+            let first = TEST_GATE.take(Duration::from_millis(10)).unwrap();
+            let queued = std::thread::spawn(|| TEST_GATE.take(Duration::from_secs(2)).is_some());
+            std::thread::sleep(Duration::from_millis(50)); // it is waiting for its turn
+            let quitting = std::thread::spawn(|| TEST_GATE.close(Duration::from_secs(2)));
+            std::thread::sleep(Duration::from_millis(50)); // Quit has begun
+            drop(first); // the give-back finishes
+            assert!(quitting.join().unwrap(), "Quit went ahead once his clipboard was back");
+            assert!(!queued.join().unwrap(), "the queued paste gave up instead of taking the turn");
+            assert!(
+                TEST_GATE.take(Duration::from_millis(10)).is_none(),
+                "nothing can borrow after Quit saw the clipboard idle"
+            );
+        }
+
+        #[test]
+        fn a_quit_that_cannot_finish_does_not_go_ahead_and_leaves_pasting_working() {
+            static TEST_GATE: Gate = Gate::new();
+            let turn = TEST_GATE.take(Duration::from_millis(10)).unwrap();
+            assert!(!TEST_GATE.close(Duration::from_millis(30)), "still on loan: says so, so no exit");
+            assert!(TEST_GATE.take(Duration::from_millis(10)).is_none(), "closed while quitting");
+            TEST_GATE.reopen();
+            drop(turn);
+            assert!(TEST_GATE.take(Duration::from_millis(50)).is_some(), "open again after a failed Quit");
         }
     }
 }

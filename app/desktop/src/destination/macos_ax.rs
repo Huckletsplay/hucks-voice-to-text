@@ -209,7 +209,13 @@ impl hvtt_core::pinning::FocusSource for AxFocusSource {
             return None;
         }
         unsafe {
-            let system = AxElement::retain(AXUIElementCreateSystemWide())?;
+            // Create rule: already ours, so not retained again - that leaked one reference a call
+            // (Codex's third review of 0.1.6).
+            let raw = AXUIElementCreateSystemWide();
+            if raw.is_null() {
+                return None;
+            }
+            let system = AxElement(raw);
             // The system-wide element alone is unreliable - it returns nothing while a field
             // plainly has focus - so the focused *application* is the documented fallback.
             // Both are pure C calls.
@@ -219,6 +225,31 @@ impl hvtt_core::pinning::FocusSource for AxFocusSource {
                     .or_else(|| app.copy_element("AXFocusedWindow")?.copy_element("AXFocusedUIElement"))
             })
         }
+    }
+}
+
+/// The process Accessibility says has keyboard focus - **when it says**. `None` for "no value" and
+/// for any error, and that is not a sign of anything: with an Electron app such as VS Code in
+/// front, this answers "no value" all the time (measured 2026-09-29).
+///
+/// What it is good for is a one-way alarm. A panel that takes the keyboard *without* becoming the
+/// active app leaves the active application and the window list unchanged, but Accessibility names
+/// it: with a proper app's non-activating key panel over VS Code, the system-wide focused
+/// application and focused element both became the panel's process, and went back to "no value"
+/// when it closed (Codex's second review of 0.1.6). Only the application is used, not the element:
+/// a web view's elements can belong to a helper process.
+pub fn focused_app_pid() -> Option<i32> {
+    if !accessibility_trusted() {
+        return None;
+    }
+    unsafe {
+        let raw = AXUIElementCreateSystemWide();
+        if raw.is_null() {
+            return None;
+        }
+        // Create rule: this reference is ours already, so it is not retained again.
+        let system = AxElement(raw);
+        system.copy_element("AXFocusedApplication")?.pid()
     }
 }
 

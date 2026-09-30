@@ -8,6 +8,8 @@ pub mod clip;
 pub mod destination;
 pub mod engine_whisper;
 pub mod login_item;
+#[cfg(target_os = "macos")]
+mod mac_exit;
 pub mod recorder;
 pub mod update;
 #[cfg(windows)]
@@ -149,6 +151,12 @@ struct App {
     destination: Mutex<Option<Box<dyn Destination>>>,
     pin_note: Mutex<Option<String>>,
     delivered: Mutex<bool>,
+    /// The last words are neither on a clipboard nor in a draft - only in the box. Quit waits for
+    /// him to take them (Codex's fourth review of 0.1.6). Cleared when a new dictation starts.
+    words_unsaved: Mutex<bool>,
+    /// Serialises the logout's early copy with the start of the final copy.
+    #[cfg(target_os = "macos")]
+    final_copy_started: Mutex<bool>,
     ask_permission: Mutex<bool>,
     /// Set the first time the permission is found missing, so the ask happens once per launch.
     /// macOS only: Windows asks for no permission.
@@ -881,11 +889,11 @@ fn on_menu(app: &AppHandle, id: &str) {
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(120));
                 let again = app.clone();
-                let _ = app.run_on_main_thread(move || toggle(again));
+                let _ = app.run_on_main_thread(move || toggle_by(again, false));
             });
         }
         #[cfg(not(windows))]
-        "dictate" => toggle(app.clone()),
+        "dictate" => toggle_by(app.clone(), false),
         "allow-ax" => open_accessibility_settings(),
         "check-updates" => check_for_updates(app),
         "rebind-dictation" => begin_rebind(app, Rebinding::Dictation),
@@ -929,7 +937,7 @@ fn on_menu(app: &AppHandle, id: &str) {
                 open_path(dir);
             }
         }
-        "quit" => app.exit(0),
+        "quit" => quit(app.clone()),
         _ => return,
     }
     // A check item flips its own tick when clicked; rebuild so it always shows the setting.
@@ -969,11 +977,154 @@ fn get_snapshot(state: State<App>) -> Snapshot {
     state.snapshot()
 }
 
+/// Quit - but on macOS only once his clipboard is not on loan (Codex's reviews of 0.1.6). A paste
+/// on Huck's clipboard has his own clipboard for half a second, and leaving in that time would
+/// leave the pasted words on it instead. From here on no paste may borrow it (one already waiting
+/// gives up), the borrow on loan is waited for - on a worker, so the menu stays alive - and only
+/// then does the program exit. If it cannot be given back within a generous ten seconds (a stuck
+/// restore), the program does **not** exit and pasting works again: choose Quit once more.
+fn quit(app: AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering;
+        // One Quit at a time: a second choice while the first still waits would race its
+        // `resume_borrowing`, reopening the gate under the other.
+        if QUITTING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::thread::spawn(move || {
+            let kept = keep_everything_before_exit(&app, std::time::Duration::from_secs(20));
+            // The words could be neither copied nor drafted: they are only in the box, which
+            // says so ("copy it before closing"). The first Quit brings the box forward instead
+            // of leaving; a second one, after he has seen it, goes. (Codex's fourth review.)
+            let state: State<App> = app.state();
+            let unsaved = *state.words_unsaved.lock();
+            let generation = *state.generation.lock();
+            let warned = *QUIT_WARNED_GENERATION.lock();
+            match mac_exit::quit_decision(kept, unsaved, warned, generation) {
+                mac_exit::QuitDecision::Exit => {
+                    EXIT_ALLOWED.store(true, Ordering::SeqCst);
+                    app.exit(0);
+                    return;
+                }
+                mac_exit::QuitDecision::Warn => {
+                    eprintln!("[hvtt] not quitting yet: his last words are only in the box");
+                    reveal_composer(&app);
+                    push(&app);
+                    *QUIT_WARNED_GENERATION.lock() = Some(generation);
+                }
+                mac_exit::QuitDecision::Stay => {
+                    eprintln!("[hvtt] not quitting yet: a dictation or his clipboard is not safe yet");
+                }
+            }
+            clip::huck::resume_borrowing();
+            QUITTING.store(false, Ordering::SeqCst);
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    app.exit(0);
+}
+
+/// A Quit is under way (macOS): no new dictation may start, and the shortcut is ignored.
+#[cfg(target_os = "macos")]
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The generation whose unsaved words a Quit has already revealed. A timeout does not warn.
+#[cfg(target_os = "macos")]
+static QUIT_WARNED_GENERATION: Mutex<Option<u64>> = Mutex::new(None);
+
+/// The end is coming and cannot be put off (a logout): before anything slow, put the words
+/// already recognised where the finished ones would go - the chosen clipboard, and a draft if
+/// drafts are on. If the last stretch then finishes in time it replaces them; if not, only that
+/// last stretch is lost, never the whole dictation. (Codex's fourth review of 0.1.6.) Audio is
+/// never written to disk for this: he has not asked for recordings to be kept.
+#[cfg(target_os = "macos")]
+fn keep_words_so_far(app: &AppHandle) {
+    let state: State<App> = app.state();
+    let order = mac_exit::CopyOrder::new(&state.final_copy_started);
+    // Hold through the snapshot and its write: a final copy waits for an early one, and an
+    // early copy arriving after the final one has begun is skipped.
+    let Some(_early_copy) = order.early() else { return };
+    let busy = {
+        let session = state.session.lock();
+        session.is_dictating() || matches!(*session, SessionState::Transcribing)
+    };
+    let text = state.live.lock().text.trim().to_string();
+    if !busy || text.is_empty() {
+        return;
+    }
+    let (choice, keep_drafts) = {
+        let s = state.settings.lock();
+        (s.clipboard, s.keep_drafts)
+    };
+    let system = clip::SystemClipboard::new(app.clone());
+    let huck = clip::huck::HuckClipboard;
+    let clipboard: &dyn hvtt_core::pipeline::Clipboard = match choice {
+        ClipboardChoice::Huck => &huck,
+        _ => &system,
+    };
+    let report = hvtt_core::complete_transcription(
+        &Transcript::settled(text),
+        clipboard,
+        None,
+        state.drafts.as_ref().filter(|_| keep_drafts),
+    );
+    eprintln!("[hvtt] ending: the words so far were kept ({})", report.text_is_safe());
+}
+
+/// `keep_everything_before_exit` has finished: an exit request may now go through.
+#[cfg(target_os = "macos")]
+static EXIT_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Before the program leaves, nothing of his may be only in flight (Codex's third review of
+/// 0.1.6; the product rule). In order, within `limit`:
+/// 1. a dictation still going - listening or paused - is finished the way closing the box finishes
+///    it: the last words recognised, then drafted and copied, **not delivered**;
+/// 2. that, or a delivery already under way, is waited for;
+/// 3. no paste may borrow his clipboard any more, and one on loan is given back (`stop_borrowing`).
+///
+/// `true` when all of it is done. Callers set `QUITTING` first, so no new dictation starts.
+#[cfg(target_os = "macos")]
+fn keep_everything_before_exit(app: &AppHandle, limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    let state: State<App> = app.state();
+    if state.session.lock().is_dictating() {
+        finish(app.clone(), false);
+    }
+    loop {
+        let busy = {
+            let session = state.session.lock();
+            session.is_dictating() || matches!(*session, SessionState::Transcribing)
+        };
+        if !busy {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    clip::huck::stop_borrowing(deadline.saturating_duration_since(std::time::Instant::now()))
+}
+
 /// The dictation shortcut: start, or - listening or paused - send.
 #[tauri::command]
 fn toggle(app: AppHandle) {
+    toggle_by(app, true);
+}
+
+/// `by_key`: a key press ended the dictation, which the paste gate expects to have counted. The H
+/// menu's Start/Stop item is a mouse click - no key was pressed - so it says `false`, as the Send
+/// button does; otherwise the gate waits for a stop press that never comes and only copies the
+/// words (Codex's review of 0.1.6).
+fn toggle_by(app: AppHandle, by_key: bool) {
     let state: State<App> = app.state();
     if state.rebinding.lock().is_some() {
+        return;
+    }
+    // Quitting: the dictation, if any, is being finished and kept; nothing new may start.
+    #[cfg(target_os = "macos")]
+    if QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
     let (dictating, busy) = {
@@ -981,7 +1132,7 @@ fn toggle(app: AppHandle) {
         (session.is_dictating(), matches!(*session, SessionState::Transcribing))
     };
     if dictating {
-        crate::destination::box_input::set_stopped_by_key(true);
+        crate::destination::box_input::set_stopped_by_key(by_key);
         finish(app.clone(), true);
     } else if !busy {
         start_recording(app.clone());
@@ -1164,6 +1315,10 @@ fn dismiss(app: AppHandle) {
         *state.update.lock() = None;
     }
     *state.transcript.lock() = Transcript::empty();
+    #[cfg(target_os = "macos")]
+    {
+        *state.words_unsaved.lock() = false;
+    }
     *state.message.lock() = String::new();
     *state.elapsed_ms.lock() = 0;
     state.set_state(SessionState::Idle);
@@ -1261,6 +1416,11 @@ fn start_recording(app: AppHandle) {
     *state.box_has_keyboard.lock() = false;
     *state.transcript.lock() = Transcript::empty();
     *state.delivered.lock() = false;
+    *state.words_unsaved.lock() = false;
+    #[cfg(target_os = "macos")]
+    {
+        *state.final_copy_started.lock() = false;
+    }
     *state.ask_permission.lock() = false;
     // A finished update message gives way; a check still running re-shows itself when done.
     if !matches!(state.update.lock().as_ref(), Some(v) if matches!(v.stage, "checking" | "downloading" | "installing")) {
@@ -1406,7 +1566,7 @@ fn resolve_pin(
     stamp: Option<crate::destination::macos_paste::FocusStamp>,
     browser: Option<Result<crate::destination::chromium::ChromiumDestination, String>>,
 ) {
-    use crate::destination::macos_paste::PasteDestination;
+    use crate::destination::macos_paste::{PasteDestination, SameWindow};
     use crate::destination::{is_chromium_executable, is_unsupported_executable, macos_ax};
 
     let state: State<App> = app.state();
@@ -1473,9 +1633,12 @@ fn resolve_pin(
     }
 
     // Chrome without the extension has no silent write at all, and desktop Chromium apps change
-    // how they behave when Accessibility asks them anything: paste, gated.
+    // how they behave when Accessibility asks them anything: paste, gated. Every Chromium window
+    // gets the caret rule, as on Windows: after a click in the same window the paste goes where
+    // the caret is - a browser's address bar included (decided with him 2026-09-29) - whichever
+    // box Accessibility happens to name.
     if is_chromium_executable(&exe) || is_unsupported_executable(&exe).is_some() {
-        match paste() {
+        match paste().map(|p| p.forgiving(SameWindow::Caret)) {
             Some(p) => set(Box::new(p)),
             None => note(PinError::Unsupported { app: app_label.clone() }),
         }
@@ -1717,8 +1880,19 @@ fn hand_back_keyboard(app: &AppHandle, settle: bool) {
         }
     }
     #[cfg(target_os = "macos")]
-    if let Some(pid) = *state.workplace.lock() {
-        crate::destination::macos_paste::activate(pid);
+    {
+        let workplace = *state.workplace.lock();
+        if let Some(pid) = workplace {
+            crate::destination::macos_paste::activate(pid);
+            // Activation is asynchronous, and the paste gate refuses unless that app really holds
+            // the keyboard again (Codex's review of 0.1.6): wait for it, briefly, not hope.
+            if settle {
+                crate::destination::macos_paste::wait_for_keyboard(
+                    pid,
+                    std::time::Duration::from_millis(500),
+                );
+            }
+        }
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = &state;
@@ -1856,6 +2030,9 @@ fn deliver_words(app: &AppHandle, text: String, deliver: bool) {
     let transcript = state.transcript.lock().clone();
     let keep_drafts = state.settings.lock().keep_drafts;
     let deliver_started = std::time::Instant::now();
+    // Mark before the pipeline, but never hold this lock across final delivery.
+    #[cfg(target_os = "macos")]
+    mac_exit::CopyOrder::new(&state.final_copy_started).start_final();
     let report = {
         let dest = state.destination.lock();
         hvtt_core::complete_transcription(
@@ -1893,6 +2070,7 @@ fn deliver_words(app: &AppHandle, text: String, deliver: bool) {
         _ => report.message.clone(),
     };
     *state.delivered.lock() = delivered;
+    *state.words_unsaved.lock() = !report.text_is_safe();
     state.set_state(SessionState::Ready);
     log_latency(&state);
     push(app);
@@ -1973,6 +2151,9 @@ pub fn run() {
         destination: Mutex::new(None),
         pin_note: Mutex::new(None),
         delivered: Mutex::new(false),
+        words_unsaved: Mutex::new(false),
+        #[cfg(target_os = "macos")]
+        final_copy_started: Mutex::new(false),
         ask_permission: Mutex::new(false),
         permission_asked: Mutex::new(false),
         generation: Mutex::new(0),
@@ -2121,6 +2302,62 @@ pub fn run() {
             spawn_engine_load(app.handle().clone());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Huck's Voice to Text");
+        .build(tauri::generate_context!())
+        .expect("error while building Huck's Voice to Text")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            match event {
+                // A request to leave that can be refused (`app.exit`, the last window closing):
+                // refused until his words and clipboard are safe, then let through by `quit`
+                // (Codex's third review of 0.1.6).
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    if !EXIT_ALLOWED.load(std::sync::atomic::Ordering::SeqCst) {
+                        api.prevent_exit();
+                        quit(app.clone());
+                    }
+                }
+                // The end, which cannot be refused. After a Quit everything is already safe;
+                // after a logout or shutdown - which macOS delivers straight here, never as a
+                // request (tao's `applicationWillTerminate`) - keep what can be kept in the few
+                // seconds macOS allows, then leave.
+                tauri::RunEvent::Exit => {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+                    if !EXIT_ALLOWED.load(std::sync::atomic::Ordering::SeqCst) {
+                        QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+                        keep_words_so_far(app);
+                        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                        if !keep_everything_before_exit(app, remaining) {
+                            eprintln!("[hvtt] leaving before everything was kept (the system is ending the session)");
+                        }
+                    }
+                    leave_now(app);
+                }
+                _ => {}
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn _exit(status: i32) -> !;
+}
+
+/// Leave without running the C++ static destructors (macOS). The speech engine's Metal backend
+/// (ggml) frees its device in one and, with the model still loaded, calls `abort()`
+/// (`ggml_metal_rsets_free`): **every normal Quit produced a crash report** - found 2026-09-29
+/// testing Quit for real, on the debug build (which names the frames) and on the first 0.1.6
+/// candidate, so it is older than any of that work and very likely in the published builds too.
+///
+/// Tauri calls the run callback's `Exit` *before* its own `cleanup_before_exit` (tauri 2.11.6
+/// `app.rs`), so that cleanup is called here first - the tray icon, the resource tables - and only
+/// the C++ static destructors are skipped. Nothing of his is only in memory by now: the caller has
+/// kept any dictation and given back his clipboard, settings and drafts are written as they change,
+/// and Huck's clipboard is a named pasteboard that outlives the program. (Windows has no such
+/// backend and is untouched.)
+#[cfg(target_os = "macos")]
+fn leave_now(app: &AppHandle) -> ! {
+    app.cleanup_before_exit();
+    unsafe { _exit(0) }
 }
