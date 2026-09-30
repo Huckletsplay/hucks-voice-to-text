@@ -44,7 +44,15 @@ SetupIconFile={#SetupIcon}
 UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma2/max
 SolidCompression=yes
-WizardStyle=modern
+; Dressed like the floating box (app/desktop/ui/style.css): always dark, its near-black panel,
+; no divider lines, the white H. The art is drawn by make_install_art.py from docs/icon/mark.svg.
+WizardStyle=modern dark hidebevels
+WizardBackColor=#171717
+WizardBackColorDynamicDark=#171717
+WizardImageFile=..\desktop\installer\wizard-100.png,..\desktop\installer\wizard-125.png,..\desktop\installer\wizard-150.png,..\desktop\installer\wizard-175.png,..\desktop\installer\wizard-200.png,..\desktop\installer\wizard-225.png,..\desktop\installer\wizard-250.png
+WizardSmallImageFile=..\desktop\installer\wizard-small-100.png,..\desktop\installer\wizard-small-125.png,..\desktop\installer\wizard-small-150.png,..\desktop\installer\wizard-small-175.png,..\desktop\installer\wizard-small-200.png,..\desktop\installer\wizard-small-225.png,..\desktop\installer\wizard-small-250.png
+; The welcome page carries the tall panel - the first thing he sees is the box's look.
+DisableWelcomePage=no
 CloseApplications=yes
 RestartApplications=no
 ArchitecturesAllowed=x64compatible
@@ -81,8 +89,10 @@ Type: files; Name: "{userprograms}\{#AppName}.lnk"
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "HucksVoiceToText"; Flags: uninsdeletevalue dontcreatekey
 
 [Run]
-; No skipifsilent: an update from the app itself runs /SILENT and should come back running.
-Filename: "{app}\{#AppExeName}"; Description: "Start {#AppName}"; Flags: nowait postinstall
+; An update from the app itself runs /VERYSILENT - no installer window at all - and comes back
+; running with --updated, so the box can say it is done.
+Filename: "{app}\{#AppExeName}"; Description: "Start {#AppName}"; Flags: nowait postinstall; Check: not WizardSilent
+Filename: "{app}\{#AppExeName}"; Parameters: "--updated"; Flags: nowait postinstall; Check: WizardSilent
 
 [Code]
 { The floating box is drawn by Microsoft Edge WebView2. Windows 11 always has it and Windows 10

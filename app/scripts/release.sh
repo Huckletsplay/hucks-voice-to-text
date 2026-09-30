@@ -100,8 +100,51 @@ ARCHS="$(lipo -archs "$APP/Contents/MacOS/hvtt-desktop")"
 
 say "Making the DMG…"
 ln -s /Applications "$STAGE/Applications"
-hdiutil create -quiet -volname "$PRODUCT_NAME" -srcfolder "$STAGE" -fs HFS+ -format UDZO \
-    -ov "$WORK/$NAME.dmg"
+# Dressed like the floating box: the background drawn by make_install_art.py (1x and 2x in one
+# TIFF, so a Retina screen gets the sharp one), the app and Applications on its two tiles. Finder
+# stores the layout in the volume's .DS_Store, so it is laid out once in a writable image, then
+# compressed. The first run asks to let this terminal control Finder; allow it.
+ART="$APP_DIR/desktop/installer"
+mkdir -p "$STAGE/.background"
+tiffutil -cathidpicheck "$ART/dmg-background.png" "$ART/dmg-background@2x.png" \
+    -out "$STAGE/.background/background.tiff" >/dev/null
+hdiutil create -quiet -volname "$PRODUCT_NAME" -srcfolder "$STAGE" -fs HFS+ -format UDRW \
+    -ov "$WORK/layout.dmg"
+LAYOUT="$(hdiutil attach -readwrite -noverify -noautoopen "$WORK/layout.dmg" \
+    | awk -F'\t' '/Apple_HFS/ {print $NF}')"
+[ -d "$LAYOUT" ] || { echo "Could not open the DMG to lay it out." >&2; exit 1; }
+# Window: 660 x 400 points of content, the size of the art. Icon centres match APP_AT / APPS_AT
+# in make_install_art.py.
+osascript - "$(basename "$LAYOUT")" "$PRODUCT_NAME.app" <<'OSA'
+on run argv
+    set volumeName to item 1 of argv
+    set appName to item 2 of argv
+    tell application "Finder"
+        tell disk volumeName
+            open
+            set current view of container window to icon view
+            set toolbar visible of container window to false
+            set statusbar visible of container window to false
+            set the bounds of container window to {200, 120, 860, 548}
+            set opts to the icon view options of container window
+            set arrangement of opts to not arranged
+            set icon size of opts to 128
+            set text size of opts to 13
+            set background picture of opts to file ".background:background.tiff"
+            set position of item appName of container window to {180, 190}
+            set position of item "Applications" of container window to {480, 190}
+            update without registering applications
+            delay 1
+            close
+        end tell
+    end tell
+end run
+OSA
+sync
+[ -f "$LAYOUT/.DS_Store" ] || { echo "Finder did not save the DMG's layout." >&2; exit 1; }
+hdiutil detach -quiet "$LAYOUT"
+hdiutil convert -quiet "$WORK/layout.dmg" -format UDZO -o "$WORK/$NAME.dmg"
+rm -f "$WORK/layout.dmg"
 hdiutil verify -quiet "$WORK/$NAME.dmg"
 
 say "Checking the app inside the DMG…"
@@ -112,6 +155,8 @@ codesign --verify --strict "$MOUNTED"
 [ -f "$MOUNTED/Contents/Resources/models/$(basename "$MODEL")" ] \
     || { echo "The speech model is missing from the mounted app." >&2; exit 1; }
 [ -L "$WORK/mnt/Applications" ] || { echo "The Applications shortcut is missing." >&2; exit 1; }
+[ -f "$WORK/mnt/.background/background.tiff" ] && [ -f "$WORK/mnt/.DS_Store" ] \
+    || { echo "The DMG's branded background or layout is missing." >&2; exit 1; }
 hdiutil detach -quiet "$WORK/mnt"
 
 # One line, the file name only - the form the updater requires.

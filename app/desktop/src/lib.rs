@@ -543,7 +543,7 @@ fn show_update(app: &AppHandle, stage: &'static str, title: String, detail: Stri
 /// Settings › Check for Updates…. The only network connection the program makes, and only now.
 fn check_for_updates(app: &AppHandle) {
     let state: State<App> = app.state();
-    if matches!(state.update.lock().as_ref(), Some(v) if matches!(v.stage, "checking" | "downloading")) {
+    if matches!(state.update.lock().as_ref(), Some(v) if matches!(v.stage, "checking" | "downloading" | "installing")) {
         reveal_composer(app);
         return;
     }
@@ -601,15 +601,28 @@ fn check_for_updates(app: &AppHandle) {
 #[tauri::command]
 fn open_update(app: AppHandle) {
     let file = app.state::<App>().update_file.lock().clone();
-    // Snip 'n' Clip's way: a silent install that closes this copy and starts the new one.
+    // Snip 'n' Clip's way: an install that closes this copy and starts the new one. Very silent,
+    // so no plain installer window appears: the box says it is installing, and the new copy says
+    // it is done (the installer starts it with --updated).
     #[cfg(windows)]
     if let Some(installer) = file {
-        // The installer must not find this copy still "running" while it quits.
-        win_surface::release_single_instance();
-        if std::process::Command::new(installer).args(["/SILENT", "/CLOSEAPPLICATIONS"]).spawn().is_ok() {
-            app.exit(0);
-            return;
-        }
+        show_update(
+            &app,
+            "installing",
+            "Installing the update…".into(),
+            "Back in a moment. Your settings stay as they are.".into(),
+        );
+        std::thread::spawn(move || {
+            // Long enough to read before this copy steps aside.
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            // The installer must not find this copy still "running" while it quits.
+            win_surface::release_single_instance();
+            match std::process::Command::new(&installer).args(["/VERYSILENT", "/CLOSEAPPLICATIONS"]).spawn() {
+                Ok(_) => app.exit(0),
+                Err(e) => show_update(&app, "failed", "Couldn't start the update".into(), e.to_string()),
+            }
+        });
+        return;
     }
     #[cfg(not(windows))]
     if let Some(dmg) = file {
@@ -1072,7 +1085,7 @@ fn dismiss(app: AppHandle) {
     *state.level.lock() = 0.0;
     *state.delivered.lock() = false;
     *state.ask_permission.lock() = false;
-    if !matches!(state.update.lock().as_ref(), Some(v) if matches!(v.stage, "checking" | "downloading")) {
+    if !matches!(state.update.lock().as_ref(), Some(v) if matches!(v.stage, "checking" | "downloading" | "installing")) {
         *state.update.lock() = None;
     }
     *state.transcript.lock() = Transcript::empty();
@@ -1175,7 +1188,7 @@ fn start_recording(app: AppHandle) {
     *state.delivered.lock() = false;
     *state.ask_permission.lock() = false;
     // A finished update message gives way; a check still running re-shows itself when done.
-    if !matches!(state.update.lock().as_ref(), Some(v) if matches!(v.stage, "checking" | "downloading")) {
+    if !matches!(state.update.lock().as_ref(), Some(v) if matches!(v.stage, "checking" | "downloading" | "installing")) {
         *state.update.lock() = None;
     }
     state.set_state(SessionState::Recording);
@@ -2003,6 +2016,20 @@ pub fn run() {
             // The window server's first answer costs ~45 ms; pay it now, not on the first keypress.
             #[cfg(target_os = "macos")]
             std::thread::spawn(crate::destination::macos_paste::warm_up);
+
+            // Back from an update this program started (the installer passes --updated): the box
+            // says so, then leaves, as it does for "You're up to date".
+            if std::env::args().any(|a| a == "--updated") {
+                let handle = app.handle().clone();
+                let version = handle.package_info().version.to_string();
+                show_update(
+                    &handle,
+                    "current",
+                    format!("Updated to version {version}"),
+                    "Your settings are as you left them.".into(),
+                );
+                hide_after(&handle, std::time::Duration::from_millis(3000));
+            }
 
             spawn_engine_load(app.handle().clone());
             Ok(())
