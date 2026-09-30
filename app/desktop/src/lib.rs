@@ -548,6 +548,8 @@ fn check_for_updates(app: &AppHandle) {
         return;
     }
     *state.update_file.lock() = None;
+    #[cfg(windows)]
+    UPDATE_WARNED.store(false, std::sync::atomic::Ordering::SeqCst);
     show_update(app, "checking", "Checking for updates…".into(), "Asking GitHub.".into());
     let app = app.clone();
     std::thread::spawn(move || {
@@ -606,6 +608,14 @@ fn open_update(app: AppHandle) {
     // it is done (the installer starts it with --updated).
     #[cfg(windows)]
     if let Some(installer) = file {
+        // With Keep Recovery Drafts off, Huck's Clipboard is the only copy of his last words, and
+        // on Windows it lives in this program's memory: say so before an update empties it. The
+        // second Open Update goes ahead.
+        let held_at_click = crate::clip::huck::read();
+        if huck_clipboard_at_risk(&app) && !UPDATE_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            warn_huck_clipboard(&app);
+            return;
+        }
         show_update(
             &app,
             "installing",
@@ -615,27 +625,31 @@ fn open_update(app: AppHandle) {
         std::thread::spawn(move || {
             // Long enough to read before this copy steps aside.
             std::thread::sleep(std::time::Duration::from_millis(1200));
-            // Never step aside mid-dictation: a dictation started meanwhile finishes, and its
-            // words are drafted, copied and delivered, before this copy quits for the installer.
-            // A paste on Huck's clipboard gives his own clipboard back half a second later, so
-            // after a dictation this waits a second more - and looks again.
+            // Never step aside mid-dictation - its words are drafted, copied and delivered first -
+            // nor while his own clipboard is out on loan for a paste (Codex's review of 0.1.5).
             let dictating = |app: &AppHandle| {
                 matches!(
                     *app.state::<App>().session.lock(),
                     SessionState::Recording | SessionState::Paused | SessionState::Transcribing
                 )
             };
-            while dictating(&app) {
-                while dictating(&app) {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1000));
+            while dictating(&app) || crate::clip::huck::borrows_pending() {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            // New words arrived on Huck's Clipboard while it waited: those he has not been told
+            // about. Stop and say so; Open Update again goes ahead.
+            if huck_clipboard_at_risk(&app) && crate::clip::huck::read() != held_at_click {
+                warn_huck_clipboard(&app);
+                return;
             }
             // The installer must not find this copy still "running" while it quits.
             win_surface::release_single_instance();
-            match std::process::Command::new(&installer).args(["/VERYSILENT", "/CLOSEAPPLICATIONS"]).spawn() {
-                Ok(_) => app.exit(0),
-                Err(e) => show_update(&app, "failed", "Couldn't start the update".into(), e.to_string()),
+            match start_installer(&installer) {
+                Ok(()) => app.exit(0),
+                Err(e) => {
+                    let _ = win_surface::claim_single_instance();
+                    show_update(&app, "failed", "Couldn't start the update".into(), e.to_string());
+                }
             }
         });
         return;
@@ -645,6 +659,55 @@ fn open_update(app: AppHandle) {
         open_path(dmg);
     }
     dismiss(app);
+}
+
+/// He has been told this once for the update now on offer (reset by each Check for Updates).
+#[cfg(windows)]
+static UPDATE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Would the update lose words? Only when Huck's Clipboard holds some, it is the chosen
+/// clipboard, and no recovery draft keeps a copy on disk.
+#[cfg(windows)]
+fn huck_clipboard_at_risk(app: &AppHandle) -> bool {
+    let state: State<App> = app.state();
+    let settings = state.settings.lock();
+    settings.clipboard == ClipboardChoice::Huck
+        && !settings.keep_drafts
+        && crate::clip::huck::read().is_some_and(|t| !t.trim().is_empty())
+}
+
+#[cfg(windows)]
+fn warn_huck_clipboard(app: &AppHandle) {
+    show_update(
+        app,
+        "ready",
+        "Paste what you need first".into(),
+        "Updating empties Huck's Clipboard, and Keep Recovery Drafts is off. Paste anything you \
+         still need from it, then choose Open Update again."
+            .into(),
+    );
+}
+
+/// Start the verified installer so that an update can never leave him without the program: cmd.exe
+/// waits for it, and if it did not finish - failed, cancelled, refused - starts this copy again
+/// with --update-failed. A path cmd would read as syntax gets the plain start, as before 0.1.5.
+#[cfg(windows)]
+fn start_installer(installer: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = std::env::current_exe()?;
+    let watched = update::installer_command(&installer.display().to_string(), &exe.display().to_string());
+    match watched {
+        Some(line) => {
+            let root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
+            let cmd = root.unwrap_or_else(|| r"C:\Windows".into()).join("System32").join("cmd.exe");
+            std::process::Command::new(cmd).raw_arg(line).creation_flags(CREATE_NO_WINDOW).spawn()?;
+        }
+        None => {
+            std::process::Command::new(installer).args(["/VERYSILENT", "/CLOSEAPPLICATIONS"]).spawn()?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------- the menu
@@ -2045,6 +2108,18 @@ pub fn run() {
                     "Your settings are as you left them.".into(),
                 );
                 hide_after(&handle, std::time::Duration::from_millis(3000));
+            }
+            // The installer did not finish, and the update's watcher started this copy again.
+            if std::env::args().any(|a| a == "--update-failed") {
+                let handle = app.handle().clone();
+                let version = handle.package_info().version.to_string();
+                show_update(
+                    &handle,
+                    "failed",
+                    "The update didn't finish".into(),
+                    format!("You're still on version {version}. Check for Updates to try again."),
+                );
+                hide_after(&handle, std::time::Duration::from_millis(6000));
             }
 
             spawn_engine_load(app.handle().clone());

@@ -51,7 +51,8 @@ MODEL="${HVTT_RELEASE_MODEL:-$HOME/Library/Application Support/com.huck.voice-to
 [ -f "$MODEL" ] || { echo "No speech model at $MODEL - run scripts/fetch-model.sh base.en" >&2; exit 1; }
 OUT="$PROJECT_ROOT/artifacts/macos/release"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/hvtt-release.XXXXXX")"
-trap 'hdiutil detach "$WORK/mnt" -quiet 2>/dev/null || true; rm -rf "$WORK"' EXIT
+LAYOUT=""
+trap 'hdiutil detach "$WORK/mnt" -quiet 2>/dev/null || true; [ -z "$LAYOUT" ] || hdiutil detach "$LAYOUT" -quiet -force 2>/dev/null || true; rm -rf "$WORK"' EXIT
 STAGE="$WORK/stage"
 APP="$STAGE/$PRODUCT_NAME.app"
 CARGO_TARGET_DIR="$WORK/target"
@@ -140,9 +141,15 @@ on run argv
     end tell
 end run
 OSA
-sync
+# Finder writes its .DS_Store a moment after the window closes: give it up to ten seconds.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sync
+    [ -f "$LAYOUT/.DS_Store" ] && break
+    sleep 1
+done
 [ -f "$LAYOUT/.DS_Store" ] || { echo "Finder did not save the DMG's layout." >&2; exit 1; }
 hdiutil detach -quiet "$LAYOUT"
+LAYOUT=""
 hdiutil convert -quiet "$WORK/layout.dmg" -format UDZO -o "$WORK/$NAME.dmg"
 rm -f "$WORK/layout.dmg"
 hdiutil verify -quiet "$WORK/$NAME.dmg"

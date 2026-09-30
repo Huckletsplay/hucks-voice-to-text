@@ -92,7 +92,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 ; An update from the app itself runs /VERYSILENT - no installer window at all - and comes back
 ; running with --updated, so the box can say it is done.
 Filename: "{app}\{#AppExeName}"; Description: "Start {#AppName}"; Flags: nowait postinstall; Check: not WizardSilent
-Filename: "{app}\{#AppExeName}"; Parameters: "--updated"; Flags: nowait postinstall; Check: WizardSilent
+Filename: "{app}\{#AppExeName}"; Parameters: "--updated"; Flags: nowait postinstall; Check: WizardSilent and WasInstalled
+Filename: "{app}\{#AppExeName}"; Flags: nowait postinstall; Check: WizardSilent and not WasInstalled
 
 [Code]
 { The floating box is drawn by Microsoft Edge WebView2. Windows 11 always has it and Windows 10
@@ -106,8 +107,19 @@ begin
     (RegQueryStringValue(HKCU, 'Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', Version) and (Version <> '') and (Version <> '0.0.0.0'));
 end;
 
+{ Read before anything is installed: was a copy here already? Only then is a silent install an
+  update, and only then does the program start with --updated to say so. }
+var
+  Existing: Boolean;
+
+function WasInstalled(): Boolean;
+begin
+  Result := Existing;
+end;
+
 function InitializeSetup(): Boolean;
 begin
+  Existing := RegKeyExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{AE21D989-11BC-4DBD-9B5C-9F05997CD30B}_is1');
   Result := True;
   if (not WizardSilent()) and (not WebView2Installed()) then
     MsgBox('Huck''s Voice to Text needs the Microsoft Edge WebView2 Runtime, which this PC does not seem to have.' + #13#10#13#10 +

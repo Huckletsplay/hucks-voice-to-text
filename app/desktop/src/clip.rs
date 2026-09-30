@@ -545,10 +545,38 @@ pub mod huck {
         }
     }
 
+    /// Borrows not yet given back. The program must not quit while one is out: his words would
+    /// stay on the normal clipboard and what he had there would be gone. (Codex's review of 0.1.5,
+    /// 2026-09-29: the update used to guess this from the dictation state.)
+    static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Whether any borrow of the normal clipboard is still out.
+    pub fn borrows_pending() -> bool {
+        PENDING.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// Counts one borrow for as long as it lives: from before the clipboard is touched until it
+    /// has been given back (or refused).
+    struct Pending;
+
+    impl Pending {
+        fn new() -> Self {
+            PENDING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Pending
+        }
+    }
+
+    impl Drop for Pending {
+        fn drop(&mut self) {
+            PENDING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// Everything that was on the normal clipboard before a borrow.
     pub struct Borrowed {
         items: Vec<(u32, Vec<u8>)>,
         ours: u32,
+        _pending: Pending,
     }
 
     /// Put `text` on the normal clipboard for a moment, remembering exactly what was there. A
@@ -562,6 +590,7 @@ pub mod huck {
     /// opens another program could copy something new, which the borrow then replaced and never
     /// put back).
     pub fn borrow_general(text: &str) -> Result<Borrowed, String> {
+        let pending = Pending::new();
         let items;
         {
             let _open = Open::new().ok_or("the clipboard is busy")?;
@@ -578,7 +607,7 @@ pub mod huck {
             }
         }
         // Read only once the clipboard is closed: closing it is itself a change Windows counts.
-        Ok(Borrowed { items, ours: unsafe { GetClipboardSequenceNumber() } })
+        Ok(Borrowed { items, ours: unsafe { GetClipboardSequenceNumber() }, _pending: pending })
     }
 
     impl Borrowed {
@@ -606,6 +635,17 @@ pub mod huck {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_borrow_counts_until_it_is_dropped() {
+            // Other tests may borrow in parallel, so this compares against its own start.
+            let before = PENDING.load(std::sync::atomic::Ordering::SeqCst);
+            let one = Pending::new();
+            assert_eq!(PENDING.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+            assert!(borrows_pending());
+            drop(one);
+            assert_eq!(PENDING.load(std::sync::atomic::Ordering::SeqCst), before);
+        }
 
         #[test]
         fn handles_that_cannot_be_copied_stop_the_borrow() {

@@ -218,6 +218,23 @@ pub fn download_dir() -> PathBuf {
     std::env::temp_dir().join("HucksVoiceToText-Update")
 }
 
+/// cmd.exe's arguments for a watched update: run the installer out of sight and wait for it, and
+/// if it did not finish (any exit code but 0), start the program it was replacing again, told so.
+/// `None` when either path holds a character cmd would read as syntax rather than a name.
+///
+/// With /s, cmd drops the outer quotes and runs the rest as written; `start /wait` hands back the
+/// installer's exit code, which `if errorlevel 1` reads.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn installer_command(installer: &str, exe: &str) -> Option<String> {
+    let risky = |s: &str| s.chars().any(|c| matches!(c, '"' | '%' | '^' | '&' | '|' | '<' | '>' | '!'));
+    if risky(installer) || risky(exe) {
+        return None;
+    }
+    Some(format!(
+        r#"/d /s /c "start "" /wait "{installer}" /VERYSILENT /CLOSEAPPLICATIONS & if errorlevel 1 start "" "{exe}" --update-failed""#
+    ))
+}
+
 /// Download the DMG and prove it is the published one. Returns its path only if it is.
 pub fn download(offer: &Offer) -> Result<PathBuf, String> {
     let dir = download_dir();
@@ -313,6 +330,30 @@ mod tests {
         let spaced = hash.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(" ");
         assert_eq!(read_sha256(&format!("SHA256 hash of file:\n{spaced}\n")), Some(hash));
         assert_eq!(read_sha256("CertUtil: error\n"), None);
+    }
+
+    #[test]
+    fn a_failed_install_starts_the_old_program_again() {
+        // Spaces in both paths, as a real profile folder often has.
+        let line = installer_command(
+            r"C:\Temp Files\HucksVoiceToText-Update\HucksVoiceToText-0.1.5-windows-x64-setup.exe",
+            r"C:\Program Files\HucksVoiceToText\HucksVoiceToText.exe",
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            r#"/d /s /c "start "" /wait "C:\Temp Files\HucksVoiceToText-Update\HucksVoiceToText-0.1.5-windows-x64-setup.exe" /VERYSILENT /CLOSEAPPLICATIONS & if errorlevel 1 start "" "C:\Program Files\HucksVoiceToText\HucksVoiceToText.exe" --update-failed""#
+        );
+        // An apostrophe is only a name; cmd leaves it alone.
+        assert!(installer_command(r"C:\O'Neil Tools\a.exe", r"C:\b.exe").is_some());
+    }
+
+    #[test]
+    fn paths_cmd_would_read_as_syntax_are_not_risked() {
+        for bad in ["C:\\A&B\\x.exe", "C:\\50%\\x.exe", "C:\\a^b\\x.exe", "C:\\a|b\\x.exe", "C:\\a\"b\\x.exe"] {
+            assert!(installer_command(bad, r"C:\b.exe").is_none(), "{bad}");
+            assert!(installer_command(r"C:\b.exe", bad).is_none(), "{bad}");
+        }
     }
 
     #[test]
