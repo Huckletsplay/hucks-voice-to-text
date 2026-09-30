@@ -474,11 +474,22 @@ impl PasteDestination {
         let strict =
             if self.stamp.held_other { Some("key-held-at-start") } else { input_moved(clicks, keys, expected) };
         let verdict = after_moving(strict, keys >= expected.1, self.stamp.focus != 0, || self.place());
-        if let (Some(why), None) = (strict, verdict) {
-            eprintln!("[hvtt] paste gate: {why}, same window and box - sending where the caret is");
+        let (Some(why), None) = (strict, verdict) else { return verdict };
+        // Asking UI Automation takes a moment, in which he could have clicked or switched away.
+        // Everything read before it is read again after it, and must not have changed. (Codex's
+        // third review, 2026-09-29.)
+        if let Some(moved) = settled((clicks, keys), self.stamp.counted(), self.stamp.window_moved()) {
+            return Some(moved);
         }
-        verdict
+        eprintln!("[hvtt] paste gate: {why}, same window and box - sending where the caret is");
+        None
     }
+}
+
+/// Nothing moved while the same-window check ran: the same window and control, and no click or
+/// key press since the counts were first read.
+fn settled(before: (u32, u32), after: (u32, u32), window_moved: Option<&'static str>) -> Option<&'static str> {
+    window_moved.or((before != after).then_some("moved-during-check"))
 }
 
 /// The same-window rule, apart from the system calls. `strict` is the old verdict (anything at
@@ -583,6 +594,16 @@ mod tests {
             assert_eq!(after_moving(Some(why), false, true, || Place::Caret), Some("stop-not-seen"), "{why}");
         }
         assert_eq!(after_moving(Some("stop-not-seen"), false, true, || Place::Caret), Some("stop-not-seen"));
+    }
+
+    #[test]
+    fn nothing_may_move_while_the_same_window_check_runs() {
+        // Codex's third review, 2026-09-29: focus could change during the UI Automation check.
+        assert_eq!(settled((2, 3), (2, 3), None), None);
+        assert_eq!(settled((2, 3), (3, 3), None), Some("moved-during-check"), "a click meanwhile");
+        assert_eq!(settled((2, 3), (2, 4), None), Some("moved-during-check"), "a key meanwhile");
+        assert_eq!(settled((2, 3), (2, 3), Some("focus-changed")), Some("focus-changed"));
+        assert_eq!(settled((2, 3), (2, 3), Some("window-changed")), Some("window-changed"));
     }
 
     #[test]
