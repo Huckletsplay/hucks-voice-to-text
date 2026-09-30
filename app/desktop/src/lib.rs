@@ -608,11 +608,10 @@ fn open_update(app: AppHandle) {
     // it is done (the installer starts it with --updated).
     #[cfg(windows)]
     if let Some(installer) = file {
-        // With Keep Recovery Drafts off, Huck's Clipboard is the only copy of his last words, and
-        // on Windows it lives in this program's memory: say so before an update empties it. The
-        // second Open Update goes ahead.
+        // On Windows Huck's Clipboard lives in this program's memory, and may hold the only copy of
+        // his last words: say so before an update empties it. The second Open Update goes ahead.
         let held_at_click = crate::clip::huck::read();
-        if huck_clipboard_at_risk(&app) && !UPDATE_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if huck_clipboard_at_risk() && !UPDATE_WARNED.load(std::sync::atomic::Ordering::SeqCst) {
             warn_huck_clipboard(&app);
             return;
         }
@@ -638,7 +637,7 @@ fn open_update(app: AppHandle) {
             }
             // New words arrived on Huck's Clipboard while it waited: those he has not been told
             // about. Stop and say so; Open Update again goes ahead.
-            if huck_clipboard_at_risk(&app) && crate::clip::huck::read() != held_at_click {
+            if huck_clipboard_at_risk() && crate::clip::huck::read() != held_at_click {
                 warn_huck_clipboard(&app);
                 return;
             }
@@ -665,48 +664,45 @@ fn open_update(app: AppHandle) {
 #[cfg(windows)]
 static UPDATE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Would the update lose words? Only when Huck's Clipboard holds some, it is the chosen
-/// clipboard, and no recovery draft keeps a copy on disk.
+/// Would the update lose words? Whenever Huck's Clipboard holds some. It lives in this program's
+/// memory, and whether a recovery draft of those very words was written cannot be told from the
+/// setting (drafts can be switched on afterwards, or a write can fail), so this does not try.
+/// (Codex's second review of 0.1.5.)
 #[cfg(windows)]
-fn huck_clipboard_at_risk(app: &AppHandle) -> bool {
-    let state: State<App> = app.state();
-    let settings = state.settings.lock();
-    settings.clipboard == ClipboardChoice::Huck
-        && !settings.keep_drafts
-        && crate::clip::huck::read().is_some_and(|t| !t.trim().is_empty())
+fn huck_clipboard_at_risk() -> bool {
+    crate::clip::huck::read().is_some_and(|t| !t.trim().is_empty())
 }
 
 #[cfg(windows)]
 fn warn_huck_clipboard(app: &AppHandle) {
+    UPDATE_WARNED.store(true, std::sync::atomic::Ordering::SeqCst);
     show_update(
         app,
         "ready",
         "Paste what you need first".into(),
-        "Updating empties Huck's Clipboard, and Keep Recovery Drafts is off. Paste anything you \
-         still need from it, then choose Open Update again."
+        "Updating empties Huck's Clipboard. Paste anything you still need from it, then choose \
+         Open Update again."
             .into(),
     );
 }
 
-/// Start the verified installer so that an update can never leave him without the program: cmd.exe
-/// waits for it, and if it did not finish - failed, cancelled, refused - starts this copy again
-/// with --update-failed. A path cmd would read as syntax gets the plain start, as before 0.1.5.
+/// Start the verified installer so that an update can never leave him without the program: a
+/// hidden PowerShell waits for it, and if it did not finish - any exit code but 0 - starts this copy
+/// again with --update-failed. The script travels encoded, so no path is ever parsed as syntax.
 #[cfg(windows)]
 fn start_installer(installer: &std::path::Path) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let exe = std::env::current_exe()?;
-    let watched = update::installer_command(&installer.display().to_string(), &exe.display().to_string());
-    match watched {
-        Some(line) => {
-            let root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
-            let cmd = root.unwrap_or_else(|| r"C:\Windows".into()).join("System32").join("cmd.exe");
-            std::process::Command::new(cmd).raw_arg(line).creation_flags(CREATE_NO_WINDOW).spawn()?;
-        }
-        None => {
-            std::process::Command::new(installer).args(["/VERYSILENT", "/CLOSEAPPLICATIONS"]).spawn()?;
-        }
-    }
+    let script = update::installer_script(&installer.display().to_string(), &exe.display().to_string());
+    let root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
+    let powershell = root
+        .unwrap_or_else(|| r"C:\Windows".into())
+        .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    std::process::Command::new(powershell)
+        .args(update::powershell_args(&script))
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
     Ok(())
 }
 

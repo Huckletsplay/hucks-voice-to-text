@@ -218,21 +218,79 @@ pub fn download_dir() -> PathBuf {
     std::env::temp_dir().join("HucksVoiceToText-Update")
 }
 
-/// cmd.exe's arguments for a watched update: run the installer out of sight and wait for it, and
-/// if it did not finish (any exit code but 0), start the program it was replacing again, told so.
-/// `None` when either path holds a character cmd would read as syntax rather than a name.
+/// The watcher for an update, as a PowerShell script: run the installer out of sight, wait for that
+/// process alone, and if it did not finish - any exit code but 0, negative crash codes included, or
+/// no exit code at all - start the program it was replacing again, told so.
 ///
-/// With /s, cmd drops the outer quotes and runs the rest as written; `start /wait` hands back the
-/// installer's exit code, which `if errorlevel 1` reads.
+/// Waits with `Wait-Process` on that one process, not `Start-Process -Wait`, which would also wait
+/// for the new program the installer starts. Cmdlets and properties only, no .NET method calls,
+/// so it also runs where PowerShell is held to Constrained Language. If anything throws once the
+/// installer is running, it waits for the installer to be gone before starting anything; a start
+/// that was not needed finds the new copy running and quits at once (the single-instance lock).
+/// (Codex's reviews of 0.1.5: cmd.exe's `if errorlevel 1` missed negative codes, and paths with
+/// `&` or `%` could not be passed to it safely.)
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn installer_command(installer: &str, exe: &str) -> Option<String> {
-    let risky = |s: &str| s.chars().any(|c| matches!(c, '"' | '%' | '^' | '&' | '|' | '<' | '>' | '!'));
-    if risky(installer) || risky(exe) {
-        return None;
+pub fn installer_script(installer: &str, exe: &str) -> String {
+    format!(
+        "$code = 1\n\
+         $p = $null\n\
+         try {{\n\
+         \x20   $p = Start-Process -FilePath {} -ArgumentList '/VERYSILENT','/CLOSEAPPLICATIONS' -PassThru\n\
+         \x20   $null = $p.Handle\n\
+         \x20   Wait-Process -InputObject $p\n\
+         \x20   if ($null -ne $p.ExitCode) {{ $code = $p.ExitCode }}\n\
+         }} catch {{\n\
+         \x20   if ($p) {{ while (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) {{ Start-Sleep -Seconds 1 }} }}\n\
+         }}\n\
+         if ($code -ne 0) {{ Start-Process -FilePath {} -ArgumentList '--update-failed' }}\n",
+        ps_literal(installer),
+        ps_literal(exe)
+    )
+}
+
+/// A PowerShell single-quoted literal: nothing inside is read as syntax except the quote itself,
+/// which is doubled. PowerShell takes the typographic single quotes for quotes too, so they are
+/// doubled as well.
+fn ps_literal(text: &str) -> String {
+    let mut out = String::from("'");
+    for c in text.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
     }
-    Some(format!(
-        r#"/d /s /c "start "" /wait "{installer}" /VERYSILENT /CLOSEAPPLICATIONS & if errorlevel 1 start "" "{exe}" --update-failed""#
-    ))
+    out.push('\'');
+    out
+}
+
+/// powershell.exe's arguments for `script`: -EncodedCommand takes it as Base64 of UTF-16LE, so no
+/// character in it is ever parsed by a command line.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn powershell_args(script: &str) -> Vec<String> {
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(base64(&bytes)))
+        .collect()
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// Download the DMG and prove it is the published one. Returns its path only if it is.
@@ -334,26 +392,76 @@ mod tests {
 
     #[test]
     fn a_failed_install_starts_the_old_program_again() {
-        // Spaces in both paths, as a real profile folder often has.
-        let line = installer_command(
-            r"C:\Temp Files\HucksVoiceToText-Update\HucksVoiceToText-0.1.5-windows-x64-setup.exe",
-            r"C:\Program Files\HucksVoiceToText\HucksVoiceToText.exe",
-        )
-        .unwrap();
-        assert_eq!(
-            line,
-            r#"/d /s /c "start "" /wait "C:\Temp Files\HucksVoiceToText-Update\HucksVoiceToText-0.1.5-windows-x64-setup.exe" /VERYSILENT /CLOSEAPPLICATIONS & if errorlevel 1 start "" "C:\Program Files\HucksVoiceToText\HucksVoiceToText.exe" --update-failed""#
-        );
-        // An apostrophe is only a name; cmd leaves it alone.
-        assert!(installer_command(r"C:\O'Neil Tools\a.exe", r"C:\b.exe").is_some());
+        let script = installer_script(r"C:\Temp Files\setup.exe", r"C:\Program Files\HVTT\HucksVoiceToText.exe");
+        assert!(script.contains(r"Start-Process -FilePath 'C:\Temp Files\setup.exe' -ArgumentList '/VERYSILENT','/CLOSEAPPLICATIONS' -PassThru"));
+        assert!(script.contains("Wait-Process -InputObject $p"), "waits for the installer alone");
+        assert!(!script.contains(".WaitForExit("), "no .NET method calls: Constrained Language allows none");
+        assert!(!script.contains("-Wait "), "Start-Process -Wait would wait for the new program too");
+        assert!(script.contains("if ($code -ne 0)"), "any exit code but 0, negative ones included");
+        assert!(script.contains(r"Start-Process -FilePath 'C:\Program Files\HVTT\HucksVoiceToText.exe' -ArgumentList '--update-failed'"));
     }
 
     #[test]
-    fn paths_cmd_would_read_as_syntax_are_not_risked() {
-        for bad in ["C:\\A&B\\x.exe", "C:\\50%\\x.exe", "C:\\a^b\\x.exe", "C:\\a|b\\x.exe", "C:\\a\"b\\x.exe"] {
-            assert!(installer_command(bad, r"C:\b.exe").is_none(), "{bad}");
-            assert!(installer_command(r"C:\b.exe", bad).is_none(), "{bad}");
+    fn no_character_in_a_path_is_read_as_syntax() {
+        assert_eq!(ps_literal(r"C:\A&B\50%\x^y|z.exe"), r"'C:\A&B\50%\x^y|z.exe'");
+        assert_eq!(ps_literal(r"C:\O'Neil\x.exe"), r"'C:\O''Neil\x.exe'");
+        assert_eq!(ps_literal("C:\\Huck\u{2019}s\\x.exe"), "'C:\\Huck\u{2019}\u{2019}s\\x.exe'");
+        assert_eq!(ps_literal(r#"C:\a"b $c `d\x.exe"#), r#"'C:\a"b $c `d\x.exe'"#);
+    }
+
+    /// On purpose (`dev.ps1 test --ignored`): the real watcher, run by the real PowerShell, with
+    /// stand-in installers in a folder whose name holds every awkward character. A crash code (-1)
+    /// must start the program again; 0 must not.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn the_watcher_really_restarts_the_program_after_a_failed_install() {
+        use std::os::windows::process::CommandExt;
+        let dir = std::env::temp_dir().join("hvtt watcher A&B 50% Huck\u{2019}s O'Neil");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("program.cmd");
+        let marker = dir.join("marker.txt");
+        std::fs::write(&program, "@echo %* > \"%~dp0marker.txt\"\r\n").unwrap();
+        let root = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let powershell = root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        // Each case twice: as PowerShell normally runs, and held to Constrained Language, as some
+        // managed PCs have it.
+        let modes = ["", "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n"];
+        let cases = [("-1", true), ("3", true), ("0", false)];
+        for (mode, (code, restarted)) in modes.iter().flat_map(|m| cases.iter().map(move |c| (m, *c))) {
+            let _ = std::fs::remove_file(&marker);
+            let setup = dir.join(format!("setup {code}.cmd"));
+            std::fs::write(&setup, format!("@exit {code}\r\n")).unwrap();
+            let script =
+                format!("{mode}{}", installer_script(&setup.display().to_string(), &program.display().to_string()));
+            let status = std::process::Command::new(&powershell)
+                .args(powershell_args(&script))
+                .creation_flags(0x0800_0000)
+                .status()
+                .unwrap();
+            assert!(status.success(), "the watcher itself ran");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let got = std::fs::read_to_string(&marker).ok();
+            assert_eq!(got.is_some(), restarted, "installer exit {code}, mode {mode:?}");
+            if let Some(args) = got {
+                assert_eq!(args.trim(), "--update-failed");
+            }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_script_reaches_powershell_encoded() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        let args = powershell_args("exit 0");
+        assert_eq!(args[..5], ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand"]);
+        // "exit 0" as UTF-16LE, as PowerShell's own docs encode it.
+        assert_eq!(args[5], "ZQB4AGkAdAAgADAA");
     }
 
     #[test]
