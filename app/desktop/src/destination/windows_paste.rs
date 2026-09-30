@@ -475,14 +475,11 @@ impl PasteDestination {
             if self.stamp.held_other { Some("key-held-at-start") } else { input_moved(clicks, keys, expected) };
         let verdict = after_moving(strict, keys >= expected.1, self.stamp.focus != 0, || self.place());
         let (Some(why), None) = (strict, verdict) else { return verdict };
-        // Asking UI Automation takes a moment, in which he could have clicked or switched away.
-        // Everything read before it is read again after it, and must not have changed. (Codex's
-        // third review, 2026-09-29.)
-        if let Some(moved) = settled((clicks, keys), self.stamp.counted(), self.stamp.window_moved()) {
-            return Some(moved);
-        }
-        eprintln!("[hvtt] paste gate: {why}, same window and box - sending where the caret is");
-        None
+        eprintln!("[hvtt] paste gate: {why}, same window and box - forgiven if nothing moves now");
+        // Asking UI Automation (and the log line) take a moment, in which he could have clicked or
+        // switched away. Everything read before is read again, last, and must not have changed.
+        // (Codex's third and fourth reviews, 2026-09-29.)
+        settled((clicks, keys), self.stamp.counted(), self.stamp.window_moved())
     }
 }
 
@@ -533,15 +530,34 @@ impl Destination for PasteDestination {
     }
 
     fn deliver(&self, text: &str) -> Result<(), DeliveryError> {
-        // Checked again last thing: transcription took time in which he could have clicked away.
+        // Transcription took time in which he could have clicked away: refuse before touching his
+        // clipboard at all.
         if self.gone().is_some() {
             return Err(DeliveryError::DestinationLost);
         }
-        if self.borrow {
-            paste_borrowing_clipboard(text)
-        } else {
-            press_paste()
+        // Anything that can wait - borrowing the clipboard waits on whichever program holds it -
+        // happens before the last check, so nothing stands between that check and the keystroke.
+        // (Codex's fourth review, 2026-09-29.)
+        let borrowed = match self.borrow {
+            true => Some(
+                crate::clip::huck::borrow_general(text)
+                    .map_err(|why| DeliveryError::Other(format!("his clipboard was left alone: {why}")))?,
+            ),
+            false => None,
+        };
+        let pressed = match self.gone() {
+            Some(_) => Err(DeliveryError::DestinationLost),
+            None => press_paste(),
+        };
+        if let Some(borrowed) = borrowed {
+            // The app reads the clipboard when it handles the keystroke, a moment later.
+            let wait = if pressed.is_ok() { Duration::from_millis(500) } else { Duration::ZERO };
+            std::thread::spawn(move || {
+                std::thread::sleep(wait);
+                let _ = borrowed.give_back();
+            });
         }
+        pressed
     }
 }
 
