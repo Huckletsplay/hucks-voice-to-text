@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_GETTEXT, WM_GETTEXTLENGTH,
 };
 
-use super::windows_paste::{class_of, FocusStamp, PasteDestination};
+use super::windows_paste::{class_of, FocusStamp, PasteDestination, SameWindow};
 
 const EM_REPLACESEL: u32 = 0x00C2;
 /// A hung target must never hang delivery; the words are on the clipboard already.
@@ -109,6 +109,25 @@ pub fn capture(stamp: &FocusStamp) -> Result<UiaElement, String> {
     Ok(UiaElement { element })
 }
 
+/// The field from the keypress, held so a paste can ask whether it has keyboard focus again.
+pub struct SameElement(IUIAutomationElement);
+
+// Free-threaded, as `UiaElement`.
+unsafe impl Send for SameElement {}
+unsafe impl Sync for SameElement {}
+
+impl SameElement {
+    /// Whether UI Automation's focused element is this very field. Anything it cannot answer is
+    /// "no": the paste is refused and the words wait on the clipboard.
+    pub fn is_focused(&self) -> bool {
+        let Ok(uia) = automation() else { return false };
+        unsafe {
+            let Ok(now) = uia.GetFocusedElement() else { return false };
+            uia.CompareElements(&self.0, &now).map(|same| same.as_bool()).unwrap_or(false)
+        }
+    }
+}
+
 /// Turn a captured element into a destination.
 pub fn validate_captured(captured: UiaElement, app: String) -> Result<UiaDestination, String> {
     let element = captured.element;
@@ -158,9 +177,11 @@ unsafe impl Send for UiaDestination {}
 unsafe impl Sync for UiaDestination {}
 
 impl UiaDestination {
-    /// The last rung, for fields that accept neither silent write.
+    /// The last rung, for fields that accept neither silent write. A click or key press in the
+    /// same window is forgiven only while this very field is focused again.
     pub fn with_paste_fallback(mut self, paste: Option<PasteDestination>) -> Self {
-        self.paste = paste;
+        let field = SameElement(self.element.clone());
+        self.paste = paste.map(|p| p.forgiving(SameWindow::SameBox(field)));
         self
     }
 

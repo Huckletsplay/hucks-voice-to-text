@@ -1282,8 +1282,15 @@ fn resolve_pin_windows(
 
     // Desktop apps built on Chromium (VS Code, Slack, Discord, the Claude and ChatGPT apps) are
     // never asked: asking flips VS Code into screen-reader mode. Gated, like every paste.
+    // Chrome itself was handled above: its address bar shares the page's control, so a click
+    // there is not forgiven. An Electron app has no address bar - the Mac's rule for VS Code.
     if stamp.is_chromium_window() || is_unsupported_executable(&exe).is_some() {
-        set(Box::new(paste()));
+        let rule = if stamp.is_chromium_window() {
+            crate::destination::windows_paste::SameWindow::Caret
+        } else {
+            crate::destination::windows_paste::SameWindow::Strict
+        };
+        set(Box::new(paste().forgiving(rule)));
         return;
     }
 

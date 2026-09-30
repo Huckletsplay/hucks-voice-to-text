@@ -4,8 +4,9 @@
 //!
 //! A paste lands in *whatever is focused*, so it is gated: **the same foreground window and the
 //! same focused control as at the keypress**. If either changed it refuses, and the words wait on
-//! the clipboard. Clicks and key presses are counted too; since 2026-09-29 they no longer refuse
-//! on their own inside that window and control (`PasteDestination::gone`), as on the Mac.
+//! the clipboard. Clicks and key presses are counted too; since 2026-09-29 they are forgiven inside
+//! that window and control where something can say where the caret went (`SameWindow`), as on
+//! the Mac: always in Electron apps, and in a native app only when UI Automation sees the same box.
 //!
 //! Windows keeps no system-wide input counters the way macOS does, so clicks and key presses are
 //! counted by low-level input hooks - **only while a dictation is in flight**. The hooks are
@@ -411,44 +412,99 @@ pub struct PasteDestination {
     label: String,
     /// Huck's own clipboard is chosen, so the normal one does not hold the words yet.
     borrow: bool,
+    /// What a click or key press inside the same window may be forgiven by.
+    rule: SameWindow,
+}
+
+/// After a click or key press inside the same window and focused control, may the paste still go?
+pub enum SameWindow {
+    /// No: nothing can tell which box the caret is in now. The words wait on the clipboard.
+    Strict,
+    /// Yes, where the caret is: an Electron app (VS Code, Slack) draws every box into one control
+    /// and names none of them - the Mac's rule for VS Code.
+    Caret,
+    /// Only if UI Automation's focused element is still the box from the keypress.
+    SameBox(super::windows_uia::SameElement),
+}
+
+/// Where the caret is after he clicked or typed inside the same window and control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Unknown,
+    Caret,
+    SameBox,
+    AnotherBox,
 }
 
 impl PasteDestination {
     pub fn new(stamp: FocusStamp, label: String, borrow: bool) -> Self {
-        PasteDestination { stamp, label, borrow }
+        PasteDestination { stamp, label, borrow, rule: SameWindow::Strict }
+    }
+
+    /// Forgive clicks and typing inside the same window by this rule (see `gone`).
+    pub fn forgiving(mut self, rule: SameWindow) -> Self {
+        self.rule = rule;
+        self
+    }
+
+    fn place(&self) -> Place {
+        match &self.rule {
+            SameWindow::Strict => Place::Unknown,
+            SameWindow::Caret => Place::Caret,
+            SameWindow::SameBox(field) if field.is_focused() => Place::SameBox,
+            SameWindow::SameBox(_) => Place::AnotherBox,
+        }
     }
 
     /// Why a paste would not land in his box, or `None` when it would.
     ///
     /// Clicks or typing since the keypress may have moved the caret to another box. Decided with
     /// him 2026-09-29, the twin of `macos_paste`'s rule: he clicks away and back into his box
-    /// before sending, and expects it to arrive. So within the same window and focused control:
-    /// - a native app's text box is its own control, so the paste goes only if it is the very box
-    ///   from the keypress (`focus-changed` otherwise);
-    /// - Chromium and Electron (VS Code, Slack, Chrome) draw every box into one control, which
-    ///   names none of them, so the paste goes where the caret now is. If he left it in another
-    ///   box of that window, the words land there: inserted, never sent, and still on the
-    ///   clipboard.
-    ///
-    /// Another window or control, or the stop press not seen, still refuses.
+    /// before sending, and expects it to arrive. Within the same window and focused control, that
+    /// is forgiven only where something can say where the caret went (`SameWindow`). Another
+    /// window or control, an unreadable focus, or the stop press not seen, still refuses.
     fn gone(&self) -> Option<&'static str> {
-        let why = self.stamp.moved()?;
-        if !same_window_allows(why) {
+        if let Some(why) = self.stamp.window_moved() {
             return Some(why);
         }
-        // `moved` answers a key held at the start before it looks at the window.
-        if let Some(moved) = self.stamp.window_moved() {
-            return Some(moved);
+        let (clicks, keys) = self.stamp.counted();
+        let expected = super::box_input::expected(false);
+        let strict =
+            if self.stamp.held_other { Some("key-held-at-start") } else { input_moved(clicks, keys, expected) };
+        let verdict = after_moving(strict, keys >= expected.1, self.stamp.focus != 0, || self.place());
+        if let (Some(why), None) = (strict, verdict) {
+            eprintln!("[hvtt] paste gate: {why}, same window and box - sending where the caret is");
         }
-        eprintln!("[hvtt] paste gate: {why}, same window and control - sending where the caret is");
-        None
+        verdict
     }
 }
 
-/// What he may have done since the keypress, inside the same window and control, without the
-/// paste being refused.
-fn same_window_allows(why: &str) -> bool {
-    matches!(why, "clicked" | "typed" | "key-held-at-start")
+/// The same-window rule, apart from the system calls. `strict` is the old verdict (anything at
+/// all refuses); `stop_seen` is the key count reaching the stop press, which proves the count ran;
+/// `place` is asked only when it matters. (Codex's review, 2026-09-29: a click used to hide a
+/// missing stop press, and a same `hwndFocus` was taken to mean the same box.)
+///
+/// The forgiving places do not rest on the counts: `Caret` pastes where the caret is whatever he
+/// did, and `SameBox` asks UI Automation directly. The counts decide only `Strict`, as before, and
+/// `stop_seen` is a check that they were running at all - not proof of which key was pressed.
+fn after_moving(
+    strict: Option<&'static str>,
+    stop_seen: bool,
+    focus_known: bool,
+    place: impl FnOnce() -> Place,
+) -> Option<&'static str> {
+    let why = strict?;
+    if !stop_seen {
+        return Some("stop-not-seen");
+    }
+    if !focus_known {
+        return Some(why);
+    }
+    match place() {
+        Place::Caret | Place::SameBox => None,
+        Place::AnotherBox => Some("another-box"),
+        Place::Unknown => Some(why),
+    }
 }
 
 impl Destination for PasteDestination {
@@ -508,13 +564,29 @@ mod tests {
 
     #[test]
     fn clicking_away_and_back_in_the_same_window_still_sends() {
-        // Decided with him 2026-09-29: the same rule as the Mac.
+        // Decided with him 2026-09-29: the Mac's rule, where something can say where the caret is.
+        let never = || -> Place { panic!("not asked when nothing moved") };
+        assert_eq!(after_moving(None, true, true, never), None, "nothing moved");
+        assert_eq!(after_moving(Some("clicked"), true, true, || Place::Caret), None, "VS Code");
+        assert_eq!(after_moving(Some("typed"), true, true, || Place::SameBox), None, "back in his box");
+        assert_eq!(after_moving(Some("key-held-at-start"), true, true, || Place::SameBox), None);
+        assert_eq!(after_moving(Some("clicked"), true, true, || Place::AnotherBox), Some("another-box"));
+        assert_eq!(after_moving(Some("clicked"), true, true, || Place::Unknown), Some("clicked"), "Chrome, strict");
+    }
+
+    #[test]
+    fn a_click_never_hides_a_missing_stop_press() {
+        // Codex's review, 2026-09-29.
         for why in ["clicked", "typed", "key-held-at-start"] {
-            assert!(same_window_allows(why), "{why} in the same window and control");
+            assert_eq!(after_moving(Some(why), false, true, || Place::Caret), Some("stop-not-seen"), "{why}");
         }
-        for why in ["window-changed", "focus-changed", "no-front-window", "stop-not-seen"] {
-            assert!(!same_window_allows(why), "{why} still refuses");
-        }
+        assert_eq!(after_moving(Some("stop-not-seen"), false, true, || Place::Caret), Some("stop-not-seen"));
+    }
+
+    #[test]
+    fn an_unreadable_focus_forgives_nothing() {
+        assert_eq!(after_moving(Some("clicked"), true, false, || Place::Caret), Some("clicked"));
+        assert_eq!(after_moving(Some("typed"), true, false, || Place::SameBox), Some("typed"));
     }
 
     #[test]
