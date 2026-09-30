@@ -615,6 +615,22 @@ fn open_update(app: AppHandle) {
         std::thread::spawn(move || {
             // Long enough to read before this copy steps aside.
             std::thread::sleep(std::time::Duration::from_millis(1200));
+            // Never step aside mid-dictation: a dictation started meanwhile finishes, and its
+            // words are drafted, copied and delivered, before this copy quits for the installer.
+            // A paste on Huck's clipboard gives his own clipboard back half a second later, so
+            // after a dictation this waits a second more - and looks again.
+            let dictating = |app: &AppHandle| {
+                matches!(
+                    *app.state::<App>().session.lock(),
+                    SessionState::Recording | SessionState::Paused | SessionState::Transcribing
+                )
+            };
+            while dictating(&app) {
+                while dictating(&app) {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
             // The installer must not find this copy still "running" while it quits.
             win_surface::release_single_instance();
             match std::process::Command::new(&installer).args(["/VERYSILENT", "/CLOSEAPPLICATIONS"]).spawn() {
