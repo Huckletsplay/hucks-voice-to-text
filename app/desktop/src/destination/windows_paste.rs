@@ -6,7 +6,8 @@
 //! same focused control as at the keypress**. If either changed it refuses, and the words wait on
 //! the clipboard. Clicks and key presses are counted too; since 2026-09-29 they are forgiven inside
 //! that window and control where something can say where the caret went (`SameWindow`), as on
-//! the Mac: always in Electron apps, and in a native app only when UI Automation sees the same box.
+//! the Mac: always in Chrome and Electron apps, and in a native app only when UI Automation sees
+//! the same box.
 //!
 //! Windows keeps no system-wide input counters the way macOS does, so clicks and key presses are
 //! counted by low-level input hooks - **only while a dictation is in flight**. The hooks are
@@ -420,8 +421,9 @@ pub struct PasteDestination {
 pub enum SameWindow {
     /// No: nothing can tell which box the caret is in now. The words wait on the clipboard.
     Strict,
-    /// Yes, where the caret is: an Electron app (VS Code, Slack) draws every box into one control
-    /// and names none of them - the Mac's rule for VS Code.
+    /// Yes, where the caret is: Chrome and Electron apps (VS Code, Slack) draw every box into one
+    /// control and name none of them - the Mac's rule for VS Code. In Chrome that includes the
+    /// address bar (decided with him 2026-09-29): typed there, never sent, still on the clipboard.
     Caret,
     /// Only if UI Automation's focused element is still the box from the keypress.
     SameBox(super::windows_uia::SameElement),
@@ -571,7 +573,7 @@ mod tests {
         assert_eq!(after_moving(Some("typed"), true, true, || Place::SameBox), None, "back in his box");
         assert_eq!(after_moving(Some("key-held-at-start"), true, true, || Place::SameBox), None);
         assert_eq!(after_moving(Some("clicked"), true, true, || Place::AnotherBox), Some("another-box"));
-        assert_eq!(after_moving(Some("clicked"), true, true, || Place::Unknown), Some("clicked"), "Chrome, strict");
+        assert_eq!(after_moving(Some("clicked"), true, true, || Place::Unknown), Some("clicked"), "no rule: strict");
     }
 
     #[test]

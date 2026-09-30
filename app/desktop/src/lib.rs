@@ -1269,10 +1269,12 @@ fn resolve_pin_windows(
 
     // The extension is the only silent way into Chrome. Without it, a paste, gated.
     // Any text box is a destination, password boxes included (decided with him 2026-09-28).
+    // After a click in the same window the paste goes where the caret is, the address bar
+    // included (decided with him 2026-09-29): typed there, never sent, and still on the clipboard.
     if is_chromium_executable(&exe) {
         match browser {
             Some(Ok(d)) => set(Box::new(d)),
-            _ => set(Box::new(paste())),
+            _ => set(Box::new(paste().forgiving(crate::destination::windows_paste::SameWindow::Caret))),
         }
         return;
     } else if let Some(Ok(_)) = browser {
@@ -1282,8 +1284,8 @@ fn resolve_pin_windows(
 
     // Desktop apps built on Chromium (VS Code, Slack, Discord, the Claude and ChatGPT apps) are
     // never asked: asking flips VS Code into screen-reader mode. Gated, like every paste.
-    // Chrome itself was handled above: its address bar shares the page's control, so a click
-    // there is not forgiven. An Electron app has no address bar - the Mac's rule for VS Code.
+    // Every Chromium window gets the Mac's rule for VS Code: after a click in the same window the
+    // paste goes where the caret is - an address bar included, as in Chrome above.
     if stamp.is_chromium_window() || is_unsupported_executable(&exe).is_some() {
         let rule = if stamp.is_chromium_window() {
             crate::destination::windows_paste::SameWindow::Caret
