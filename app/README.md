@@ -3,8 +3,10 @@
 Local, offline dictation. Press a shortcut, speak, press it again — the words go into the text box
 you started in, and they are never lost.
 
-Everything runs on the machine. There is no account and no telemetry, and the only network
-connection is **Check for Updates**, made to GitHub when the user chooses it.
+Everything runs on the machine. There is no account and no telemetry. It goes online only for
+**Check for Updates** (GitHub - chosen from the menu, or once each time it opens unless Settings ›
+Check for Updates When It Opens is unticked), and a speech model chosen from Settings › Speech
+Model that is not on the computer yet (downloaded once from the whisper.cpp project's files).
 
 **Status:** public unsigned beta for macOS on Apple silicon and for Windows 10/11 (x64, AVX2).
 Releases: https://github.com/Huckletsplay/hucks-voice-to-text/releases
@@ -21,7 +23,7 @@ Releases: https://github.com/Huckletsplay/hucks-voice-to-text/releases
 ## Getting started
 
 ```sh
-scripts/fetch-model.sh base.en   # ~141 MB, into the app-data directory
+scripts/fetch-model.sh           # "Best" (~574 MB) and the voice detector, into the app-data directory
 scripts/install.sh               # build, sign locally, install to ~/Applications, launch
 ```
 
@@ -43,13 +45,14 @@ scripts/dev.sh build
 scripts/dev.sh run
 scripts/dev.sh test                 # the whole suite
 scripts/dev.sh test -- --ignored    # also the two tests that use the real clipboard
+scripts/dev.sh bench <corpus> <model.bin> clean:sinc:engine   # accuracy on quick phrases
 scripts/release.sh --unsigned-beta  # the public DMG and its checksum, in ../artifacts/macos/release
 ```
 
 On **Windows** the same steps are PowerShell scripts:
 
 ```powershell
-scripts\fetch-model.ps1             # ~141 MB, into %LOCALAPPDATA%\Huck's Voice to Text\models
+scripts\fetch-model.ps1             # "Best" (~574 MB) and the voice detector, into %LOCALAPPDATA%\Huck's Voice to Text\models
 scripts\install.ps1                 # release build, installed to %LOCALAPPDATA%\Programs\HucksVoiceToText
 scripts\dev.ps1 build | run | test  # development; `dev.ps1 test --ignored` adds the on-purpose tests
 ```
@@ -60,9 +63,18 @@ machine's processor, so they are for that machine only; `scripts\release.ps1 -Un
 the public installer instead - AVX2 baseline, static C runtime, build paths removed and checked.
 No permission step exists on Windows.
 
-The release DMG carries the speech model inside the app (`Contents/Resources/models/`); a model in
-Application Support is preferred when present. Its file names are the contract with the in-app
+The release DMG carries the speech model inside the app (`Contents/Resources/models/`), with
+whisper.cpp's Silero voice detector (`ggml-silero-v5.1.2.bin`, `hvtt_core::models::VOICE_DETECTOR`)
+beside it - it tells quiet speech from noise and finds where speech ends; without it, loudness
+alone decides. A model in Application Support is preferred when present. Its file names are the contract with the in-app
 updater in `desktop/src/update.rs`.
+
+**Measuring accuracy.** `python3 scripts/make-accuracy-corpus.py <dir>` (macOS: `say`, `ffmpeg`, numpy)
+writes 164 quick phrases in twelve voices at fast speaking rates, trimmed tight as a quick
+dictation is; `--long` writes 40 stretches of 4-12 s. `scripts/dev.sh bench <dir> <model.bin>
+<case>...` runs them through Whisper and prints the share of words wrong and the time taken;
+`desktop/examples/accuracy.rs` lists the cases (added noise, a missing start, the old resampling
+and window, and `engine` - exactly what the program does).
 
 ## Using it
 
@@ -74,6 +86,8 @@ updater in `desktop/src/update.rs`.
 | Choose the clipboard | H › Settings › Clipboard: *Normal Clipboard — ⌘V* (default) or *Huck's Clipboard — Ctrl + Option + V* (Windows: Ctrl+V, or Ctrl + Alt + Shift + V). One or the other, never both |
 | Change a shortcut | H › Settings › Shortcuts, pick one, press the new keys (Esc cancels) |
 | Recovery drafts | H › Settings › Keep Recovery Drafts, and Open Drafts Folder |
+| Recordings | None: a dictation's sound is held in memory until it is recognised, never written to disk. (The last five were kept from 2026-10-01 to 10-03; when it opens, the program deletes the recording files it made there - only those, by their exact names - and the app-data `recordings/` folder once it is empty.) |
+| Speech model | H › Settings › Speech Model, six choices, each line showing accuracy and speed (dots out of five) and its size: *Tiny* (tiny.en), *Quick* (base.en), *Better* (small.en), *Medium* (medium.en, 5-bit), *Best* (large-v3-turbo, 5-bit), *Large* (large-v3, 5-bit) - *Best* built in on both platforms (Windows until tested there). One not on the computer is downloaded once - the whisper.cpp project's files, pinned to one commit - and kept only if its size and SHA-256 are the ones in `core/src/models.rs` |
 | Update | H › Settings › Check for Updates… — downloads this platform's newer release from GitHub (the DMG, or the Windows installer), checks its size and SHA-256, then offers to open it; on Windows the installer runs silently and starts the new copy |
 | Close the floating box | It leaves by itself; the × or `Esc` closes it early |
 
@@ -162,7 +176,7 @@ Never inside this repository:
 | `thiserror` | MIT / Apache-2.0 | Error types |
 
 Whisper model weights are MIT, converted by the whisper.cpp project; the release DMG and the
-Windows installer include `ggml-base.en.bin`. Updates are fetched with the system's own `curl` and checked with `shasum`
+Windows installer include `ggml-large-v3-turbo-q5_0.bin`. Updates are fetched with the system's own `curl` and checked with `shasum`
 (Windows: `curl.exe` and `certutil`), so there is no HTTP or crypto crate. No code was copied from any third-party application.
 
 ## Licence

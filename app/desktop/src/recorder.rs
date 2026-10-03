@@ -14,6 +14,8 @@ struct Buffer {
     peak: f32,
     /// Paused by him: whatever the device still delivers is thrown away, never kept.
     paused: bool,
+    /// When the device delivered its first sound: everything said before it is lost.
+    first_sound: Option<std::time::Instant>,
 }
 
 pub struct Recording {
@@ -24,11 +26,25 @@ pub struct Recording {
     device_name: String,
 }
 
-impl Recording {
-    /// Open the default input device and start capturing immediately.
-    ///
-    /// The hotkey budget is 150 ms, so nothing slow belongs on this path.
-    pub fn start(preferred_device: Option<&str>) -> Result<Self, String> {
+/// A microphone stream built but not started - the slow part of opening the microphone, done
+/// before the keypress so the press only has to start it (`Prepared::start`). Nothing is captured
+/// until then. The start of a quick dictation is where words were lost: missing the first 0.12 s
+/// took base.en from 6% to 23% of words wrong, and opening the microphone took about 0.17 s
+/// (Codex's sixth to eighth reviews ranked this first; an experiment from 2026-10-02, checked by
+/// hand with him: the macOS microphone dot, AirPods).
+pub struct Prepared {
+    stream: cpal::Stream,
+    buffer: Arc<Mutex<Buffer>>,
+    sample_rate: u32,
+    channels: u16,
+    device_name: String,
+    /// Cleared by the device reporting an error (unplugged, say): then it is not used.
+    healthy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Prepared {
+    /// Build the stream for the default (or preferred) input device, without starting it.
+    pub fn new(preferred_device: Option<&str>) -> Result<Self, String> {
         let host = cpal::default_host();
 
         let device = match preferred_device {
@@ -54,10 +70,13 @@ impl Recording {
         let stream_config: cpal::StreamConfig = config.into();
         let buffer = Arc::new(Mutex::new(Buffer::default()));
 
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let err_buf = buffer.clone();
+        let err_health = healthy.clone();
         let err_fn = move |e| {
             // A device error must not lose what was already captured.
             eprintln!("[hvtt] audio stream error: {e}");
+            err_health.store(false, std::sync::atomic::Ordering::SeqCst);
             let _ = &err_buf;
         };
 
@@ -94,15 +113,47 @@ impl Recording {
         }
         .map_err(|e| format!("could not open the microphone: {e}"))?;
 
+        Ok(Prepared { stream, buffer, sample_rate, channels, device_name, healthy })
+    }
+
+    /// Still the device a dictation would use now, and no error from it since it was built.
+    pub fn still_current(&self, preferred_device: Option<&str>) -> bool {
+        if !self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        match preferred_device {
+            Some(want) => self.device_name == want,
+            None => cpal::default_host()
+                .default_input_device()
+                .and_then(|d| device_name_of(&d))
+                .is_some_and(|name| name == self.device_name),
+        }
+    }
+
+    /// Start capturing.
+    pub fn start(self) -> Result<Recording, String> {
+        let Prepared { stream, buffer, sample_rate, channels, device_name, .. } = self;
         stream
             .play()
             .map_err(|e| format!("could not start the microphone: {e}"))?;
-
         Ok(Recording { stream, buffer, sample_rate, channels, device_name })
+    }
+}
+
+impl Recording {
+    /// Open the default (or preferred) input device and start capturing at once: built and
+    /// started in one go - what a prepared stream saves the keypress from.
+    pub fn start(preferred_device: Option<&str>) -> Result<Self, String> {
+        Prepared::new(preferred_device)?.start()
     }
 
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// When the first sound arrived from the device, if any has yet.
+    pub fn first_sound(&self) -> Option<std::time::Instant> {
+        self.buffer.lock().first_sound
     }
 
     /// Peak level since the last call, 0.0..=1.0. Drives the listening animation.
@@ -134,6 +185,13 @@ impl Recording {
         hvtt_core::audio::condition(&raw, self.channels, self.sample_rate)
     }
 
+    /// How much has been recorded so far, in 16 kHz samples.
+    pub fn recorded_len(&self) -> usize {
+        let raw = self.buffer.lock().samples.len() as u64;
+        let frames = raw / self.channels.max(1) as u64;
+        (frames * hvtt_core::audio::WHISPER_SAMPLE_RATE as u64 / self.sample_rate.max(1) as u64) as usize
+    }
+
     /// Where a position in 16 kHz samples falls in the device's own interleaved samples.
     fn raw_index(&self, start: usize) -> usize {
         let rate = hvtt_core::audio::WHISPER_SAMPLE_RATE as u64;
@@ -148,8 +206,7 @@ impl Recording {
         // Dropping the stream stops it; do it explicitly so intent is visible.
         drop(self.stream);
         let raw = std::mem::take(&mut self.buffer.lock().samples);
-        let rest = raw.get(first..).unwrap_or_default();
-        hvtt_core::audio::condition(rest, self.channels, self.sample_rate)
+        hvtt_core::audio::condition(raw.get(first..).unwrap_or_default(), self.channels, self.sample_rate)
     }
 }
 
@@ -158,6 +215,9 @@ fn append(buffer: &Arc<Mutex<Buffer>>, data: &[f32]) {
     let mut b = buffer.lock();
     if b.paused {
         return;
+    }
+    if b.first_sound.is_none() && !data.is_empty() {
+        b.first_sound = Some(std::time::Instant::now());
     }
     b.samples.extend_from_slice(data);
     if peak > b.peak {

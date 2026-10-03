@@ -41,6 +41,11 @@ Windows 10 22H2; other versions have not yet been tested. Intel Macs are not sup
   menu bar or notification area.
 - **Keep it private.** Recognition runs entirely on your computer with
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Audio and text never leave it.
+- **Accurate first, faster if you like.** The most accurate speech model, *Best*, is built in.
+  H › Settings › Speech Model lists five more - *Tiny*, *Quick*, *Better*, *Medium*, *Large* - each
+  rated for accuracy and speed, downloaded once when you choose it. A speed check when the program
+  first opens sets it up for your computer, and offers a faster model if *Best* is slow there
+  (**Settings > Check This Computer's Speed** runs it again).
 - **Keep your clipboard yours.** Choose the normal clipboard, or Huck's Clipboard, which leaves
   whatever you copied alone and pastes dictation with its own shortcut.
 - **Stay safe.** It never writes into a text box that has closed or been replaced, and never
@@ -117,10 +122,15 @@ source (`app/extension/`) but is not yet published in the Chrome Web Store.
 Huck's Voice to Text does not require an account, upload audio or text, or collect analytics.
 Speech is recognized on your computer, and recovery copies of your dictations stay in
 `~/Library/Application Support/com.huck.voice-to-text/drafts/` on a Mac and
-`%LOCALAPPDATA%\Huck's Voice to Text\drafts` on Windows. The words Learning remembers are kept
-only in the program's settings file, next to that drafts folder. It contacts GitHub only when you
-explicitly choose **Check for Updates**. To report a security issue privately, see
-[SECURITY.md](SECURITY.md).
+`%LOCALAPPDATA%\Huck's Voice to Text\drafts` on Windows. The sound of your dictations is never
+saved: it is held in memory only until it is recognized. The words Learning remembers are kept
+only in the program's settings file, next to that drafts folder. It goes online for two things:
+**updates** - each time it opens it asks GitHub, quietly, whether a newer version exists, and if
+so downloads it and offers it (untick **Settings > Check for Updates When It Opens** to stop
+that; **Check for Updates** asks any time) - and choosing a speech model that is not on your
+computer yet downloads it once from the whisper.cpp project's files on Hugging Face, checked
+against its published SHA-256. Neither sends anything of yours. To report a security issue
+privately, see [SECURITY.md](SECURITY.md).
 
 ## Verify a download
 
@@ -175,7 +185,7 @@ Requirements:
 From the repository root:
 
 ```bash
-app/scripts/fetch-model.sh base.en   # the speech model, ~141 MB, into Application Support
+app/scripts/fetch-model.sh           # the speech model (~574 MB) and voice detector, into Application Support
 app/scripts/dev.sh test
 app/scripts/install.sh               # build, sign, install to ~/Applications, and open
 ```
@@ -206,7 +216,7 @@ Requirements:
 From the repository root, in PowerShell:
 
 ```powershell
-app\scripts\fetch-model.ps1          # the speech model, ~141 MB, into %LOCALAPPDATA%
+app\scripts\fetch-model.ps1          # the speech model (~574 MB) and voice detector, into %LOCALAPPDATA%
 app\scripts\dev.ps1 test
 app\scripts\install.ps1              # build and install for this PC, and start it
 app\scripts\release.ps1 -UnsignedBeta  # the public installer and its checksum

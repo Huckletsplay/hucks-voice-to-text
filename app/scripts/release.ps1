@@ -44,9 +44,15 @@ $conf = Get-Content -LiteralPath (Join-Path $appDir 'desktop\tauri.conf.json') -
 $version = $conf.version
 $name = "HucksVoiceToText-$version-windows-x64-setup"
 $model = if ($env:HVTT_RELEASE_MODEL) { $env:HVTT_RELEASE_MODEL } else {
-    Join-Path $env:LOCALAPPDATA "Huck's Voice to Text\models\ggml-base.en.bin"
+    # "Best" is built in on Windows too, until he has tried it on the PC (hvtt_core::models, 2026-10-02).
+    Join-Path $env:LOCALAPPDATA "Huck's Voice to Text\models\ggml-large-v3-turbo-q5_0.bin"
 }
 if (-not (Test-Path -LiteralPath $model)) { throw "No speech model at $model - run app\scripts\fetch-model.ps1" }
+# The published file, under the name startup asks for (hvtt_core::models).
+if ((Split-Path -Leaf $model) -ne 'ggml-large-v3-turbo-q5_0.bin') { throw "The speech model must be named ggml-large-v3-turbo-q5_0.bin." }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $model).Hash.ToLower() -ne '394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2') {
+    throw "The speech model at $model is not the published file."
+}
 $license = Join-Path $projectRoot 'LICENSE'
 $icon = Join-Path $appDir 'desktop\icons\icon.ico'
 $out = Join-Path $projectRoot 'artifacts\windows\release'

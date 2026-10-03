@@ -29,7 +29,7 @@ if (-not $NoBuild) {
 }
 if (-not (Test-Path -LiteralPath $built)) { throw "No release build at $built - run without -NoBuild." }
 
-$model = Join-Path $env:LOCALAPPDATA "$name\models\ggml-base.en.bin"
+$model = Join-Path $env:LOCALAPPDATA "$name\models\ggml-large-v3-turbo-q5_0.bin"
 if (-not (Test-Path -LiteralPath $model)) {
     Write-Warning "No speech model yet - run app\scripts\fetch-model.ps1 before dictating."
 }

@@ -15,7 +15,7 @@
 #          xcode-select --install
 #      Until that is done, pointing the compiler at the SDK's headers is enough.
 #
-# Usage: scripts/dev.sh [build|build-release|run|test]   (default: run)
+# Usage: scripts/dev.sh [build|build-release|run|test|bench]   (default: run)
 
 set -euo pipefail
 
@@ -59,5 +59,7 @@ case "${1:-run}" in
   test)   shift; cargo test --workspace "$@" ;;
   bundle) echo "Use scripts/install.sh - it assembles and signs the .app without the Tauri CLI." >&2; exit 2 ;;
   run)    cargo run -p hvtt-desktop ;;
-  *)      echo "usage: scripts/dev.sh [build|build-release|run|test]" >&2; exit 2 ;;
+  # How well quick dictations are recognised: desktop/examples/accuracy.rs explains the cases.
+  bench)  shift; cargo run --release -p hvtt-desktop --example accuracy -- "$@" ;;
+  *)      echo "usage: scripts/dev.sh [build|build-release|run|test|bench]" >&2; exit 2 ;;
 esac

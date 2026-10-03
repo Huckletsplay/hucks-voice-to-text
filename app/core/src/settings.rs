@@ -23,6 +23,11 @@ pub struct Settings {
     pub input_device: Option<String>,
     /// Keep recovery drafts on disk. Dictated speech is sensitive; this can be turned off.
     pub keep_drafts: bool,
+    /// No longer used: the last five recordings were kept from 2026-10-01 until his decision of
+    /// 2026-10-03, "we don't need them at all". Still read, so an older settings file loads
+    /// (unknown names are refused), and never written again.
+    #[serde(skip_serializing)]
+    pub keep_recordings: bool,
     /// Words the recogniser habitually gets wrong. Cheap accuracy win, near-zero cost.
     pub vocabulary: Vec<String>,
     /// Which clipboard dictations go to: the normal one or Huck's own. One or the other.
@@ -37,6 +42,18 @@ pub struct Settings {
     pub fixes: Vec<crate::learning::Fix>,
     /// How hard the box works to show the words while he talks.
     pub live_words: LiveWords,
+    /// H › Settings › When I Stop Talking: wait the full moment after every stop, so even a last
+    /// word fainter than the microphone's own hiss is kept (Codex's eleventh review), instead of
+    /// finishing as soon as he is back down to the room. His choice, 2026-10-02: an option, off by
+    /// default.
+    pub careful_stop: bool,
+    /// H › Settings › Check for Updates When It Opens: ask GitHub once, quietly, each time the
+    /// program starts, and say something only if there is a newer version. His decision,
+    /// 2026-10-02 - on by default; off, the network is used only when he asks.
+    pub check_updates_on_start: bool,
+    /// The program version and model the speed check last ran for ("0.1.7 ggml-...bin"): it runs
+    /// again when either changes.
+    pub speed_checked: String,
 }
 
 /// H › Settings › Live Words: how much of the processor showing the words while he talks may
@@ -142,15 +159,20 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             shortcut: DEFAULT_SHORTCUT.to_string(),
-            model: "ggml-base.en.bin".to_string(),
+            // The model inside the program: "Best" (Windows too, until he has tried it there).
+            model: "ggml-large-v3-turbo-q5_0.bin".to_string(),
             input_device: None,
             keep_drafts: true,
+            keep_recordings: false,
             vocabulary: Vec::new(),
             clipboard: ClipboardChoice::System,
             paste_shortcut: DEFAULT_PASTE_SHORTCUT.to_string(),
             learning: true,
             fixes: Vec::new(),
             live_words: LiveWords::AsYouTalk,
+            careful_stop: false,
+            check_updates_on_start: true,
+            speed_checked: String::new(),
         }
     }
 }
@@ -270,6 +292,18 @@ mod tests {
         assert_eq!(s.clipboard, ClipboardChoice::System);
         assert_eq!(Settings::default().clipboard, ClipboardChoice::System);
         fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn a_settings_file_from_when_recordings_were_kept_still_loads_and_drops_the_setting() {
+        // Unknown names are refused, so the retired switch must still be read - or his settings
+        // would all fall back to defaults.
+        let p = temp_path("recordings");
+        fs::write(&p, r#"{"model":"ggml-small.en.bin","keep_recordings":true}"#).unwrap();
+        let s = Settings::load_from(&p);
+        assert_eq!(s.model, "ggml-small.en.bin");
+        assert!(!serde_json::to_string(&s).unwrap().contains("keep_recordings"), "never written again");
+        let _ = fs::remove_file(&p);
     }
 
     #[test]

@@ -187,76 +187,146 @@ fn the_real_ax_destination_refuses_when_accessibility_is_not_granted() {
     }
 }
 
-/// Live recognition: the audio is fed in as it would arrive, half a second at a time, cut at the
-/// pauses exactly as the running program cuts it, and each stretch recognised on its own. Every
-/// sentence must survive the cuts - a word lost at a join would be dictation lost.
+/// The model inside the program ("Best") hears a quick phrase - the rest of these tests use base.en
+/// for speed, and a fresh setup now fetches only the default (Codex's thirteenth review).
 #[test]
-fn speech_recognised_a_stretch_at_a_time_keeps_every_sentence() {
+fn the_built_in_model_hears_a_quick_phrase() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(model) = hvtt_core::paths::models_dir()
+        .map(|d| d.join(hvtt_core::models::built_in().file))
+        .filter(|p| p.exists())
+    else {
+        eprintln!("skipping: the built-in model is not downloaded - run scripts/fetch-model.sh");
+        return;
+    };
+    let Some(samples) = speak("Push the fix to GitHub tonight.", "default") else { return };
+    let engine = hvtt_desktop::engine_whisper::WhisperEngine::load(&model).expect("the model loads");
+    let got = engine
+        .transcribe(&hvtt_core::engine::TranscriptionRequest {
+            samples,
+            vocabulary_prompt: None,
+            give_up: None,
+            provisional: false,
+        })
+        .expect("recognition succeeds")
+        .text
+        .to_lowercase();
+    for word in ["push", "fix", "tonight"] {
+        assert!(got.contains(word), "expected {word:?}, got {got:?}");
+    }
+}
+
+/// Live recognition: the audio is fed in as it would arrive, half a second at a time, and each full
+/// window (`WINDOW_SECS`) is recognised for good up to its last whole sentence, exactly as the
+/// running program does; the rest at the stop. Every sentence must come through once - a word lost
+/// or said twice where one window hands over to the next would be dictation lost or garbled.
+#[test]
+fn speech_recognised_a_window_at_a_time_keeps_every_sentence_once() {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(model) = model_path() else {
         eprintln!("skipping: no model");
         return;
     };
     let passage = "The weather was cold this morning. We walked the dog down to the river. \
-                   Later we made pancakes for breakfast. Then everyone went back to sleep.";
-    let Some(samples) = speak(passage, "live") else {
+                   Later we made pancakes for breakfast. Then everyone went back to sleep. \
+                   In the afternoon the neighbours came over with a basket of apples. \
+                   My brother fixed the fence behind the garage while it was still light. \
+                   We talked about the trip to the mountains next summer. \
+                   Nobody could agree on which trail to take, so we flipped a coin. \
+                   After dinner the children played cards in the kitchen. \
+                   The cat slept on the windowsill until the rain started.";
+    let Some(samples) = speak(passage, "window") else {
         eprintln!("skipping: no speech synthesizer");
         return;
     };
+    let window = (hvtt_core::engine::WINDOW_SECS * 16_000.0) as usize;
+    assert!(samples.len() > window, "the passage must outlast one window to test the hand-over");
     let engine = hvtt_desktop::engine_whisper::WhisperEngine::load(&model).expect("the model loads");
-    let recognise = |audio: &[f32]| {
-        if !hvtt_core::audio::has_speech(audio) {
-            return String::new();
-        }
+    let hear = |audio: &[f32], before: &str| {
+        let words: Vec<&str> = before.split_whitespace().collect();
+        let context = words[words.len().saturating_sub(25)..].join(" ");
         engine
             .transcribe(&hvtt_core::engine::TranscriptionRequest {
                 samples: audio.to_vec(),
-                vocabulary_prompt: None,
-            give_up: None,
-            provisional: false,
+                vocabulary_prompt: (!context.is_empty()).then_some(context),
+                give_up: None,
+                provisional: false,
             })
             .expect("recognition succeeds")
-            .text
     };
 
-    let step = hvtt_core::audio::WHISPER_SAMPLE_RATE as usize / 2;
-    let (mut heard, mut text, mut stretches) = (0usize, String::new(), 0);
-    let mut upto = step;
+    // Exactly the program's path: the voice detector, `window_step` while he talks, and
+    // `recognise_all` for the rest at the stop.
+    hvtt_desktop::load_voice_detector();
+    let mut hear = |audio: &[f32], before: &str| -> Result<hvtt_core::engine::TranscriptionResult, ()> {
+        Ok(hear(audio, before))
+    };
+    let (mut heard, mut text, mut windows) = (0usize, String::new(), 0);
+    let mut upto = 8_000;
     while upto < samples.len() {
-        if let Some(cut) = hvtt_core::audio::commit_point(&samples[heard..upto], 3.0, 12.0) {
-            text.push_str(&recognise(&samples[heard..heard + cut]));
-            text.push(' ');
+        if upto - heard >= window {
+            let step = hvtt_core::engine::window_step(&samples[heard..heard + window], &text, &mut hear).unwrap();
+            let hvtt_core::engine::Window::Keep { text: words, upto: cut } = step else {
+                panic!("a clear passage should not be held");
+            };
+            text = format!("{text} {words}").trim().to_string();
             heard += cut;
-            stretches += 1;
+            windows += 1;
         }
-        upto += step;
+        upto += 8_000;
     }
     let started = std::time::Instant::now();
-    text.push_str(&recognise(&samples[heard..]));
-    let last_ms = started.elapsed().as_millis();
+    let (rest, failed) = hvtt_core::engine::recognise_all(&samples[heard..], &text, &mut hear);
+    assert!(failed.is_none(), "recognition succeeds");
+    assert_eq!(rest.unrecognised_secs, 0.0, "nothing left unrecognised");
+    text = format!("{text} {}", rest.text).trim().to_string();
     eprintln!(
-        "{:.1}s of speech in {stretches} finished stretches + the last {:.1}s ({last_ms} ms at the stop): {text:?}",
+        "{:.1}s of speech in {windows} window(s) + the last {:.1}s ({} ms at the stop): {text:?}",
         samples.len() as f32 / 16_000.0,
         (samples.len() - heard) as f32 / 16_000.0,
+        started.elapsed().as_millis(),
     );
 
-    assert!(stretches >= 1, "a passage this long is recognised before the stop, not all at it");
-    // The quick, one-attempt pass shown while he talks still hears the same words.
-    let quick = engine
+    assert!(windows >= 1, "a passage this long is recognised before the stop, not all at it");
+    let got = text.to_lowercase();
+    for word in ["weather", "river", "pancakes", "apples", "fence", "mountains", "coin", "cards", "windowsill"] {
+        assert_eq!(got.matches(word).count(), 1, "{word:?} once, got {got:?}");
+    }
+}
+
+/// Codex's sixth and seventh reviews: quiet speech - a microphone set low - with a fan behind it
+/// was judged silence and never reached Whisper. With the voice detector it is heard.
+#[test]
+fn quiet_speech_under_a_fan_is_still_heard() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(model) = model_path() else { return };
+    let Some(loud) = speak("The quick brown fox jumps over the lazy dog.", "quiet") else { return };
+    if !hvtt_desktop::load_voice_detector_loaded() {
+        eprintln!("skipping: no voice detector file");
+        return;
+    }
+    let level = (loud.iter().map(|s| s * s).sum::<f32>() / loud.len() as f32).sqrt() * 0.01;
+    let quiet: Vec<f32> = loud
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let t = i as f32 / 16_000.0;
+            s * 0.01 + level * 0.5 * (0.6 * (std::f32::consts::TAU * 120.0 * t).sin() + 0.3 * (std::f32::consts::TAU * 240.0 * t).sin())
+        })
+        .collect();
+    assert_ne!(hvtt_core::audio::hear_speech(&quiet), hvtt_core::audio::Heard::Silence);
+    let engine = hvtt_desktop::engine_whisper::WhisperEngine::load(&model).expect("the model loads");
+    let got = engine
         .transcribe(&hvtt_core::engine::TranscriptionRequest {
-            samples: samples[heard..].to_vec(),
+            samples: quiet,
             vocabulary_prompt: None,
             give_up: None,
-            provisional: true,
+            provisional: false,
         })
-        .expect("a provisional pass succeeds")
+        .expect("recognition succeeds")
         .text
         .to_lowercase();
-    assert!(quick.contains("sleep"), "provisional pass heard {quick:?}");
-    let got = text.to_lowercase();
-    for word in ["weather", "cold", "dog", "river", "pancakes", "breakfast", "sleep"] {
-        assert!(got.contains(word), "expected {word:?}, got {got:?}");
-    }
+    assert!(got.contains("fox"), "heard {got:?}");
 }
 
 /// Pausing or sending abandons a live pass part-way, so the final pass never waits behind it.

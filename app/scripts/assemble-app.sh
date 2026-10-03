@@ -52,6 +52,13 @@ if [ -n "${HVTT_BUNDLE_MODEL:-}" ]; then
     mkdir -p "$DEST/Contents/Resources/models"
     cp "$HVTT_BUNDLE_MODEL" "$DEST/Contents/Resources/models/"
 fi
+# The voice detector (hvtt_core::models::VOICE_DETECTOR) goes beside it: without it, loudness
+# alone decides what is speech, and quiet speech over noise can be lost.
+if [ -n "${HVTT_BUNDLE_VAD:-}" ]; then
+    [ -f "$HVTT_BUNDLE_VAD" ] || { echo "No voice detector at $HVTT_BUNDLE_VAD" >&2; exit 1; }
+    mkdir -p "$DEST/Contents/Resources/models"
+    cp "$HVTT_BUNDLE_VAD" "$DEST/Contents/Resources/models/"
+fi
 
 # LSUIElement keeps it out of the Dock and the app switcher. That is the product design — a
 # voice layer, not an application you manage — and it is also what lets the floating box appear

@@ -13,6 +13,7 @@ pub mod audio;
 pub mod drafts;
 pub mod engine;
 pub mod learning;
+pub mod models;
 pub mod paths;
 pub mod pinning;
 pub mod pipeline;

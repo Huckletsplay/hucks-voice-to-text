@@ -25,7 +25,6 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 cpal = "0.18.2"
-hound = "3.5.1"
 hvtt-core = { path = "../core" }
 parking_lot = "0.12.5"
 serde = { version = "1", features = ["derive"] }
@@ -68,3 +67,7 @@ windows = { version = "0.61", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+# Reads the test and benchmark recordings; the program itself writes no sound files.
+hound = "3.5.1"

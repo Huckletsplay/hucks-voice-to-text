@@ -47,8 +47,20 @@ CONFPY
 [ "$(uname -m)" = "arm64" ] || { echo "Build the Apple silicon release on an Apple silicon Mac." >&2; exit 1; }
 
 NAME="HucksVoiceToText-$VERSION-macOS-arm64-unsigned-beta"
-MODEL="${HVTT_RELEASE_MODEL:-$HOME/Library/Application Support/com.huck.voice-to-text/models/ggml-base.en.bin}"
-[ -f "$MODEL" ] || { echo "No speech model at $MODEL - run scripts/fetch-model.sh base.en" >&2; exit 1; }
+# "Best" (large-v3-turbo, 5-bit) is the model inside the Mac app (hvtt_core::models, 2026-10-02).
+MODEL="${HVTT_RELEASE_MODEL:-$HOME/Library/Application Support/com.huck.voice-to-text/models/ggml-large-v3-turbo-q5_0.bin}"
+[ -f "$MODEL" ] || { echo "No speech model at $MODEL - run scripts/fetch-model.sh large-v3-turbo-q5_0" >&2; exit 1; }
+[ "$(shasum -a 256 "$MODEL" | cut -c1-64)" = "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2" ] \
+    || { echo "The speech model at $MODEL is not the published file." >&2; exit 1; }
+# Startup asks for this exact name (hvtt_core::models): a renamed copy would never be found.
+[ "$(basename "$MODEL")" = "ggml-large-v3-turbo-q5_0.bin" ] \
+    || { echo "The speech model must be named ggml-large-v3-turbo-q5_0.bin." >&2; exit 1; }
+VAD="${HVTT_RELEASE_VAD:-$HOME/Library/Application Support/com.huck.voice-to-text/models/ggml-silero-v5.1.2.bin}"
+[ -f "$VAD" ] || { echo "No voice detector at $VAD - run scripts/fetch-model.sh silero-v5.1.2" >&2; exit 1; }
+[ "$(shasum -a 256 "$VAD" | cut -c1-64)" = "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf" ] \
+    || { echo "The voice detector at $VAD is not the published file." >&2; exit 1; }
+[ "$(basename "$VAD")" = "ggml-silero-v5.1.2.bin" ] \
+    || { echo "The voice detector must be named ggml-silero-v5.1.2.bin." >&2; exit 1; }
 OUT="$PROJECT_ROOT/artifacts/macos/release"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/hvtt-release.XXXXXX")"
 LAYOUT=""
@@ -82,7 +94,7 @@ bash "$SCRIPT_DIR/dev.sh" build-release --features custom-protocol
 
 say "Assembling, with the speech model inside…"
 mkdir -p "$STAGE"
-HVTT_BUNDLE_MODEL="$MODEL" bash "$SCRIPT_DIR/assemble-app.sh" "$APP"
+HVTT_BUNDLE_MODEL="$MODEL" HVTT_BUNDLE_VAD="$VAD" bash "$SCRIPT_DIR/assemble-app.sh" "$APP"
 
 # This is deliberately a release failure, not a best-effort warning. It protects against a future
 # compiler, dependency or custom target directory bypassing the remapping above.
@@ -161,6 +173,8 @@ MOUNTED="$WORK/mnt/$PRODUCT_NAME.app"
 codesign --verify --strict "$MOUNTED"
 [ -f "$MOUNTED/Contents/Resources/models/$(basename "$MODEL")" ] \
     || { echo "The speech model is missing from the mounted app." >&2; exit 1; }
+[ -f "$MOUNTED/Contents/Resources/models/$(basename "$VAD")" ] \
+    || { echo "The voice detector is missing from the mounted app." >&2; exit 1; }
 [ -L "$WORK/mnt/Applications" ] || { echo "The Applications shortcut is missing." >&2; exit 1; }
 [ -f "$WORK/mnt/.background/background.tiff" ] && [ -f "$WORK/mnt/.DS_Store" ] \
     || { echo "The DMG's branded background or layout is missing." >&2; exit 1; }

@@ -148,8 +148,13 @@ function renderWords(s) {
   ui.live.hidden = !showLive || (s.state === "transcribing" && !s.live_text);
   ui.edit.hidden = !paused;
   if (showLive) {
+    // Follow the newest words, as a chat does - unless he has scrolled up to read, and then
+    // only until he scrolls back down to the end (asked for 2026-09-30 and 2026-10-03).
+    const box = ui.live;
+    const following = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
     ui.liveText.textContent = s.live_text || "";
     ui.liveTail.textContent = s.live_tail || "";
+    if (following) box.scrollTop = box.scrollHeight;
     ui.live.dataset.empty = String(!s.live_text && !s.live_tail);
     ui.live.dataset.off = String(s.live_words === "off");
     dirty = false;
@@ -157,7 +162,11 @@ function renderWords(s) {
   if (paused) {
     ui.edit.disabled = !!s.settling;
     ui.edit.placeholder = s.settling ? "Finishing your last words…" : "Nothing yet — Resume to keep talking.";
-    if (!dirty && document.activeElement !== ui.edit) ui.edit.value = s.live_text || "";
+    if (!dirty && document.activeElement !== ui.edit && ui.edit.value !== (s.live_text || "")) {
+      ui.edit.value = s.live_text || "";
+      // Paused, the newest words are the ones in view too.
+      ui.edit.scrollTop = ui.edit.scrollHeight;
+    }
     if (wantCaret && !s.settling) {
       wantCaret = false;
       ui.edit.focus();
@@ -192,7 +201,12 @@ function render(s) {
     ui.note.textContent = s.update.detail;
     ui.note.hidden = !s.update.detail;
     ui.permission.hidden = true;
-    ui.updateActions.hidden = s.update.stage !== "ready";
+    // "ready": an update to open. "offer": a suggestion with its own button (the speed check).
+    const offer = s.update.stage === "offer";
+    ui.updateActions.hidden = !(s.update.stage === "ready" || offer);
+    ui.updateOpen.textContent = offer ? s.update.action || "Switch" : "Open Update";
+    ui.updateLater.textContent = offer ? "Keep it as it is" : "Not now";
+    updateStage = s.update.stage;
     ui.close.hidden = false;
     last = s.state;
     fit();
@@ -209,7 +223,10 @@ function render(s) {
   // Where it is pointed - glanceable, never announced. An arrow only where the words are going
   // or went; the permission panel already says its own sentence.
   const aimed = s.state === "recording" || (s.state === "ready" && s.delivered);
-  if (aimed && s.pinned) {
+  if ((s.state === "recording" || s.state === "paused") && s.live_trouble) {
+    // Words that could not be recognised yet: kept, and tried again.
+    ui.target.textContent = s.live_trouble;
+  } else if (aimed && s.pinned) {
     ui.target.textContent = `→ ${s.pinned}`;
   } else if (s.state === "recording" || s.state === "ready") {
     ui.target.textContent = ui.permission.hidden ? (s.pin_note || "") : "";
@@ -220,7 +237,9 @@ function render(s) {
   // A shortcut that did not register outranks everything else: without it the product has no
   // front door, and the failure must never be silent. "Sent" needs no second line.
   const quiet = s.delivered || s.state === "recording" || s.state === "paused";
-  const note = s.shortcut_error || (quiet ? "" : s.message) || "";
+  // The last few seconds missing from words already sent: said even after "Sent".
+  const missing = s.state === "ready" ? s.live_trouble || "" : "";
+  const note = s.shortcut_error || [missing, quiet ? "" : s.message].filter(Boolean).join(" ");
   ui.note.textContent = note;
   ui.note.hidden = !note;
 
@@ -246,7 +265,8 @@ function done() {
 }
 
 ui.close.addEventListener("click", () => invoke("dismiss"));
-ui.updateOpen.addEventListener("click", () => invoke("open_update"));
+let updateStage = null;
+ui.updateOpen.addEventListener("click", () => invoke(updateStage === "offer" ? "accept_offer" : "open_update"));
 ui.updateLater.addEventListener("click", () => invoke("dismiss"));
 ui.permOpen.addEventListener("click", () => { invoke("open_accessibility_settings"); done(); });
 ui.permLater.addEventListener("click", done);

@@ -1,8 +1,8 @@
 //! Check for Updates.
 //!
-//! Asks GitHub for its releases **only when he chooses it** from the menu — there is no
-//! background check, and this is the program's only network connection. It mirrors Huck's Snip 'n'
-//! Clip:
+//! Asks GitHub for its releases when he chooses it from the menu, and once, quietly, a little after
+//! the program opens (H › Settings › Check for Updates When It Opens, on by default since
+//! 2026-10-02 - his decision). It mirrors Huck's Snip 'n' Clip:
 //!
 //! - an update is offered only for a strictly newer `v<major>.<minor>.<patch>` release that carries
 //!   exactly this platform's download and checksum, named by [`download_name`] and
@@ -21,6 +21,10 @@
 //! The rules are plain functions with tests; the network and hashing go through the system's own
 //! tools (`curl` and `shasum` on macOS, `curl.exe` and `certutil` on Windows), so there is no HTTP
 //! or crypto dependency to carry.
+//!
+//! **The program's only other connection** is here too: a speech model he chooses from H ›
+//! Settings › Speech Model that is not on the computer yet, fetched once from the whisper.cpp
+//! project's files ([`download_model`], since 2026-09-30). Neither ever carries anything of his.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -177,6 +181,11 @@ fn curl_program() -> PathBuf {
 }
 
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
+    curl_from("GitHub", args)
+}
+
+/// `host` names the place in what he is told when it cannot be reached.
+fn curl_from(host: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let mut command = Command::new(curl_program());
     #[cfg(windows)]
     {
@@ -190,10 +199,10 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
         .args(["--proto", "=https", "--proto-redir", "=https", "--tlsv1.2"])
         .args(args)
         .output()
-        .map_err(|e| format!("Could not reach GitHub ({e})."))?;
+        .map_err(|e| format!("Could not reach {host} ({e})."))?;
     if !out.status.success() {
         let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if why.is_empty() { "Could not reach GitHub.".into() } else { why });
+        return Err(if why.is_empty() { format!("Could not reach {host}.") } else { why });
     }
     Ok(out.stdout)
 }
@@ -314,7 +323,10 @@ fn download_into(offer: &Offer, dir: &std::path::Path) -> Result<PathBuf, String
 
     let dmg = dir.join(&name);
     let dmg_text = dmg.to_string_lossy().to_string();
-    curl(&["--max-time", "900", "--output", &dmg_text, &offer.download_url])?;
+    // No fixed deadline: with "Best" inside, a download is ~600 MB, and a slow line needs longer
+    // than 15 minutes. It gives up only if it stalls - under 1 KB/s for a minute (Codex's twelfth
+    // review) - and the size and SHA-256 are checked as always.
+    curl(&["--speed-limit", "1024", "--speed-time", "60", "--output", &dmg_text, &offer.download_url])?;
 
     let size = std::fs::metadata(&dmg).map(|m| m.len()).unwrap_or(0);
     if size != offer.download_size {
@@ -327,6 +339,59 @@ fn download_into(offer: &Offer, dir: &std::path::Path) -> Result<PathBuf, String
             .into());
     }
     Ok(dmg)
+}
+
+// ---------------------------------------------------------------------------- speech models
+
+/// Download a speech model he chose into `dir`, and keep it only if it is exactly the published
+/// file: its size and SHA-256 must be the ones in `hvtt_core::models`. Until then it is a `.part`
+/// file, which the program never loads; anything that goes wrong deletes it. `progress` hears how
+/// many bytes have arrived, twice a second.
+pub fn download_model(
+    model: &hvtt_core::models::Model,
+    dir: &std::path::Path,
+    progress: impl Fn(u64) + Send + 'static,
+) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    std::fs::create_dir_all(dir).map_err(|e| format!("Could not prepare the models folder ({e})."))?;
+    let target = dir.join(model.file);
+    let part = dir.join(format!("{}.part", model.file));
+    let _ = std::fs::remove_file(&part);
+
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (part, done) = (part.clone(), done.clone());
+        std::thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                if let Ok(meta) = std::fs::metadata(&part) {
+                    progress(meta.len());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        })
+    };
+    let part_text = part.to_string_lossy().to_string();
+    let url = hvtt_core::models::download_url(model);
+    let fetched = curl_from("Hugging Face", &["--speed-limit", "1024", "--speed-time", "60", "--output", &part_text, &url]);
+    done.store(true, Ordering::SeqCst);
+    let _ = watcher.join();
+
+    let kept = fetched.and_then(|_| {
+        let size = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        if size != model.bytes {
+            return Err("The download is incomplete — its size is not the published one.".into());
+        }
+        if sha256_of(&part_text)? != model.sha256 {
+            return Err("The download does not match its published SHA-256 checksum, so it was \
+                        deleted."
+                .into());
+        }
+        std::fs::rename(&part, &target).map_err(|e| format!("Could not keep the download ({e})."))
+    });
+    if kept.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    kept.map(|_| target)
 }
 
 /// SHA-256 of a file, lower-case hex, from the system's own tool.

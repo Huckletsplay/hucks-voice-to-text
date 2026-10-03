@@ -95,6 +95,8 @@ struct Snapshot {
     live_text: String,
     /// Words still being recognised: shown fainter, and may still change.
     live_tail: String,
+    /// Words waiting to be recognised again, said in the box while it lasts.
+    live_trouble: Option<String>,
     /// Paused, and the last words are still being finished; the text cannot be fixed yet.
     settling: bool,
     /// Learning from his fixes, on or off.
@@ -113,6 +115,11 @@ struct Timings {
     shortcut_to_visible_ms: u128,
     /// Shortcut pressed -> microphone actually capturing.
     shortcut_to_capture_ms: u128,
+    /// Shortcut pressed -> the first sound from the microphone. Anything he said before it is
+    /// not in the recording.
+    shortcut_to_first_sound_ms: u128,
+    #[serde(skip)]
+    pressed: Option<std::time::Instant>,
     /// Recognition wall time.
     transcribe_ms: u128,
     /// Clipboard + delivery.
@@ -123,8 +130,20 @@ struct App {
     session: Mutex<SessionState>,
     transcript: Mutex<Transcript>,
     recording: Mutex<Option<recorder::Recording>>,
+    /// The next dictation's microphone, built and waiting (`recorder::Prepared`).
+    prepared: Mutex<Option<recorder::Prepared>>,
     engine: Mutex<Option<Arc<dyn Transcriber>>>,
     engine_status: Mutex<String>,
+    /// The smaller model the speed check offered, waiting for his answer.
+    /// The speed check's offer, with the model change it was measured under (`model_changes`).
+    offered_model: Mutex<Option<(&'static hvtt_core::models::Model, u64)>>,
+    /// Counts model changes, which happen only while holding it - the speed check holds it too
+    /// while it decides and shows its advice, so no change slips in between (Codex's 18th review).
+    model_changes: Mutex<u64>,
+    /// The speech model being downloaded or loaded - one at a time, reserved the moment it is
+    /// chosen and held until it is the one in use and remembered. Two loads at once could leave
+    /// one model ticked and another running (Codex's review, 2026-09-30).
+    model_work: Mutex<Option<ModelWork>>,
     settings: Mutex<Settings>,
     drafts: Option<DraftStore>,
     message: Mutex<String>,
@@ -199,6 +218,28 @@ struct Live {
     edited: bool,
     /// Pausing: the last words are being finished.
     settling: bool,
+    /// A window here could not be settled for sure (`Settled::Unsure`): no more windows are tried
+    /// from this point - the stop press or a pause recognises all of it, so nothing is skipped.
+    hold_at: Option<usize>,
+    /// Seconds of this dictation that held speech but gave no words, added up from every pause
+    /// and the stop - never cleared by a later success, so the end can say so (Codex's eighth
+    /// review).
+    unrecognised_secs: f32,
+    /// Words that could not be recognised yet. They are kept - `heard_upto` does not move past
+    /// them - and tried again by the next pass, Resume or the stop press; the box says so
+    /// meanwhile (Codex's review, 2026-09-30).
+    trouble: Option<String>,
+}
+
+/// What the box says while words are waiting to be recognised again.
+const TROUBLE: &str = "Some words aren't recognised yet — trying again";
+
+/// What is happening to a speech model: H › Settings › Speech Model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelWork {
+    file: String,
+    /// Still downloading; otherwise loading.
+    downloading: bool,
 }
 
 fn join_words(a: &str, b: &str) -> String {
@@ -244,6 +285,7 @@ impl App {
             timings: self.timings.lock().clone(),
             live_text: live.text,
             live_tail: live.tail,
+            live_trouble: live.trouble,
             settling: live.settling,
             learning,
             live_words,
@@ -268,8 +310,12 @@ impl App {
 fn log_latency(state: &App) {
     let t = state.timings.lock();
     eprintln!(
-        "[hvtt] latency: shortcut->visible {}ms | shortcut->capture {}ms | transcribe {}ms | deliver {}ms",
-        t.shortcut_to_visible_ms, t.shortcut_to_capture_ms, t.transcribe_ms, t.deliver_ms
+        "[hvtt] latency: shortcut->visible {}ms | shortcut->capture {}ms | shortcut->first sound {}ms | transcribe {}ms | deliver {}ms",
+        t.shortcut_to_visible_ms,
+        t.shortcut_to_capture_ms,
+        t.shortcut_to_first_sound_ms,
+        t.transcribe_ms,
+        t.deliver_ms
     );
 }
 
@@ -411,12 +457,21 @@ fn bind_all(app: &AppHandle) {
 /// Change a setting and save it. The menu rebuilds itself from the next update.
 fn update_settings(app: &AppHandle, change: impl FnOnce(&mut Settings)) {
     let state: State<App> = app.state();
-    let mut s = state.settings.lock().clone();
+    change_settings(&state.settings, change, |s| {
+        if let Err(e) = s.save() {
+            eprintln!("[hvtt] settings not saved: {e}");
+        }
+    });
+}
+
+/// Change settings in one turn - from the latest, saved, and kept, all under the lock - so two
+/// changes at once can never undo each other. Copying, saving and putting back separately let a
+/// model finishing loading put "Keep Last 5 Recordings" back on after he had switched it off, or
+/// drop a fix just learned (Codex's fourteenth review).
+fn change_settings(settings: &Mutex<Settings>, change: impl FnOnce(&mut Settings), save: impl FnOnce(&Settings)) {
+    let mut s = settings.lock();
     change(&mut s);
-    if let Err(e) = s.save() {
-        eprintln!("[hvtt] settings not saved: {e}");
-    }
-    *state.settings.lock() = s;
+    save(&s);
 }
 
 /// Which shortcut is being rebound while the box waits for keys.
@@ -532,15 +587,17 @@ fn paste_last() {
 /// What the floating box says during Check for Updates.
 #[derive(Debug, Clone, Serialize)]
 struct UpdateView {
-    /// checking | current | downloading | ready | failed
+    /// checking | current | downloading | ready | failed | offer
     stage: &'static str,
     title: String,
     detail: String,
+    /// "offer" only: the button's words ("Switch to Quick").
+    action: Option<String>,
 }
 
 fn show_update(app: &AppHandle, stage: &'static str, title: String, detail: String) {
     let state: State<App> = app.state();
-    *state.update.lock() = Some(UpdateView { stage, title, detail });
+    *state.update.lock() = Some(UpdateView { stage, title, detail, action: None });
     // Dictation outranks this: it waits in the state and shows when the box is next free.
     if !matches!(*state.session.lock(), SessionState::Recording | SessionState::Paused | SessionState::Transcribing) {
         reveal_composer(app);
@@ -548,23 +605,78 @@ fn show_update(app: &AppHandle, stage: &'static str, title: String, detail: Stri
     push(app);
 }
 
-/// Settings › Check for Updates…. The only network connection the program makes, and only now.
-fn check_for_updates(app: &AppHandle) {
+/// Put away an update or speech-model message after `delay` - only if that same message is still
+/// the one waiting and nothing else has the box. A dictation that started or ended meanwhile is
+/// never dismissed by it, above all one whose words could be kept nowhere but the box: `hide_after`
+/// went by the generation alone, so a model download finishing mid-dictation could clear those
+/// words later (Codex's review, 2026-09-30).
+fn hide_update_after(app: &AppHandle, delay: std::time::Duration) {
     let state: State<App> = app.state();
+    let Some(shown) = state.update.lock().as_ref().map(|v| (v.stage, v.title.clone())) else {
+        return;
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let state: State<App> = app.state();
+        // One lock at a time: `snapshot` holds the session while it reads the others.
+        let idle = matches!(*state.session.lock(), SessionState::Idle);
+        let same = state
+            .update
+            .lock()
+            .as_ref()
+            .is_some_and(|v| v.stage == shown.0 && v.title == shown.1);
+        if idle && same {
+            dismiss(app.clone());
+        }
+    });
+}
+
+/// Settings › Check for Updates…. Asks GitHub only now, when he chooses it.
+fn check_for_updates(app: &AppHandle) {
+    check_for_updates_how(app, false);
+}
+
+/// `quiet`: the check made when the program opens (H › Settings › Check for Updates When It
+/// Opens) - nothing is shown unless a newer version is found; up to date, offline or failed, it
+/// stays silent.
+fn check_for_updates_how(app: &AppHandle, quiet: bool) {
+    let state: State<App> = app.state();
+    // One check (and its download) at a time, whatever the box shows - a quiet check shows nothing
+    // (Codex's seventeenth review: two at once shared one download folder).
+    if UPDATE_WORK.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if !quiet {
+            reveal_composer(app);
+        }
+        return;
+    }
     if matches!(state.update.lock().as_ref(), Some(v) if matches!(v.stage, "checking" | "downloading" | "installing")) {
-        reveal_composer(app);
+        UPDATE_WORK.store(false, std::sync::atomic::Ordering::SeqCst);
+        if !quiet {
+            reveal_composer(app);
+        }
         return;
     }
     *state.update_file.lock() = None;
     #[cfg(windows)]
     UPDATE_WARNED.store(false, std::sync::atomic::Ordering::SeqCst);
-    show_update(app, "checking", "Checking for updates…".into(), "Asking GitHub.".into());
+    if !quiet {
+        show_update(app, "checking", "Checking for updates…".into(), "Asking GitHub.".into());
+    }
     let app = app.clone();
     std::thread::spawn(move || {
+        let _work = Released(&UPDATE_WORK);
         let current = app.package_info().version.to_string();
-        let fail = |why: String| show_update(&app, "failed", "Couldn't update".into(), why);
+        let fail = |why: String| {
+            if quiet {
+                eprintln!("[hvtt] update check on opening: {why}");
+            } else {
+                show_update(&app, "failed", "Couldn't update".into(), why)
+            }
+        };
         match update::fetch_latest(&current) {
             Err(why) => fail(why),
+            Ok(update::Check::UpToDate { .. }) if quiet => {}
             Ok(update::Check::UpToDate { .. }) => {
                 show_update(
                     &app,
@@ -572,7 +684,7 @@ fn check_for_updates(app: &AppHandle) {
                     "You're up to date".into(),
                     format!("Version {current} is the latest."),
                 );
-                hide_after(&app, std::time::Duration::from_millis(2600));
+                hide_update_after(&app, std::time::Duration::from_millis(2600));
             }
             Ok(update::Check::Available(offer)) => {
                 show_update(
@@ -724,7 +836,7 @@ const TRAY: &str = "hvtt";
 fn menu_key(state: &App) -> String {
     let s = state.settings.lock().clone();
     format!(
-        "{}|{}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}",
+        "{}|{}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{}|{:?}|{}|{}",
         state.session.lock().is_dictating(),
         s.shortcut,
         s.paste_shortcut,
@@ -738,6 +850,10 @@ fn menu_key(state: &App) -> String {
         s.learning,
         s.fixes,
         s.live_words,
+        s.model,
+        state.model_work.lock(),
+        s.careful_stop,
+        s.check_updates_on_start,
     )
 }
 
@@ -832,6 +948,15 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     settings.append(&shortcuts)?;
     settings.append(&clipboard)?;
     settings.append(&live)?;
+    // Same plain words: what happens, and what it costs.
+    let stop = Submenu::with_id(app, "stop-talking", "When I Stop Talking", true)?;
+    stop.append(&check("stop-quick", "Finish Quickly", !s.careful_stop)?)?;
+    stop.append(&check(
+        "stop-careful",
+        "Wait a Moment Longer — safest for a soft last word",
+        s.careful_stop,
+    )?)?;
+    settings.append(&stop)?;
     settings.append(&PredefinedMenuItem::separator(app)?)?;
     let login = login_item::state();
     let (login_title, login_on) = login_item::presentation(login);
@@ -860,11 +985,43 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     settings.append(&check("keep-drafts", "Keep Recovery Drafts", s.keep_drafts)?)?;
     settings.append(&item("open-drafts", "Open Drafts Folder".into(), true)?)?;
     settings.append(&PredefinedMenuItem::separator(app)?)?;
-    // "ggml-base.en.bin" is a file name; "base.en" is the model.
-    let model = state.engine_status.lock().trim_start_matches("ggml-").trim_end_matches(".bin").to_string();
-    settings.append(&item("model", format!("Speech Model — {model}"), false)?)?;
+    // Quick, Better, Best: what each would cost is in its line. One download at a time, and not
+    // mid-dictation.
+    let work = state.model_work.lock().clone();
+    let chosen = hvtt_core::models::find(&s.model);
+    let speech = Submenu::with_id(
+        app,
+        "speech-model",
+        format!("Speech Model — {}", chosen.map_or("your own", |m| m.name)),
+        !recording,
+    )?;
+    for (i, m) in hvtt_core::models::MODELS.iter().enumerate() {
+        let label = match &work {
+            Some(w) if w.file == m.file && !w.downloading => {
+                format!("{} — getting ready… · {}", m.name, hvtt_core::models::megabytes(m.bytes))
+            }
+            Some(w) => hvtt_core::models::menu_label(m, model_on_this_computer(m), w.file == m.file),
+            None => hvtt_core::models::menu_label(m, model_on_this_computer(m), false),
+        };
+        speech.append(&CheckMenuItem::with_id(
+            app,
+            format!("model-{i}"),
+            label,
+            work.is_none(),
+            chosen == Some(m),
+            None::<&str>,
+        )?)?;
+    }
+    if chosen.is_none() {
+        // A model he put in the folder himself: shown, so the menu never claims another.
+        let own = s.model.trim_start_matches("ggml-").trim_end_matches(".bin");
+        speech.append(&CheckMenuItem::with_id(app, "model-own", own, false, true, None::<&str>)?)?;
+    }
+    settings.append(&speech)?;
     settings.append(&PredefinedMenuItem::separator(app)?)?;
+    settings.append(&item("speed-check", "Check This Computer's Speed".into(), !recording && state.model_work.lock().is_none())?)?;
     settings.append(&item("check-updates", "Check for Updates…".into(), !recording)?)?;
+    settings.append(&check("updates-on-start", "Check for Updates When It Opens", s.check_updates_on_start)?)?;
     settings.append(&item("version", format!("Version {}", app.package_info().version), false)?)?;
     menu.append(&settings)?;
 
@@ -896,6 +1053,8 @@ fn on_menu(app: &AppHandle, id: &str) {
         "dictate" => toggle_by(app.clone(), false),
         "allow-ax" => open_accessibility_settings(),
         "check-updates" => check_for_updates(app),
+        "speed-check" => speed_check(app, true),
+        "updates-on-start" => update_settings(app, |s| s.check_updates_on_start = !s.check_updates_on_start),
         "rebind-dictation" => begin_rebind(app, Rebinding::Dictation),
         "rebind-paste" => begin_rebind(app, Rebinding::Paste),
         "reset-shortcuts" => {
@@ -921,7 +1080,16 @@ fn on_menu(app: &AppHandle, id: &str) {
         "live-as-you-talk" => update_settings(app, |s| s.live_words = LiveWords::AsYouTalk),
         "live-lighter" => update_settings(app, |s| s.live_words = LiveWords::Lighter),
         "live-off" => update_settings(app, |s| s.live_words = LiveWords::Off),
+        "stop-quick" => update_settings(app, |s| s.careful_stop = false),
+        "stop-careful" => update_settings(app, |s| s.careful_stop = true),
         "forget-all" => update_settings(app, |s| s.fixes.clear()),
+        other if other.starts_with("model-") => {
+            if let Some(model) =
+                other["model-".len()..].parse::<usize>().ok().and_then(|i| hvtt_core::models::MODELS.get(i))
+            {
+                choose_model(app, model, None);
+            }
+        }
         other if other.starts_with("forget-") => {
             if let Ok(i) = other["forget-".len()..].parse::<usize>() {
                 update_settings(app, |s| {
@@ -1037,7 +1205,7 @@ static QUIT_WARNED_GENERATION: Mutex<Option<u64>> = Mutex::new(None);
 /// already recognised where the finished ones would go - the chosen clipboard, and a draft if
 /// drafts are on. If the last stretch then finishes in time it replaces them; if not, only that
 /// last stretch is lost, never the whole dictation. (Codex's fourth review of 0.1.6.) Audio is
-/// never written to disk for this: he has not asked for recordings to be kept.
+/// never written to disk.
 #[cfg(target_os = "macos")]
 fn keep_words_so_far(app: &AppHandle) {
     let state: State<App> = app.state();
@@ -1269,7 +1437,7 @@ fn dictation_has_words(state: &App) -> bool {
             .recording
             .lock()
             .as_ref()
-            .is_some_and(|r| hvtt_core::audio::has_speech(&r.peek_from(from)))
+            .is_some_and(|r| hvtt_core::audio::hear_speech(&r.peek_from(from)) != hvtt_core::audio::Heard::Silence)
 }
 
 /// Put the box away. Always available, in every state, so the box can never get stuck on screen.
@@ -1307,7 +1475,9 @@ fn dismiss(app: AppHandle) {
         bind_all(&app);
     }
     // Nothing heard worth keeping (checked above): the recording just stops.
-    drop(state.recording.lock().take());
+    if state.recording.lock().take().is_some() {
+        prepare_microphone(&app);
+    }
     *state.level.lock() = 0.0;
     *state.delivered.lock() = false;
     *state.ask_permission.lock() = false;
@@ -1315,10 +1485,7 @@ fn dismiss(app: AppHandle) {
         *state.update.lock() = None;
     }
     *state.transcript.lock() = Transcript::empty();
-    #[cfg(target_os = "macos")]
-    {
-        *state.words_unsaved.lock() = false;
-    }
+    *state.words_unsaved.lock() = false;
     *state.message.lock() = String::new();
     *state.elapsed_ms.lock() = 0;
     state.set_state(SessionState::Idle);
@@ -1341,10 +1508,10 @@ fn get_settings(state: State<App>) -> Settings {
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     let state: State<App> = app.state();
-    settings.save().map_err(|e| e.to_string())?;
-    *state.settings.lock() = settings;
+    let mut saved = Ok(());
+    change_settings(&state.settings, |s| *s = settings, |s| saved = s.save().map_err(|e| e.to_string()));
     push(&app);
-    Ok(())
+    saved
 }
 
 /// Where the recovery drafts are, so the user can always find their words.
@@ -1367,6 +1534,13 @@ fn start_recording(app: AppHandle) {
         push(&app);
         return;
     }
+
+    // The microphone starts opening now, on its own thread, alongside everything below: opening it
+    // is the slowest thing here, and whatever he says before it runs is lost. Measured 2026-09-30
+    // on quick phrases: missing the first 0.12 s took base.en from 6% of words wrong to 23%.
+    let device = state.settings.lock().input_device.clone();
+    let prepared = state.prepared.lock().take();
+    let microphone = std::thread::spawn(move || open_microphone(prepared, device.as_deref()));
 
     // 0. CAPTURE THE DESTINATION AT THE KEYPRESS — before anything else.
     //
@@ -1427,17 +1601,27 @@ fn start_recording(app: AppHandle) {
         *state.update.lock() = None;
     }
     state.set_state(SessionState::Recording);
+    // Counted again now it shows as recording: a speed check that found nothing happening read the
+    // count before this, so it is given up (Codex's eighteenth review).
+    state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     *state.message.lock() = "Listening…".into();
     *state.elapsed_ms.lock() = 0;
     *state.pin_note.lock() = None;
     *state.destination.lock() = None;
     reveal_composer(&app);
-    state.timings.lock().shortcut_to_visible_ms = pressed.elapsed().as_millis();
+    {
+        let mut t = state.timings.lock();
+        t.pressed = Some(pressed);
+        t.shortcut_to_visible_ms = pressed.elapsed().as_millis();
+    }
     push(&app);
 
-    // 2. Microphone, so the first words are not lost while the destination is worked out.
-    let device = state.settings.lock().input_device.clone();
-    match recorder::Recording::start(device.as_deref()) {
+    // 2. The microphone, opening since the keypress, so the first words are not lost while the
+    //    destination is worked out.
+    let opened = microphone
+        .join()
+        .unwrap_or_else(|_| Err("The microphone could not be opened.".to_string()));
+    match opened {
         Ok(rec) => {
             *state.recording.lock() = Some(rec);
             state.timings.lock().shortcut_to_capture_ms = pressed.elapsed().as_millis();
@@ -1469,6 +1653,57 @@ fn start_recording(app: AppHandle) {
         #[cfg(not(any(target_os = "macos", windows)))]
         let _ = browser;
         push(&app2);
+    });
+}
+
+/// The microphone for a new dictation: the prepared one when it is still the right device and
+/// starts giving sound at once, otherwise opened from cold. A prepared stream that gives nothing
+/// within a quarter of a second (the computer slept, say) is dropped for a cold one - better a
+/// slower start than a dictation that captured nothing.
+fn open_microphone(
+    prepared: Option<recorder::Prepared>,
+    device: Option<&str>,
+) -> Result<recorder::Recording, String> {
+    if let Some(prepared) = prepared.filter(|p| p.still_current(device)) {
+        let started = std::time::Instant::now();
+        match prepared.start() {
+            Ok(rec) => {
+                while rec.first_sound().is_none() && started.elapsed() < std::time::Duration::from_millis(250) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                if rec.first_sound().is_some() {
+                    eprintln!("[hvtt] microphone: prepared, sound after {} ms", started.elapsed().as_millis());
+                    return Ok(rec);
+                }
+                eprintln!("[hvtt] microphone: prepared stream gave no sound; opening it again");
+            }
+            Err(e) => eprintln!("[hvtt] microphone: prepared stream would not start ({e})"),
+        }
+    }
+    let started = std::time::Instant::now();
+    let rec = recorder::Recording::start(device)?;
+    eprintln!("[hvtt] microphone: opened cold in {} ms", started.elapsed().as_millis());
+    Ok(rec)
+}
+
+/// Build the next dictation's microphone now, while nothing is happening, so the keypress only
+/// starts it. Only after a dictation (so never before macOS has been asked for the microphone),
+/// and not at all with `HVTT_COLD_MIC` set (the comparison, 2026-10-02).
+fn prepare_microphone(app: &AppHandle) {
+    // Windows shows its own "using your microphone" sign; whether a built-but-stopped stream
+    // lights it is not yet checked on the PC, so Windows opens the microphone at the press, as
+    // before, until it is.
+    if cfg!(windows) || std::env::var_os("HVTT_COLD_MIC").is_some() {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let state: State<App> = app.state();
+        let device = state.settings.lock().input_device.clone();
+        match recorder::Prepared::new(device.as_deref()) {
+            Ok(prepared) => *state.prepared.lock() = Some(prepared),
+            Err(e) => eprintln!("[hvtt] next microphone not prepared: {e}"),
+        }
     });
 }
 
@@ -1715,8 +1950,9 @@ fn recognise(
     give_up: Option<hvtt_core::engine::GiveUp>,
     provisional: bool,
 ) -> Result<Option<String>, String> {
+    let speech = hvtt_core::audio::hear_speech(samples);
     if samples.len() < hvtt_core::audio::WHISPER_SAMPLE_RATE as usize / 4
-        || !hvtt_core::audio::has_speech(samples)
+        || speech == hvtt_core::audio::Heard::Silence
     {
         return Ok(None);
     }
@@ -1726,14 +1962,92 @@ fn recognise(
         provisional,
         give_up,
     };
-    let heard = engine.transcribe(&req).map_err(|e| e.to_string())?.text;
+    let result = engine.transcribe(&req).map_err(|e| e.to_string())?;
+    let heard = hvtt_core::engine::without_ellipses(&hvtt_core::engine::confident(&result, speech));
     let text = hvtt_core::learning::apply(heard.trim(), &hints.fixes);
     Ok((!text.trim().is_empty()).then_some(text))
 }
 
-/// Recognise while he talks, so the box fills in and the stop press has only the last few
-/// seconds left to do. Every 0.3 s: a finished stretch, ended at a pause, is recognised for good;
-/// the stretch he is still in is recognised provisionally and shown fainter.
+/// Recognise one full window for good by the rolling rule (`hvtt_core::engine::window_step`): its
+/// words and how far they reach (16 kHz samples), or `None` when the window is held whole for the
+/// stop. `hints` already carry the words before it.
+fn recognise_window(
+    engine: &Arc<dyn Transcriber>,
+    samples: &[f32],
+    hints: &Hints,
+    give_up: Option<hvtt_core::engine::GiveUp>,
+) -> Result<Option<(Option<String>, usize)>, String> {
+    let mut hear = |audio: &[f32], _before: &str| hear_for_good(engine, audio, hints.prompt.clone(), give_up.clone());
+    match hvtt_core::engine::window_step(samples, "", &mut hear)? {
+        hvtt_core::engine::Window::Keep { text, upto } => {
+            let words = hvtt_core::learning::apply(text.trim(), &hints.fixes);
+            Ok(Some(((!words.trim().is_empty()).then_some(words), upto)))
+        }
+        hvtt_core::engine::Window::Hold => Ok(None),
+    }
+}
+
+/// One recognition whose words are kept. Too short to be speech is nothing heard, not an error.
+fn hear_for_good(
+    engine: &Arc<dyn Transcriber>,
+    audio: &[f32],
+    prompt: Option<String>,
+    give_up: Option<hvtt_core::engine::GiveUp>,
+) -> Result<hvtt_core::engine::TranscriptionResult, String> {
+    if audio.len() < hvtt_core::audio::WHISPER_SAMPLE_RATE as usize / 4 {
+        return Ok(hvtt_core::engine::TranscriptionResult { text: String::new(), sentences: Vec::new(), elapsed_ms: 0 });
+    }
+    let req = TranscriptionRequest { samples: audio.to_vec(), vocabulary_prompt: prompt, provisional: false, give_up };
+    engine.transcribe(&req).map_err(|e| e.to_string())
+}
+
+/// What the live windows had not kept, at the stop. Up to a window, heard in one piece; longer
+/// (Live Words off, or a window held), a window at a time by the same rolling rule
+/// (`hvtt_core::engine::recognise_all`) - never handed whole to Whisper's own long-form, which
+/// dropped a hundred words of a minute under hiss (2026-10-01).
+struct Rest {
+    /// The words recognised, his fixes applied.
+    words: Option<String>,
+    /// Seconds that held speech but gave no words.
+    unrecognised_secs: f32,
+    /// Recognition failed this far in (16 kHz samples), and why: `words` are everything before.
+    failed: Option<(usize, String)>,
+}
+
+/// What was not yet recognised for good, at a pause or the stop: window by window
+/// (`hvtt_core::engine::recognise_all`), and a failure part-way keeps the words before it and tries
+/// only the rest once more (Codex's eighth review).
+fn recognise_rest(engine: &Arc<dyn Transcriber>, samples: &[f32], state: &App, before: &str) -> Rest {
+    let fixes = hints(state, before).fixes;
+    let mut hear = |audio: &[f32], so_far: &str| hear_for_good(engine, audio, hints(state, so_far).prompt, None);
+    let (mut all, mut failed) = hvtt_core::engine::recognise_all(samples, before, &mut hear);
+    if let (Some(at), Some(why)) = (all.unfinished_from, failed.take()) {
+        eprintln!("[hvtt] recognition failed part-way, trying the rest once more: {why}");
+        let so_far = join_words(before, &all.text);
+        let (again, still) = hvtt_core::engine::recognise_all(&samples[at..], &so_far, &mut hear);
+        all.text = join_words(&all.text, &again.text);
+        all.unrecognised_secs += again.unrecognised_secs;
+        all.unfinished_from = again.unfinished_from.map(|more| at + more);
+        failed = still;
+    }
+    // `recognise_all`'s words begin after `before`.
+    let text = hvtt_core::learning::apply(all.text.trim(), &fixes);
+    Rest {
+        words: (!text.trim().is_empty()).then_some(text),
+        unrecognised_secs: all.unrecognised_secs,
+        failed: all.unfinished_from.zip(failed),
+    }
+}
+
+/// What the box says when speech gave no words, even asked twice.
+fn unrecognised_note(secs: f32) -> String {
+    format!("About {:.0} s of what you said couldn't be recognised.", secs.max(1.0))
+}
+
+/// Recognise while he talks, so the box fills in and the stop press has only the last window left
+/// to do. Every 0.3 s or so: a full window (`WINDOW_SECS`) waiting is recognised for good by the
+/// rolling rule (`recognise_window`); what is not yet kept is recognised provisionally and shown
+/// fainter.
 ///
 /// Recognition takes nearly every core, so the rest between passes scales with how long the last
 /// one took (H › Settings › Live Words, `LiveWords::rest_after`): a slow machine refreshes less
@@ -1767,14 +2081,23 @@ fn spawn_live(app: AppHandle, generation: u64) {
         // Only what is not yet recognised for good.
         let Some(rest) = state.recording.lock().as_ref().map(|r| r.peek_from(from)) else { break };
 
-        let (cut, settled) = match hvtt_core::audio::commit_point(&rest, 3.0, 12.0) {
-            Some(cut) => {
-                // These words are kept and sent: recognised with full care.
-                let words =
-                    recognise(&engine, &rest[..cut], &hints(&state, &before), give_up(), false);
-                (cut, words.ok().flatten())
+        // A full window waiting (`WINDOW_SECS`): recognised for good, with full care, up to its
+        // last whole sentence. A recognition that fails (rather than hearing nothing) moves
+        // nothing on, so the window is tried again.
+        let window = (hvtt_core::engine::WINDOW_SECS * hvtt_core::audio::WHISPER_SAMPLE_RATE as f32) as usize;
+        let held = state.live.lock().hold_at == Some(from);
+        let mut unsure = false;
+        let (cut, settled, failed) = if rest.len() >= window && !held {
+            match recognise_window(&engine, &rest[..window], &hints(&state, &before), give_up()) {
+                Ok(Some((words, cut))) => (cut, words, None),
+                Ok(None) => {
+                    unsure = true;
+                    (0, None, None)
+                }
+                Err(why) => (0, None, Some(why)),
             }
-            None => (0, None),
+        } else {
+            (0, None, None)
         };
         let upto = from + cut;
         let so_far = join_words(&before, settled.as_deref().unwrap_or(""));
@@ -1797,11 +2120,21 @@ fn spawn_live(app: AppHandle, generation: u64) {
                 continue;
             }
             live.heard_upto = upto;
+            if unsure {
+                eprintln!("[hvtt] a window could not be settled for sure; kept whole for the stop");
+                live.hold_at = Some(from);
+            }
             if let Some(words) = &settled {
                 live.recognised = join_words(&live.recognised, words);
                 live.text = join_words(&live.text, words);
             }
             live.tail = tail.unwrap_or_default();
+            if let Some(why) = &failed {
+                eprintln!("[hvtt] a stretch was not recognised, kept to try again: {why}");
+                live.trouble = Some(TROUBLE.into());
+            } else if cut > 0 {
+                live.trouble = None;
+            }
         }
         push(&app);
     });
@@ -1834,15 +2167,27 @@ fn pause(app: AppHandle) {
         push(&app);
 
         let engine = state.engine.lock().clone();
-        let words = engine
-            .and_then(|e| recognise(&e, &rest, &hints(&state, &before), None, false).ok().flatten());
+        // The same bounded way as Send (`recognise_rest`): window by window, never Whisper's
+        // long-form; words recognised before a failure are kept, and only the rest waits.
+        let heard = match engine {
+            Some(e) => recognise_rest(&e, &rest, &state, &before),
+            None => Rest { words: None, unrecognised_secs: 0.0, failed: Some((0, "no speech model is loaded".into())) },
+        };
         {
             let mut live = state.live.lock();
-            live.heard_upto = from + rest.len();
-            if let Some(words) = &words {
+            live.heard_upto = from + heard.failed.as_ref().map_or(rest.len(), |(at, _)| *at);
+            if let Some(words) = &heard.words {
                 live.recognised = join_words(&live.recognised, words);
                 live.text = join_words(&live.text, words);
             }
+            live.unrecognised_secs += heard.unrecognised_secs;
+            live.trouble = if let Some((_, why)) = &heard.failed {
+                // Not skipped: Resume's next pass, or Send, recognises the rest again.
+                eprintln!("[hvtt] the words before the pause were not all recognised, kept: {why}");
+                Some(TROUBLE.into())
+            } else {
+                (live.unrecognised_secs > 0.0).then(|| unrecognised_note(live.unrecognised_secs))
+            };
             live.tail.clear();
             live.settling = false;
         }
@@ -1924,21 +2269,40 @@ fn learn_from(app: &AppHandle, recognised: &str, sent: &str) {
 fn finish(app: AppHandle, deliver: bool) {
     std::thread::spawn(move || {
         let state: State<App> = app.state();
-        let (from, before, rest) = {
+        let (from, before, rec, listening) = {
             // A pause still finishing its words completes first.
             let _pass = state.live_pass.lock();
-            if !state.session.lock().is_dictating() {
-                return;
-            }
+            let listening = {
+                let session = state.session.lock();
+                if !session.is_dictating() {
+                    return;
+                }
+                matches!(*session, SessionState::Recording)
+            };
             let Some(rec) = state.recording.lock().take() else { return };
+            {
+                let mut t = state.timings.lock();
+                t.shortcut_to_first_sound_ms = match (t.pressed, rec.first_sound()) {
+                    (Some(pressed), Some(first)) => first.saturating_duration_since(pressed).as_millis(),
+                    _ => 0,
+                };
+            }
             state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             state.set_state(SessionState::Transcribing);
             let (from, before) = {
                 let live = state.live.lock();
                 (live.heard_upto, live.text.clone())
             };
-            (from, before, rec.finish_from(from))
+            (from, before, rec, listening)
         };
+        // Pressed while the last word was still being said: the microphone stays open until he
+        // has stopped (`wait_for_quiet`). Paused, it is already closed.
+        if listening {
+            let careful = state.settings.lock().careful_stop;
+            wait_for_quiet(&rec, careful);
+        }
+        let rest = rec.finish_from(from);
+        prepare_microphone(&app);
         // The whole recording's length, for telling a mis-press from a silent one.
         let recorded = from + rest.len();
         *state.level.lock() = 0.0;
@@ -1947,36 +2311,51 @@ fn finish(app: AppHandle, deliver: bool) {
 
         let engine = state.engine.lock().clone();
         let started = std::time::Instant::now();
-        let last = match engine {
-            Some(e) => recognise(&e, &rest, &hints(&state, &before), None, false),
-            None => Ok(None),
+        // What the windows have not already recognised for good: under `WINDOW_SECS` of
+        // dictation, all of it, heard in one piece.
+        let rest_heard = match &engine {
+            Some(e) => recognise_rest(e, &rest, &state, &before),
+            None => Rest { words: None, unrecognised_secs: 0.0, failed: Some((0, "no speech model is loaded".into())) },
         };
         let elapsed = started.elapsed().as_millis();
         *state.elapsed_ms.lock() = elapsed;
         state.timings.lock().transcribe_ms = elapsed;
-        let last = match last {
-            Ok(words) => words,
-            // The words already in the box are still sent; only the last stretch is missing.
-            Err(why) if !before.trim().is_empty() => {
-                eprintln!("[hvtt] last words not recognised: {why}");
-                None
-            }
-            Err(why) => {
+        let missing_end = rest_heard.failed.is_some();
+        if let Some((_, why)) = &rest_heard.failed {
+            eprintln!("[hvtt] the last words were not all recognised: {why}");
+            // Nothing at all to keep: the problem is the message.
+            if before.trim().is_empty() && rest_heard.words.is_none() {
+                // Speech that gave no words is still said, beside the reason (Codex's tenth review).
+                let missing = state.live.lock().unrecognised_secs + rest_heard.unrecognised_secs;
+                let why = if missing > 0.0 { format!("{why} {}", unrecognised_note(missing)) } else { why.clone() };
                 *state.message.lock() = why.clone();
-                state.set_state(SessionState::Error { message: why });
+                state.set_state(SessionState::Error { message: why.clone() });
                 push(&app);
                 return;
             }
-        };
-        let (recognised, text, edited) = {
+        }
+        let (recognised, text, edited, unrecognised) = {
             let mut live = state.live.lock();
-            if let Some(words) = &last {
+            if let Some(words) = &rest_heard.words {
                 live.recognised = join_words(&live.recognised, words);
                 live.text = join_words(&live.text, words);
             }
+            live.unrecognised_secs += rest_heard.unrecognised_secs;
             live.tail.clear();
-            (live.recognised.clone(), live.text.trim().to_string(), live.edited)
+            (live.recognised.clone(), live.text.trim().to_string(), live.edited, live.unrecognised_secs)
         };
+        // Said in the box, held there: the end missing, or speech that gave no words - anywhere in
+        // the dictation, pauses included.
+        if missing_end || unrecognised > 0.0 {
+            let note = if unrecognised > 0.0 {
+                unrecognised_note(unrecognised)
+            } else {
+                "The last few seconds didn't come through.".to_string()
+            };
+            state.live.lock().trouble = Some(note);
+        } else {
+            state.live.lock().trouble = None;
+        }
 
         let had_keyboard = std::mem::take(&mut *state.box_has_keyboard.lock());
         if text.is_empty() {
@@ -1992,10 +2371,15 @@ fn finish(app: AppHandle, deliver: bool) {
             if had_keyboard {
                 hand_back_keyboard(&app, false);
             }
+            // Speech that gave no words is said, and left up long enough to read.
+            let trouble = state.live.lock().trouble.clone();
+            if let Some(note) = &trouble {
+                *state.message.lock() = note.clone();
+            }
             state.set_state(SessionState::Ready);
             log_latency(&state);
             push(&app);
-            hide_after(&app, std::time::Duration::from_millis(1800));
+            hide_after(&app, std::time::Duration::from_millis(if trouble.is_some() { 9000 } else { 1800 }));
             return;
         }
         if edited {
@@ -2004,13 +2388,23 @@ fn finish(app: AppHandle, deliver: bool) {
         if had_keyboard {
             hand_back_keyboard(&app, deliver);
         }
-        deliver_words(&app, text, deliver);
+        deliver_words(&app, text, if deliver { Ending::Deliver } else { Ending::Close });
     });
 }
 
 /// The product rule, in one call: draft to disk, then clipboard, then delivery. Nothing here
 /// loses the text, and the paste rung relies on the clipboard copy.
-fn deliver_words(app: &AppHandle, text: String, deliver: bool) {
+/// How words reach `deliver_words`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// Sent: into the text box pinned at the keypress, if it can be.
+    Deliver,
+    /// He closed the box: kept (draft and clipboard), not delivered, and the box goes.
+    Close,
+}
+
+fn deliver_words(app: &AppHandle, text: String, ending: Ending) {
+    let deliver = ending == Ending::Deliver;
     let state: State<App> = app.state();
     *state.transcript.lock() = Transcript::settled(text);
 
@@ -2075,7 +2469,7 @@ fn deliver_words(app: &AppHandle, text: String, deliver: bool) {
     log_latency(&state);
     push(app);
     // Closed rather than sent: the words are kept, and the box goes as he asked.
-    if !deliver && report.clipboard_ok {
+    if ending == Ending::Close && report.clipboard_ok {
         dismiss(app.clone());
         return;
     }
@@ -2085,39 +2479,478 @@ fn deliver_words(app: &AppHandle, text: String, deliver: bool) {
     // click.
     let hold = !report.clipboard_ok || *state.ask_permission.lock();
     if !hold {
-        let ms = if delivered { 1200 } else { 2600 };
+        // Long enough to read that the last few seconds are missing, when they are.
+        let missing_end = state.live.lock().trouble.is_some();
+        let ms = if missing_end { 9000 } else if delivered { 1200 } else { 2600 };
         hide_after(app, std::time::Duration::from_millis(ms));
     }
 }
 
 // ---------------------------------------------------------------------------- startup
 
-/// Load the recognition model in the background so the window appears immediately.
-fn spawn_engine_load(app: AppHandle) {
-    std::thread::spawn(move || {
-        let state: State<App> = app.state();
-        let model_file = state.settings.lock().model.clone();
+/// Is this model's file here - inside the program, or downloaded?
+fn model_on_this_computer(model: &hvtt_core::models::Model) -> bool {
+    engine_whisper::WhisperEngine::expected_path(model.file).is_some_and(|p| p.exists())
+}
 
-        let Some(path) = engine_whisper::WhisperEngine::expected_path(&model_file) else {
-            *state.engine_status.lock() = "No application data directory available.".into();
+/// Load the recognition model in the background so the window appears immediately: the one
+/// settings name or, if its file has gone from this computer, the one inside the program, so there
+/// is always a model to dictate with. Holds the model work, so nothing is chosen meanwhile.
+fn spawn_engine_load(app: AppHandle) {
+    std::thread::spawn(load_voice_detector);
+    let state: State<App> = app.state();
+    let named = state.settings.lock().model.clone();
+    let built_in = hvtt_core::models::built_in().file;
+    let here = engine_whisper::WhisperEngine::expected_path(&named).is_some_and(|p| p.exists());
+    if !here && named != built_in {
+        eprintln!("[hvtt] {named} is not on this computer; using the built-in model");
+        update_settings(&app, |s| s.model = built_in.to_string());
+    }
+    let file = if here { named } else { built_in.to_string() };
+    *state.model_work.lock() = Some(ModelWork { file: file.clone(), downloading: false });
+    std::thread::spawn(move || {
+        let loaded = load_model_now(&app, &file, false).is_ok();
+        *app.state::<App>().model_work.lock() = None;
+        push(&app);
+        // A new version or model: see what this computer manages, once.
+        let key = format!("{} {file}", app.package_info().version);
+        if loaded && app.state::<App>().settings.lock().speed_checked != key {
+            speed_check(&app, false);
+        }
+    });
+}
+
+/// The voice detector (whisper.cpp's Silero model, `hvtt_core::models::VOICE_DETECTOR`), for
+/// telling quiet speech from noise and finding where speech ends (`hvtt_core::audio::use_detector`).
+/// Without its file, loudness alone decides, as before 2026-10-02.
+/// Load the voice detector if it is not already, and say whether one is in use.
+pub fn load_voice_detector_loaded() -> bool {
+    static LOADED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LOADED.get_or_init(|| {
+        load_voice_detector();
+        hvtt_core::audio::detector_in_use()
+    })
+}
+
+pub fn load_voice_detector() {
+    use whisper_rs::{WhisperVadContext, WhisperVadContextParams, WhisperVadParams};
+    let file = hvtt_core::models::VOICE_DETECTOR.file;
+    let Some(path) = engine_whisper::WhisperEngine::expected_path(file).filter(|p| p.exists()) else {
+        eprintln!("[hvtt] no voice detector ({file}); loudness alone decides");
+        return;
+    };
+    let mut params = WhisperVadContextParams::new();
+    params.set_n_threads(2);
+    let Ok(context) = WhisperVadContext::new(&path.to_string_lossy(), params) else {
+        eprintln!("[hvtt] the voice detector did not load");
+        return;
+    };
+    let context = Mutex::new(context);
+    hvtt_core::audio::use_detector(Box::new(move |samples: &[f32]| {
+        // Too little to judge: let loudness decide.
+        if samples.len() < 8_000 {
+            return None;
+        }
+        let mut vad = WhisperVadParams::new();
+        // Speech parted by 0.1 s of quiet is two stretches; no padding, so gaps are true gaps.
+        vad.set_min_silence_duration(100);
+        vad.set_speech_pad(0);
+        let segments = context.lock().segments_from_samples(vad, samples).ok()?;
+        // whisper.cpp gives these in hundredths of a second.
+        Some(segments.map(|s| (s.start / 100.0, s.end / 100.0)).collect())
+    }));
+}
+
+/// Load `file` and make it the one dictation uses. Until it is ready, the model already loaded
+/// keeps working. One chosen from the menu (`chosen`) is remembered only once it has loaded; if it
+/// cannot be, the one in use stays and the reason comes back. At startup (`chosen` false) there is
+/// no other, so the reason is what the menu and the box show.
+fn load_model_now(app: &AppHandle, file: &str, chosen: bool) -> Result<(), String> {
+    let state: State<App> = app.state();
+    let Some(path) = engine_whisper::WhisperEngine::expected_path(file) else {
+        let why = "No application data directory available.".to_string();
+        *state.engine_status.lock() = why.clone();
+        push(app);
+        return Err(why);
+    };
+    let before = state.engine_status.lock().clone();
+    *state.engine_status.lock() = format!("Loading {file}…");
+    push(app);
+
+    let loaded = engine_whisper::WhisperEngine::load(&path);
+    let result = match loaded {
+        Ok(engine) => {
+            let mut changes = state.model_changes.lock();
+            *changes += 1;
+            *state.engine_status.lock() = engine.name().to_string();
+            *state.engine.lock() = Some(Arc::new(engine));
+            // An offer made for the model before no longer applies.
+            if state.offered_model.lock().take().is_some() {
+                let mut update = state.update.lock();
+                if update.as_ref().is_some_and(|v| v.stage == "offer") {
+                    *update = None;
+                }
+            }
+            if chosen {
+                update_settings(app, |s| s.model = file.to_string());
+            }
+            drop(changes);
+            Ok(())
+        }
+        Err(e) if chosen && state.engine.lock().is_some() => {
+            *state.engine_status.lock() = before;
+            Err(e.to_string())
+        }
+        Err(e) => {
+            *state.engine_status.lock() = e.to_string();
+            Err(e.to_string())
+        }
+    };
+    push(app);
+    result
+}
+
+/// H › Settings › Speech Model: use one that is here, or download it first - once, and kept only
+/// if it is exactly the published file. The work is reserved here, before anything starts, and
+/// released only once the model is in use and remembered, so two choices can never overlap.
+///
+/// `offer`: chosen from the speed check's offer, made under that count of model changes. It is
+/// followed only if no model changed since - checked and the work reserved in one turn, so a model
+/// he chose meanwhile is never undone by it (Codex's nineteenth review) - and the model is timed
+/// once it is ready. Returns whether the work was taken on.
+fn choose_model(app: &AppHandle, model: &'static hvtt_core::models::Model, offer: Option<u64>) -> bool {
+    let state: State<App> = app.state();
+    if state.session.lock().is_dictating() {
+        return false;
+    }
+    let here = model_on_this_computer(model);
+    if here && state.settings.lock().model == model.file && state.engine.lock().is_some() {
+        return false;
+    }
+    // An update being checked or fetched has the box: one download at a time.
+    if !here
+        && matches!(state.update.lock().as_ref(), Some(v) if matches!(v.stage, "checking" | "downloading" | "installing"))
+    {
+        reveal_composer(app);
+        return false;
+    }
+    let dir = hvtt_core::paths::models_dir();
+    if !here && dir.is_none() {
+        return false;
+    }
+    {
+        let changes = offer.map(|_| state.model_changes.lock());
+        if changes.as_deref().zip(offer).is_some_and(|(now, then)| *now != then) {
+            return false;
+        }
+        let mut work = state.model_work.lock();
+        if work.is_some() {
+            return false;
+        }
+        *work = Some(ModelWork { file: model.file.to_string(), downloading: !here });
+    }
+    push(app);
+
+    let size = hvtt_core::models::megabytes(model.bytes);
+    if !here {
+        show_update(
+            app,
+            "downloading",
+            format!("Downloading the {} speech model…", model.name),
+            format!("0% of {size}. You can keep dictating meanwhile."),
+        );
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let failed = |title: &str, why: String| show_update(&app, "failed", title.into(), why);
+        let mut fetched = true;
+        if let Some(dir) = dir.filter(|_| !here) {
+            let progress = {
+                let app = app.clone();
+                let size = size.clone();
+                move |got: u64| {
+                    let state: State<App> = app.state();
+                    if let Some(view) = state.update.lock().as_mut().filter(|v| v.stage == "downloading") {
+                        view.detail = format!(
+                            "{}% of {size}. You can keep dictating meanwhile.",
+                            got.saturating_mul(100) / model.bytes
+                        );
+                    }
+                    push(&app);
+                }
+            };
+            match update::download_model(model, &dir, progress) {
+                Err(why) => {
+                    failed("Couldn't download the speech model", why);
+                    fetched = false;
+                }
+                Ok(_) => {
+                    let state: State<App> = app.state();
+                    if let Some(view) = state.update.lock().as_mut() {
+                        view.detail = "Downloaded and checked. Getting it ready…".into();
+                    }
+                    // Still reserved: from downloading to loading, never free in between.
+                    *state.model_work.lock() = Some(ModelWork { file: model.file.to_string(), downloading: false });
+                    push(&app);
+                }
+            }
+        }
+        if fetched {
+            match load_model_now(&app, model.file, true) {
+                Err(why) => failed("Couldn't switch the speech model", why),
+                // A download is announced, and the announcement leaves by itself; a model that
+                // was already here just switches - the menu shows it.
+                Ok(()) if !here => {
+                    show_update(
+                        &app,
+                        "current",
+                        format!("The {} speech model is ready", model.name),
+                        "Your words use it from now on.".into(),
+                    );
+                    hide_update_after(&app, std::time::Duration::from_millis(2600));
+                }
+                Ok(()) => {}
+            }
+        }
+        let switched = fetched && app.state::<App>().settings.lock().model == model.file;
+        *app.state::<App>().model_work.lock() = None;
+        push(&app);
+        // Chosen from the speed check's offer: measure it, rather than trust the estimate.
+        if offer.is_some() && switched {
+            speed_check(&app, true);
+        }
+    });
+    true
+}
+
+/// After the stop press, keep the microphone open until he has stopped talking: at least 0.1 s
+/// (sound still on its way from the device), then until the last 0.25 s are back down to the
+/// room, at most 1.2 s. A quick dictation is often stopped on its last syllable; cutting the last
+/// 0.2 s doubled the words wrong (measured 2026-10-01, `hvtt_core::audio::voice_has_stopped`).
+/// Widened from 0.15 s / 0.6 s after Codex's sixth review found a soft ending cut: a little more
+/// time at the stop, for the last consonant - his priority.
+fn wait_for_quiet(rec: &recorder::Recording, careful: bool) {
+    let started = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    while started.elapsed() < std::time::Duration::from_millis(1200) {
+        // The last few seconds: enough to know the room and how he was speaking.
+        let recent = rec.peek_from(rec.recorded_len().saturating_sub(6 * 16_000));
+        if hvtt_core::audio::voice_has_stopped(&recent, 0.25, careful) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    eprintln!("[hvtt] listened {} ms past the stop press", started.elapsed().as_millis());
+}
+
+/// One update check, and one speed check, at a time.
+static UPDATE_WORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SPEED_WORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A speed check was asked for, so its result is said even if all is well.
+static SPEED_ANNOUNCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Clears a reservation when its work ends, however it ends.
+struct Released(&'static std::sync::atomic::AtomicBool);
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The speed check: one short test recognition with the model in use, timed - and settings
+/// adjusted to it (`models::speed_advice`). Run by itself when the program opens on a new version
+/// or model, and from H › Settings › Check This Computer's Speed (`announce`: always say the
+/// result). No microphone: three seconds of faint made-up sound, twice - the first readies the
+/// graphics processor, the second is timed (from when it has the engine, not while waiting).
+///
+/// Dictation comes first (Codex's seventeenth review): it waits while he dictates or a model
+/// loads, gives up part-way if a dictation starts (the live epoch), and applies nothing if the
+/// model changed meanwhile; Live Words is changed only if it is still "As You Talk".
+fn speed_check(app: &AppHandle, announce: bool) {
+    // Asked for while one runs: that one says its result (Codex's nineteenth review).
+    if announce {
+        SPEED_ANNOUNCE.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    if SPEED_WORK.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let _work = Released(&SPEED_WORK);
+        let state: State<App> = app.state();
+        let busy = |state: &App| {
+            let session = state.session.lock();
+            session.is_dictating() || matches!(*session, SessionState::Transcribing)
+        };
+        let asked = || SPEED_ANNOUNCE.load(std::sync::atomic::Ordering::SeqCst);
+        let current_epoch = || state.live_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let sound: Vec<f32> = (0..48_000u32).map(|i| 0.002 * (((i.wrapping_mul(2_654_435_761)) >> 16) as f32 / 65_536.0 - 0.5)).collect();
+        // Waits at most two minutes for the program to be free; the check made on opening is
+        // tried again next time (Codex's eighteenth review). Interrupted by a dictation or a model
+        // change, it waits and measures again - whatever model is then in use.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let (result, model_file, measured_under, changes) = loop {
+            // Read before looking: a dictation that starts after this counts again once it shows
+            // as recording, so it can never go unnoticed (`start_recording`).
+            let mut epoch = current_epoch();
+            loop {
+                let free = !busy(&state) && state.model_work.lock().is_none();
+                if free && std::time::Instant::now() <= deadline {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    eprintln!("[hvtt] speed check: never free, skipped");
+                    if asked() {
+                        SPEED_ANNOUNCE.store(false, std::sync::atomic::Ordering::SeqCst);
+                        speed_notice(&app, notice("Couldn't check the speed just now",
+                            "It waits for dictation and model changes to finish. Try again in a moment.".into()), Some(8000));
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                epoch = current_epoch();
+            }
+            let measured_under = *state.model_changes.lock();
+            let Some(engine) = state.engine.lock().clone() else { return };
+            let model_file = state.settings.lock().model.clone();
+            let give_up = Some(hvtt_core::engine::GiveUp { counter: state.live_epoch.clone(), value: epoch });
+            let request = TranscriptionRequest { samples: sound.clone(), vocabulary_prompt: None, give_up, provisional: false };
+            let warm = engine.transcribe(&request);
+            let timed = if current_epoch() == epoch && warm.is_ok() { engine.transcribe(&request) } else { warm };
+            if current_epoch() != epoch {
+                continue;
+            }
+            let Ok(result) = timed else {
+                if asked() {
+                    SPEED_ANNOUNCE.store(false, std::sync::atomic::Ordering::SeqCst);
+                    speed_notice(&app, notice("Couldn't check the speed",
+                        "The speech model could not run the test. Try again, or choose another model.".into()), Some(8000));
+                }
+                return;
+            };
+            // Decided and shown while no model can change: a dictation begun, or another model in
+            // use, and this measurement means nothing now.
+            let changes = state.model_changes.lock();
+            let same_engine = state.engine.lock().as_ref().is_some_and(|now| Arc::ptr_eq(now, &engine));
+            if current_epoch() != epoch || *changes != measured_under || !same_engine || state.settings.lock().model != model_file {
+                continue;
+            }
+            break (result, model_file, measured_under, changes);
+        };
+        let announce = SPEED_ANNOUNCE.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let ms = result.elapsed_ms;
+        let secs = |ms: u128| format!("{:.1} s", ms as f32 / 1000.0);
+        let key = format!("{} {model_file}", app.package_info().version);
+        update_settings(&app, |s| s.speed_checked = key);
+        let current = hvtt_core::models::find(&model_file);
+        let name = current.map_or("this model", |m| m.name);
+        eprintln!("[hvtt] speed check: {name} takes {ms} ms here");
+        let lighter = |app: &AppHandle| {
+            update_settings(app, |s| {
+                if s.live_words == LiveWords::AsYouTalk {
+                    s.live_words = LiveWords::Lighter;
+                }
+            });
+        };
+        use hvtt_core::models::SpeedAdvice;
+        let (view, hide_after) = match hvtt_core::models::speed_advice(ms) {
+            SpeedAdvice::Fine if announce => (Some(notice("This computer is quick enough",
+                format!("A short test with {name} took {}. Nothing needs changing.", secs(ms)))), Some(5000)),
+            SpeedAdvice::Fine => (None, None),
+            SpeedAdvice::Lighter => {
+                lighter(&app);
+                (Some(notice("Set up for this computer", format!(
+                    "A short test with {name} took {}, so the words shown while you talk refresh less often \
+                     (H › Settings › Live Words). Your words are just as accurate.", secs(ms)))), Some(8000))
+            }
+            SpeedAdvice::Smaller => match current.and_then(|c| hvtt_core::models::faster_choice(c, ms)) {
+                Some((offer, estimate)) => {
+                    let download = if model_on_this_computer(offer) {
+                        String::new()
+                    } else {
+                        format!(" ({} download)", hvtt_core::models::megabytes(offer.bytes))
+                    };
+                    // Forgotten again below if the message cannot be shown.
+                    *state.offered_model.lock() = Some((offer, measured_under));
+                    (Some(UpdateView {
+                        stage: "offer",
+                        title: "This computer is slow for this model".into(),
+                        detail: format!("A short test with {name} took {}. {} should take roughly {} here \
+                            (an estimate, checked once you switch) - {}{download}.",
+                            secs(ms), offer.name, secs(estimate), offer.note),
+                        action: Some(format!("Switch to {}", offer.name)),
+                    }), None)
+                }
+                None => {
+                    lighter(&app);
+                    (announce.then(|| notice("This computer is slow", format!(
+                        "A short test with {name} took {}. The words shown while you talk now refresh less often.", secs(ms)))), Some(8000))
+                }
+            },
+        };
+        let Some(view) = view else {
+            drop(changes);
             push(&app);
             return;
         };
-
-        *state.engine_status.lock() = format!("Loading {model_file}…");
-        push(&app);
-
-        match engine_whisper::WhisperEngine::load(&path) {
-            Ok(engine) => {
-                *state.engine_status.lock() = engine.name().to_string();
-                *state.engine.lock() = Some(Arc::new(engine));
-            }
-            Err(e) => {
-                *state.engine_status.lock() = e.to_string();
-            }
+        let offering = view.stage == "offer";
+        if !speed_notice(&app, view, hide_after) && offering {
+            *state.offered_model.lock() = None;
         }
-        push(&app);
+        drop(changes);
     });
+}
+
+/// Show a speed-check message: checked and shown in one turn of the update lock, never over an
+/// update being checked, fetched or offered (Codex's eighteenth review). Whether it was shown.
+fn speed_notice(app: &AppHandle, view: UpdateView, hide_after: Option<u64>) -> bool {
+    let state: State<App> = app.state();
+    let shown = {
+        let mut update = state.update.lock();
+        let busy = update.as_ref().is_some_and(|v| matches!(v.stage, "checking" | "downloading" | "installing" | "ready"));
+        if !busy {
+            *update = Some(view);
+        }
+        !busy
+    };
+    if shown {
+        if !state.session.lock().is_dictating() {
+            reveal_composer(app);
+        }
+        if let Some(ms) = hide_after {
+            hide_update_after(app, std::time::Duration::from_millis(ms));
+        }
+    }
+    push(app);
+    shown
+}
+
+/// A speed-check message with no button.
+fn notice(title: &str, detail: String) -> UpdateView {
+    UpdateView { stage: "current", title: title.into(), detail, action: None }
+}
+
+/// The speed check's offer, accepted: the smaller model, downloaded if need be.
+#[tauri::command]
+fn accept_offer(app: AppHandle) {
+    let state: State<App> = app.state();
+    // Only while the offer is what the box shows: a message that replaced it (a ready update) is
+    // never cleared by a late click (Codex's nineteenth review).
+    if !state.update.lock().as_ref().is_some_and(|v| v.stage == "offer") {
+        *state.offered_model.lock() = None;
+        return;
+    }
+    let Some((model, measured_under)) = *state.offered_model.lock() else { return };
+    // Made for a model no longer in use, it is not followed (Codex's eighteenth review).
+    if choose_model(&app, model, Some(measured_under)) {
+        *state.offered_model.lock() = None;
+        let mut update = state.update.lock();
+        if update.as_ref().is_some_and(|v| v.stage == "offer") {
+            *update = None;
+        }
+    }
+    push(&app);
 }
 
 pub fn run() {
@@ -2131,7 +2964,11 @@ pub fn run() {
         session: Mutex::new(SessionState::Idle),
         transcript: Mutex::new(Transcript::empty()),
         recording: Mutex::new(None),
+        prepared: Mutex::new(None),
         engine: Mutex::new(None),
+        model_work: Mutex::new(None),
+        offered_model: Mutex::new(None),
+        model_changes: Mutex::new(0),
         engine_status: Mutex::new("Starting…".into()),
         settings: Mutex::new(settings),
         drafts: DraftStore::at_default_location(),
@@ -2185,6 +3022,7 @@ pub fn run() {
             open_accessibility_settings,
             finish_rebind,
             open_update,
+            accept_offer,
             box_input,
             pause_resume,
             send,
@@ -2284,7 +3122,7 @@ pub fn run() {
                     format!("Updated to version {version}"),
                     "Your settings are as you left them.".into(),
                 );
-                hide_after(&handle, std::time::Duration::from_millis(3000));
+                hide_update_after(&handle, std::time::Duration::from_millis(3000));
             }
             // The installer did not finish, and the update's watcher started this copy again.
             if std::env::args().any(|a| a == "--update-failed") {
@@ -2296,10 +3134,38 @@ pub fn run() {
                     "The update didn't finish".into(),
                     format!("You're still on version {version}. Check for Updates to try again."),
                 );
-                hide_after(&handle, std::time::Duration::from_millis(6000));
+                hide_update_after(&handle, std::time::Duration::from_millis(6000));
             }
 
             spawn_engine_load(app.handle().clone());
+            // Recordings are no longer kept (his decision, 2026-10-03): the ones it made while it
+            // kept the last five are deleted - at most five files, so done here, before anything
+            // could close the program - and nothing else in that folder.
+            // Not filtered first: a folder that cannot even be looked at is reported (Codex's 23rd review).
+            if let Some(dir) = hvtt_core::paths::recordings_dir() {
+                match hvtt_core::paths::remove_old_recordings(&dir) {
+                    Ok((0, 0)) => {}
+                    Ok((deleted, 0)) => eprintln!("[hvtt] old recordings deleted: {deleted}"),
+                    Ok((deleted, stuck)) => eprintln!(
+                        "[hvtt] old recordings: {deleted} deleted, {stuck} could not be - may remain in {}",
+                        dir.display()
+                    ),
+                    Err(why) => eprintln!("[hvtt] old recordings not cleaned up, some may remain: {why}"),
+                }
+            }
+            // Once, quietly, a little after opening - out of the way of loading the model.
+            if app.state::<App>().settings.lock().check_updates_on_start {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    let state: State<App> = handle.state();
+                    // Switched off meanwhile: no request at all (Codex's seventeenth review).
+                    let wanted = state.settings.lock().check_updates_on_start;
+                    if wanted && !state.session.lock().is_dictating() {
+                        check_for_updates_how(&handle, true);
+                    }
+                });
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -2360,4 +3226,30 @@ extern "C" {
 fn leave_now(app: &AppHandle) -> ! {
     app.cleanup_before_exit();
     unsafe { _exit(0) }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    /// Codex's fourteenth review: a slow save of one change let another change made meanwhile be
+    /// undone. In one turn, both stay.
+    #[test]
+    fn two_settings_changed_at_once_both_stay() {
+        let settings = std::sync::Arc::new(Mutex::new(Settings::default()));
+        let model = {
+            let settings = settings.clone();
+            std::thread::spawn(move || {
+                change_settings(&settings, |s| s.model = "ggml-small.en.bin".into(), |_| {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                });
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        change_settings(&settings, |s| s.keep_drafts = false, |_| {});
+        model.join().unwrap();
+        let s = settings.lock();
+        assert_eq!(s.model, "ggml-small.en.bin");
+        assert!(!s.keep_drafts, "switched off, and stays off");
+    }
 }
