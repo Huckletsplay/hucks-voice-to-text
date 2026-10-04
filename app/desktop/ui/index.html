@@ -48,6 +48,12 @@
       <!-- One line, never a dialog. -->
       <p class="note" id="note" hidden></p>
 
+      <!-- A finished dictation the clipboard would not take: its words stay above, to copy. -->
+      <section class="permission" id="unsaved-actions" hidden>
+        <button id="words-copy" class="primary">Copy</button>
+        <button id="words-discard" class="quiet" hidden>Discard</button>
+      </section>
+
       <!-- Check for Updates: only once a verified download is waiting. -->
       <section class="permission" id="update-actions" hidden>
         <button id="update-open" class="primary">Open Update</button>

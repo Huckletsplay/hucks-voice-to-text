@@ -33,6 +33,10 @@ pub struct Request {
     pub cmd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Which pin this request is about (`ChromiumDestination`): the extension answers only for
+    /// the pin it names. Left out by `request`, for an extension from before pins had names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +123,13 @@ impl Bridge {
     pub fn request(&self, cmd: &str, text: Option<String>, timeout: Duration)
         -> Result<Value, BridgeError>
     {
+        self.request_for(cmd, text, None, timeout)
+    }
+
+    /// `request`, about one named pin.
+    pub fn request_for(&self, cmd: &str, text: Option<String>, pin: Option<u64>, timeout: Duration)
+        -> Result<Value, BridgeError>
+    {
         let (id, rx) = {
             let mut inner = self.inner.lock().unwrap();
             if !inner.connected {
@@ -129,7 +140,7 @@ impl Bridge {
             let (tx, rx): (Sender<Value>, Receiver<Value>) = channel();
             inner.pending.insert(id, tx);
 
-            let req = Request { id, cmd: cmd.to_string(), text };
+            let req = Request { id, cmd: cmd.to_string(), text, pin };
             let line = serde_json::to_string(&req)
                 .map_err(|e| BridgeError::Transport(e.to_string()))?;
             let writer = inner.writer.as_mut().ok_or(BridgeError::NotConnected)?;

@@ -14,9 +14,7 @@
 //   - if this page goes away nothing answers, and the desktop app treats silence as refusal.
 
 (() => {
-  let pinned = null;            // { el, docURL, pin }  pin: the name the app gave this pin
-  let offered = null;           // not a destination until the worker selects this page
-  let latestPin = null;         // retained after release, and reported on worker reconnect
+  let pinned = null;            // { el, docURL }
   let lastFocusedEditable = null;
   let port = null;
 
@@ -27,39 +25,19 @@
         /^(text|search|url|email|tel|password)$/i.test(el.type || "text")) ||
       el.isContentEditable);
 
-  // A text control is written through its value even inside an editable region, where it
-  // inherits `isContentEditable`: the rich-text write there would land in the region around it.
-  const isTextControl = (el) => el.tagName === "TEXTAREA" || el.tagName === "INPUT";
-  const isRichText = (el) => !!el.isContentEditable && !isTextControl(el);
-
-  // Editable is not enough to offer a box: the caret must be IN it. Two things look editable
-  // from here while the caret is somewhere this script cannot reach (Codex's thirteenth review):
-  //   - a frame inside an editable region inherits `isContentEditable`; the caret is in the
-  //     frame's own document, and a write here lands in the region around the frame;
-  //   - an editable element hosting a shadow tree is all the document shows of a box inside
-  //     that tree; a write here is appended to the host and reads back as success.
-  // `.shadowRoot` misses closed roots, so Chrome is asked. If it cannot be asked, the answer is
-  // unknown, and unknown makes no offer: the program pastes where the caret is instead.
-  const holdsTheCaret = (el) => {
-    if (!isEditable(el)) return false;
-    if (el.tagName === "IFRAME" || el.tagName === "FRAME") return false;
-    if (isTextControl(el)) return true;                // cannot host a page's shadow tree
-    try { return !chrome.dom.openOrClosedShadowRoot(el); } catch { return false; }
-  };
-
   document.addEventListener(
     "focusin",
     (e) => { if (isEditable(e.target)) lastFocusedEditable = e.target; },
     true
   );
 
-  const readValue = (el) => (isRichText(el) ? el.innerText ?? "" : el.value ?? "");
+  const readValue = (el) => (el.isContentEditable ? el.innerText ?? "" : el.value ?? "");
 
   const describe = (el) =>
     el.getAttribute?.("aria-label") ||
     el.getAttribute?.("placeholder") ||
     el.getAttribute?.("data-placeholder") ||
-    (isRichText(el) ? "text box" : el.tagName.toLowerCase());
+    (el.isContentEditable ? "text box" : el.tagName.toLowerCase());
 
   function liveness() {
     if (!pinned) return { alive: false, why: "nothing-pinned" };
@@ -76,7 +54,7 @@
   function write(el, text) {
     const before = readValue(el);
 
-    if (isRichText(el)) {
+    if (el.isContentEditable) {
       el.focus({ preventScroll: true });   // focus INSIDE the page; does not raise the window
       try {
         const sel = window.getSelection();
@@ -116,60 +94,20 @@
 
   function handle(req) {
     if (req.cmd === "pin") {
-      if (req.pin !== undefined) {
-        if (!Number.isSafeInteger(req.pin) || req.pin < 0 ||
-            (latestPin !== null && req.pin <= latestPin)) return null;
-        latestPin = req.pin;
-      }
-      offered = null;
-      if (!document.hasFocus()) return null;
-      // Which box? The one the caret is in, if this document can see it. The box he was in
-      // before (`lastFocusedEditable`) stands in ONLY when focus has fallen back to the page
-      // itself - nothing focused, or the body. When something else has it, the caret is
-      // somewhere this script cannot name: inside a frame (whose own script offers the real
-      // box), or inside a shadow tree, which the document shows only as its host. Offering the
-      // earlier box then sent his words to it (Codex's eleventh and twelfth reviews). Here the
-      // page stays silent instead; if nothing else answers, the program pastes where the caret is.
-      // Either way the box must pass `holdsTheCaret`, the remembered one included: `focusin`
-      // is retargeted to a shadow host, so an editable host can be what was remembered.
-      const active = document.activeElement;
-      const onThePage = !active || active === document.body || active === document.documentElement;
       const el =
-        (holdsTheCaret(active) && active) ||
-        (onThePage && holdsTheCaret(lastFocusedEditable) && lastFocusedEditable) ||
+        (isEditable(document.activeElement) && document.activeElement) ||
+        (document.hasFocus() && lastFocusedEditable) ||
         null;
       if (!el || !el.isConnected) return null;          // stay silent; another page may answer
-      offered = { el, docURL: location.href, pin: req.pin, id: req.id };
-      return { id: req.id, phase: "offered", pinProtocol: 1, pin: req.pin, ok: true };
-    }
-
-    if (req.cmd === "drop-pin") {
-      if (offered && offered.pin === req.pin) offered = null;
-      if (pinned && pinned.pin === req.pin) pinned = null;
-      return null;
-    }
-
-    if (req.cmd === "claim-pin") {
-      if (!offered || offered.id !== req.id || offered.pin !== req.pin ||
-          (req.pin !== undefined && latestPin !== req.pin)) return null;
-      // Use the reference captured by the offer, never whichever field is focused now.
-      pinned = offered;
-      offered = null;
+      pinned = { el, docURL: location.href };
       return {
         id: req.id,
-        phase: "claimed",
-        protocol: "owned-pin-v1",
-        pin: pinned.pin,
         ok: true,
-        target: { host: location.host, describe: describe(pinned.el) },
+        target: { host: location.host, describe: describe(el) },
       };
     }
 
     if (!pinned) return null;                            // not ours to answer
-    // Asked about a pin by name: only the page holding THAT pin answers. A status, a delivery or
-    // an unpin meant for another dictation's pin finds nothing here. (An app from before pins
-    // had names sends none, and is answered as it always was.)
-    if (req.pin !== undefined && pinned.pin !== req.pin) return null;
 
     if (req.cmd === "status") return { id: req.id, ...liveness() };
 
@@ -198,32 +136,22 @@
   // The service worker is terminated when idle, which breaks the port. Reconnecting keeps this
   // page reachable without the pin ever leaving the page.
   function connect() {
-    let connection;
     try {
-      connection = chrome.runtime.connect({ name: "hvtt-page" });
-      port = connection;
+      port = chrome.runtime.connect({ name: "hvtt-page" });
     } catch {
       setTimeout(connect, 2000);
       return;
     }
-    connection.onDisconnect.addListener(() => {
-      if (port === connection) { port = null; setTimeout(connect, 1000); }
-    });
-    connection.onMessage.addListener((req) => {
-      if (port !== connection) return;
+    port.onDisconnect.addListener(() => { port = null; setTimeout(connect, 1000); });
+    port.onMessage.addListener((req) => {
       if (!req || req.id === undefined) return;
       let res = null;
       try { res = handle(req); } catch (e) {
         res = { id: req.id, delivered: false, alive: false,
                 refused: "extension-error:" + String(e).slice(0, 60) };
       }
-      if (res) { try { connection.postMessage(res); } catch {} }
+      if (res && port) { try { port.postMessage(res); } catch {} }
     });
-    // Only committed ownership survives a worker restart. An offer is never announced.
-    try {
-      connection.postMessage({ type: "pin-state", pinProtocol: 1, held: !!pinned,
-                               pin: pinned?.pin, latestPin });
-    } catch {}
   }
   connect();
 })();

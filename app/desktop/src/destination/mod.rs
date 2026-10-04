@@ -25,6 +25,30 @@ pub mod windows_uia;
 
 pub mod chromium;
 
+/// Can a paste send his words? Only if they are on the clipboard the paste keys read: put there
+/// for the paste by a borrow (`borrow`, Huck's Clipboard chosen - a borrow that fails stops the
+/// paste by itself), or by the copy the pipeline made just before (`copied`). Otherwise the keys
+/// send whatever he had copied earlier.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+pub(crate) fn words_are_there_to_paste(borrow: bool, copied: bool) -> bool {
+    borrow || copied
+}
+
+/// The last rung of a destination that writes the text itself (`windows_uia`, `macos_ax`): its
+/// silent writes failed, and a paste is allowed while nothing has moved since the keypress. The
+/// paste is told whether the clipboard copy was made, exactly as if the pipeline had called it.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+pub(crate) fn fall_back_to_paste(
+    paste: Option<&dyn hvtt_core::pipeline::Destination>,
+    text: &str,
+    copied: bool,
+) -> Result<(), hvtt_core::pipeline::DeliveryError> {
+    match paste {
+        Some(paste) if paste.is_alive().is_alive() => paste.deliver(text, copied),
+        _ => Err(hvtt_core::pipeline::DeliveryError::NotVerified),
+    }
+}
+
 /// Why a pin attempt did not produce a destination. Each maps to one short, plain sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinError {
@@ -137,6 +161,66 @@ pub fn is_unsupported_executable(exe: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hvtt_core::pipeline::{DeliveryError, Destination, Liveness};
+    use std::sync::Mutex;
+
+    /// The paste rung as it behaves: no words on the clipboard, no paste.
+    struct Paste {
+        borrow: bool,
+        alive: bool,
+        pasted: Mutex<Vec<String>>,
+    }
+    impl Paste {
+        fn new(borrow: bool, alive: bool) -> Self {
+            Paste { borrow, alive, pasted: Mutex::new(vec![]) }
+        }
+    }
+    impl Destination for Paste {
+        fn label(&self) -> String {
+            "a paste".into()
+        }
+        fn is_alive(&self) -> Liveness {
+            if self.alive { Liveness::Alive } else { Liveness::dead("moved") }
+        }
+        fn deliver(&self, text: &str, copied: bool) -> Result<(), DeliveryError> {
+            if !words_are_there_to_paste(self.borrow, copied) {
+                return Err(DeliveryError::Other("the clipboard did not take the words".into()));
+            }
+            self.pasted.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    /// Codex's sixth review: the guard against pasting from a copy that failed asked only the
+    /// outermost destination. One that writes the text itself answered "no clipboard needed",
+    /// its silent writes failed, and it fell back to a paste - of whatever he had copied before.
+    #[test]
+    fn a_fallback_paste_is_never_made_from_a_copy_that_failed() {
+        let paste = Paste::new(false, true);
+        let fell = fall_back_to_paste(Some(&paste), "his words", false);
+        assert!(fell.is_err(), "refused, and not reported as sent");
+        assert!(paste.pasted.lock().unwrap().is_empty(), "nothing was pasted");
+
+        // The copy made: the fallback pastes, as it always has.
+        assert!(fall_back_to_paste(Some(&paste), "his words", true).is_ok());
+        assert_eq!(*paste.pasted.lock().unwrap(), vec!["his words".to_string()]);
+    }
+
+    #[test]
+    fn a_fallback_paste_still_needs_nothing_to_have_moved_and_a_paste_to_fall_back_to() {
+        let moved = Paste::new(false, false);
+        assert_eq!(fall_back_to_paste(Some(&moved), "his words", true), Err(DeliveryError::NotVerified));
+        assert!(moved.pasted.lock().unwrap().is_empty());
+        assert_eq!(fall_back_to_paste(None, "his words", true), Err(DeliveryError::NotVerified));
+    }
+
+    #[test]
+    fn a_paste_has_his_words_only_from_a_borrow_or_from_the_copy() {
+        assert!(words_are_there_to_paste(false, true), "the normal clipboard, copied");
+        assert!(!words_are_there_to_paste(false, false), "the normal clipboard, copy failed: his old clipboard");
+        assert!(words_are_there_to_paste(true, false), "Huck's Clipboard: the paste borrows for itself");
+        assert!(words_are_there_to_paste(true, true));
+    }
 
     #[test]
     fn unsupported_apps_are_phrased_as_normal_not_as_failure() {

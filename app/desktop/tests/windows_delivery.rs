@@ -94,7 +94,7 @@ fn windows_delivery_survives_leaving_notepad_and_is_refused_once_it_closes() {
 
         // 3. Delivery: silent, into Notepad, with the other window still in front.
         let started = Instant::now();
-        dest.deliver("Huck was here.").expect("the silent write lands and reads back");
+        dest.deliver("Huck was here.", true).expect("the silent write lands and reads back");
         eprintln!("delivered in {} ms", started.elapsed().as_millis());
         let edit = unsafe { FindWindowExW(Some(window), None, windows::core::w!("Edit"), None) }
             .expect("Notepad's text box");
@@ -185,5 +185,5 @@ fn windows_delivery_is_refused_after_the_window_closes() {
     std::thread::sleep(Duration::from_millis(300));
 
     assert!(!dest.is_alive().is_alive(), "a closed window's text box is dead");
-    assert!(dest.deliver("must land nowhere").is_err(), "and nothing is written anywhere");
+    assert!(dest.deliver("must land nowhere", true).is_err(), "and nothing is written anywhere");
 }

@@ -393,7 +393,7 @@ impl Destination for AxDestination {
         }
     }
 
-    fn deliver(&self, text: &str) -> Result<(), DeliveryError> {
+    fn deliver(&self, text: &str, copied: bool) -> Result<(), DeliveryError> {
         let before = self.value().unwrap_or_default();
 
         // Politest first: insert at the caret without rewriting the field.
@@ -417,10 +417,9 @@ impl Destination for AxDestination {
 
         // Both silent strategies failed. A paste delivers to whatever is focused now, so it is
         // only allowed while nothing has moved since the keypress - then that is still this field.
-        match &self.paste {
-            Some(paste) if paste.is_alive().is_alive() => paste.deliver(text),
-            _ => Err(DeliveryError::NotVerified),
-        }
+        // The writes above put the text in themselves and need no clipboard; the paste does,
+        // so it is told whether the copy was made (`fall_back_to_paste`).
+        super::fall_back_to_paste(self.paste.as_ref().map(|p| p as &dyn Destination), text, copied)
     }
 }
 

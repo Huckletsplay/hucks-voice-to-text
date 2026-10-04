@@ -1,7 +1,10 @@
 # Download a Whisper model into the Windows app-data directory - the twin of fetch-model.sh.
 #
-#   app\scripts\fetch-model.ps1 [model]      no model: large-v3-turbo-q5_0 ("Best", the built-in
-#                                             default) and the voice detector silero-v5.1.2
+#   app\scripts\fetch-model.ps1 [model]      no model: base.en ("Quick", the one built in on
+#                                             Windows) and the voice detector silero-v5.1.2
+#
+#   Or one of: tiny.en ("Tiny"), base.en ("Quick"), small.en ("Better"), medium.en-q5_0 ("Medium"),
+#   large-v3-turbo-q5_0 ("Best"), large-v3-q5_0 ("Large"), silero-v5.1.2.
 #
 # Models live in %LOCALAPPDATA%\Huck's Voice to Text\models, never in the project and never on
 # the SSD: the program must keep working with the drive unplugged. They are MIT licensed, from
@@ -11,7 +14,7 @@ param([string] $Model = '')
 
 $ErrorActionPreference = 'Stop'
 if ($Model -eq '') {
-    & $PSCommandPath 'large-v3-turbo-q5_0'
+    & $PSCommandPath 'base.en'
     & $PSCommandPath 'silero-v5.1.2'
     exit 0
 }

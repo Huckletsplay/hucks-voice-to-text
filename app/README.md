@@ -52,9 +52,10 @@ scripts/release.sh --unsigned-beta  # the public DMG and its checksum, in ../art
 On **Windows** the same steps are PowerShell scripts:
 
 ```powershell
-scripts\fetch-model.ps1             # "Best" (~574 MB) and the voice detector, into %LOCALAPPDATA%\Huck's Voice to Text\models
+scripts\fetch-model.ps1             # "Quick" (~148 MB) and the voice detector, into %LOCALAPPDATA%\Huck's Voice to Text\models
 scripts\install.ps1                 # release build, installed to %LOCALAPPDATA%\Programs\HucksVoiceToText
 scripts\dev.ps1 build | run | test  # development; `dev.ps1 test --ignored` adds the on-purpose tests
+scripts\dev.ps1 bench <corpus> <model.bin> clean:sinc:engine   # accuracy and timing, as on the Mac
 ```
 
 `dev.ps1` finds CMake and libclang in the Build Tools and sets whisper.cpp's MSVC Release flags
@@ -67,7 +68,8 @@ The release DMG carries the speech model inside the app (`Contents/Resources/mod
 whisper.cpp's Silero voice detector (`ggml-silero-v5.1.2.bin`, `hvtt_core::models::VOICE_DETECTOR`)
 beside it - it tells quiet speech from noise and finds where speech ends; without it, loudness
 alone decides. A model in Application Support is preferred when present. Its file names are the contract with the in-app
-updater in `desktop/src/update.rs`.
+updater in `desktop/src/update.rs`. The Windows installer carries its own built-in model, *Quick*,
+and the same voice detector in `models\` beside the program.
 
 **Measuring accuracy.** `python3 scripts/make-accuracy-corpus.py <dir>` (macOS: `say`, `ffmpeg`, numpy)
 writes 164 quick phrases in twelve voices at fast speaking rates, trimmed tight as a quick
@@ -87,7 +89,7 @@ and window, and `engine` - exactly what the program does).
 | Change a shortcut | H › Settings › Shortcuts, pick one, press the new keys (Esc cancels) |
 | Recovery drafts | H › Settings › Keep Recovery Drafts, and Open Drafts Folder |
 | Recordings | None: a dictation's sound is held in memory until it is recognised, never written to disk. (The last five were kept from 2026-10-01 to 10-03; when it opens, the program deletes the recording files it made there - only those, by their exact names - and the app-data `recordings/` folder once it is empty.) |
-| Speech model | H › Settings › Speech Model, six choices, each line showing accuracy and speed (dots out of five) and its size: *Tiny* (tiny.en), *Quick* (base.en), *Better* (small.en), *Medium* (medium.en, 5-bit), *Best* (large-v3-turbo, 5-bit), *Large* (large-v3, 5-bit) - *Best* built in on both platforms (Windows until tested there). One not on the computer is downloaded once - the whisper.cpp project's files, pinned to one commit - and kept only if its size and SHA-256 are the ones in `core/src/models.rs` |
+| Speech model | H › Settings › Speech Model, six choices, each line showing accuracy and speed (dots out of five) and its size: *Tiny* (tiny.en), *Quick* (base.en), *Better* (small.en), *Medium* (medium.en, 5-bit), *Best* (large-v3-turbo, 5-bit), *Large* (large-v3, 5-bit) - *Best* built in on the Mac, *Quick* on Windows (which recognises on the processor alone: a quick phrase took 1.25 s with Quick, 4.1 s with Better and 20 s with Best on a six-core PC). One not on the computer is downloaded once - the whisper.cpp project's files, pinned to one commit - and kept only if its size and SHA-256 are the ones in `core/src/models.rs` |
 | Update | H › Settings › Check for Updates… — downloads this platform's newer release from GitHub (the DMG, or the Windows installer), checks its size and SHA-256, then offers to open it; on Windows the installer runs silently and starts the new copy |
 | Close the floating box | It leaves by itself; the × or `Esc` closes it early |
 
@@ -175,8 +177,9 @@ Never inside this repository:
 | `dirs` | MIT / Apache-2.0 | OS app-data paths |
 | `thiserror` | MIT / Apache-2.0 | Error types |
 
-Whisper model weights are MIT, converted by the whisper.cpp project; the release DMG and the
-Windows installer include `ggml-large-v3-turbo-q5_0.bin`. Updates are fetched with the system's own `curl` and checked with `shasum`
+Whisper model weights are MIT, converted by the whisper.cpp project; the release DMG includes
+`ggml-large-v3-turbo-q5_0.bin` and the Windows installer `ggml-base.en.bin`, each with the voice
+detector `ggml-silero-v5.1.2.bin` (MIT). Updates are fetched with the system's own `curl` and checked with `shasum`
 (Windows: `curl.exe` and `certutil`), so there is no HTTP or crypto crate. No code was copied from any third-party application.
 
 ## Licence

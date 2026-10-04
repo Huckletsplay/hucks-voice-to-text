@@ -1,4 +1,5 @@
-//! Mac exit decisions and copy ordering, without app, filesystem or clipboard access.
+//! Exit decisions and copy ordering, without app, filesystem or clipboard access. The same on
+//! macOS and Windows (until 2026-10-03 this was `mac_exit`, and Windows simply left).
 
 use parking_lot::{Mutex, MutexGuard};
 

@@ -25,8 +25,9 @@
 #     one - the program says so on older machines instead of crashing - and checks it did;
 #   - links the C runtime statically, so no Visual C++ Redistributable is needed, and checks it.
 #
-# The speech model goes inside the installer. It is taken from HVTT_RELEASE_MODEL, or else this
-# PC's app-data copy (app\scripts\fetch-model.ps1).
+# The speech model and the voice detector go inside the installer. They are taken from
+# HVTT_RELEASE_MODEL and HVTT_RELEASE_VAD, or else this PC's app-data copies
+# (app\scripts\fetch-model.ps1), and must be exactly the published files.
 
 param([switch] $UnsignedBeta)
 
@@ -44,14 +45,25 @@ $conf = Get-Content -LiteralPath (Join-Path $appDir 'desktop\tauri.conf.json') -
 $version = $conf.version
 $name = "HucksVoiceToText-$version-windows-x64-setup"
 $model = if ($env:HVTT_RELEASE_MODEL) { $env:HVTT_RELEASE_MODEL } else {
-    # "Best" is built in on Windows too, until he has tried it on the PC (hvtt_core::models, 2026-10-02).
-    Join-Path $env:LOCALAPPDATA "Huck's Voice to Text\models\ggml-large-v3-turbo-q5_0.bin"
+    # "Quick" is the one built in on Windows (hvtt_core::models): on the processor alone "Best"
+    # took 20 s for a quick phrase on this PC, Quick 1.25 s (measured 2026-10-03).
+    Join-Path $env:LOCALAPPDATA "Huck's Voice to Text\models\ggml-base.en.bin"
 }
 if (-not (Test-Path -LiteralPath $model)) { throw "No speech model at $model - run app\scripts\fetch-model.ps1" }
 # The published file, under the name startup asks for (hvtt_core::models).
-if ((Split-Path -Leaf $model) -ne 'ggml-large-v3-turbo-q5_0.bin') { throw "The speech model must be named ggml-large-v3-turbo-q5_0.bin." }
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath $model).Hash.ToLower() -ne '394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2') {
+if ((Split-Path -Leaf $model) -ne 'ggml-base.en.bin') { throw "The speech model must be named ggml-base.en.bin." }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $model).Hash.ToLower() -ne 'a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002') {
     throw "The speech model at $model is not the published file."
+}
+# The voice detector goes beside it (hvtt_core::models::VOICE_DETECTOR), as on the Mac: without
+# it, loudness alone decides where speech ends, and every stop press waits the full 1.2 s.
+$detector = if ($env:HVTT_RELEASE_VAD) { $env:HVTT_RELEASE_VAD } else {
+    Join-Path $env:LOCALAPPDATA "Huck's Voice to Text\models\ggml-silero-v5.1.2.bin"
+}
+if (-not (Test-Path -LiteralPath $detector)) { throw "No voice detector at $detector - run app\scripts\fetch-model.ps1" }
+if ((Split-Path -Leaf $detector) -ne 'ggml-silero-v5.1.2.bin') { throw "The voice detector must be named ggml-silero-v5.1.2.bin." }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $detector).Hash.ToLower() -ne '29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf') {
+    throw "The voice detector at $detector is not the published file."
 }
 $license = Join-Path $projectRoot 'LICENSE'
 $icon = Join-Path $appDir 'desktop\icons\icon.ico'
@@ -162,7 +174,7 @@ try {
     New-Item -ItemType Directory -Path $stage | Out-Null
     $stagedExe = Join-Path $stage 'HucksVoiceToText.exe'
     Copy-Item -LiteralPath $exe -Destination $stagedExe
-    & $inno /Qp ("/DAppVersion=$version") ("/DSourceExe=$stagedExe") ("/DSourceModel=$model") `
+    & $inno /Qp ("/DAppVersion=$version") ("/DSourceExe=$stagedExe") ("/DSourceModel=$model") ("/DSourceDetector=$detector") `
         ("/DSourceLicense=$license") ("/DOutputDir=$work") ("/DSetupIcon=$icon") (Join-Path $PSScriptRoot 'HucksVoiceToText.iss')
     if ($LASTEXITCODE -ne 0) { throw 'The installer did not compile.' }
     $installer = Join-Path $work "$name.exe"

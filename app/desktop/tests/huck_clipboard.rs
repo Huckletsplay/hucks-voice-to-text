@@ -23,8 +23,8 @@ fn huck_clipboard_holds_its_own_text() {
 
 /// Codex's review of 0.1.6: two pastes inside the half second the first has his clipboard on loan
 /// used to lose it - the second took the first one's words for "what he had" and gave *those*
-/// back. The unit tests prove it on private pasteboards; this is the real one.
-#[cfg(target_os = "macos")]
+/// back. The unit tests prove it on private pasteboards; this is the real one - on Windows too,
+/// whose borrows take turns the same way since 2026-10-03 (it has no private clipboard to test on).
 #[test]
 #[ignore]
 fn two_overlapping_pastes_put_back_his_own_clipboard() {

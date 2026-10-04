@@ -529,7 +529,14 @@ impl Destination for PasteDestination {
         }
     }
 
-    fn deliver(&self, text: &str) -> Result<(), DeliveryError> {
+    fn deliver(&self, text: &str, copied: bool) -> Result<(), DeliveryError> {
+        // The paste keys send what the clipboard holds. With the normal clipboard chosen that
+        // is the copy the pipeline made just before - and if that copy failed, it is whatever he
+        // had copied earlier. Refused here, in the one place every paste goes through, whoever
+        // calls it (a direct-write destination falling back to it included).
+        if !super::words_are_there_to_paste(self.borrow, copied) {
+            return Err(DeliveryError::Other("the clipboard did not take the words".into()));
+        }
         // Transcription took time in which he could have clicked away: refuse before touching his
         // clipboard at all.
         if self.gone().is_some() {

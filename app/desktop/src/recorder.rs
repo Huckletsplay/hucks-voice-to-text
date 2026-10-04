@@ -31,7 +31,8 @@ pub struct Recording {
 /// until then. The start of a quick dictation is where words were lost: missing the first 0.12 s
 /// took base.en from 6% to 23% of words wrong, and opening the microphone took about 0.17 s
 /// (Codex's sixth to eighth reviews ranked this first; an experiment from 2026-10-02, checked by
-/// hand with him: the macOS microphone dot, AirPods).
+/// hand with him: the macOS microphone dot, AirPods). On Windows it does not light the
+/// microphone sign either (`examples/mic_sign.rs`, 2026-10-03).
 pub struct Prepared {
     stream: cpal::Stream,
     buffer: Arc<Mutex<Buffer>>,

@@ -60,7 +60,16 @@ pub trait Destination: Send + Sync {
     fn is_alive(&self) -> Liveness;
 
     /// Write the text and confirm it landed. Implementations read the value back.
-    fn deliver(&self, text: &str) -> Result<(), DeliveryError>;
+    ///
+    /// `copied`: the clipboard copy `complete_transcription` has just made holds these words. It
+    /// is an argument, not a question asked of the destination, so that no implementation can
+    /// reach a paste without having been told: a paste sends whatever the clipboard holds, and
+    /// with the copy failed that is what he had copied before - into his text box, reported as
+    /// sent. A destination that writes the text itself may still do so; **any step of it that
+    /// presses the paste keys on the strength of that copy must refuse when `copied` is false**,
+    /// including a fallback inside a destination that normally writes directly (Codex's sixth
+    /// review of the 0.1.8 candidate: the first guard asked only the outermost destination).
+    fn deliver(&self, text: &str, copied: bool) -> Result<(), DeliveryError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,7 +169,7 @@ pub fn complete_transcription(
                     detail: Some(reason),
                 },
                 Liveness::Alive if text.trim().is_empty() => DeliveryOutcome::NotAttempted,
-                Liveness::Alive => match d.deliver(&text) {
+                Liveness::Alive => match d.deliver(&text, clipboard_ok) {
                     Ok(()) => DeliveryOutcome::Delivered { label },
                     Err(error) => DeliveryOutcome::Failed { label, error, detail: None },
                 },
@@ -246,19 +255,25 @@ mod tests {
         liveness: Liveness,
         result: Option<DeliveryError>,
         deliver_calls: RefCell<Vec<String>>,
+        /// Delivers by pressing the paste keys, relying on the clipboard copy.
+        pastes: bool,
+        /// What each call was told about the copy.
+        told_copied: RefCell<Vec<bool>>,
     }
     impl SpyDestination {
         fn alive() -> Self {
             SpyDestination { liveness: Liveness::Alive, result: None,
-                             deliver_calls: RefCell::new(vec![]) }
+                             deliver_calls: RefCell::new(vec![]), pastes: false,
+                             told_copied: RefCell::new(vec![]) }
+        }
+        fn pasting() -> Self {
+            SpyDestination { pastes: true, ..SpyDestination::alive() }
         }
         fn dead(reason: &str) -> Self {
-            SpyDestination { liveness: Liveness::dead(reason), result: None,
-                             deliver_calls: RefCell::new(vec![]) }
+            SpyDestination { liveness: Liveness::dead(reason), ..SpyDestination::alive() }
         }
         fn failing(e: DeliveryError) -> Self {
-            SpyDestination { liveness: Liveness::Alive, result: Some(e),
-                             deliver_calls: RefCell::new(vec![]) }
+            SpyDestination { result: Some(e), ..SpyDestination::alive() }
         }
         fn was_written_to(&self) -> bool { !self.deliver_calls.borrow().is_empty() }
     }
@@ -268,7 +283,12 @@ mod tests {
     impl Destination for SpyDestination {
         fn label(&self) -> String { "Slack - message box".into() }
         fn is_alive(&self) -> Liveness { self.liveness.clone() }
-        fn deliver(&self, text: &str) -> Result<(), DeliveryError> {
+        fn deliver(&self, text: &str, copied: bool) -> Result<(), DeliveryError> {
+            self.told_copied.borrow_mut().push(copied);
+            // As the real paste rung does: no copy, no paste.
+            if self.pastes && !copied {
+                return Err(DeliveryError::Other("nothing of his to paste".into()));
+            }
             self.deliver_calls.borrow_mut().push(text.to_string());
             match self.result.clone() { None => Ok(()), Some(e) => Err(e) }
         }
@@ -315,6 +335,39 @@ mod tests {
         assert!(!r.clipboard_ok);
         assert_eq!(r.text, "still here", "the transcript is never dropped");
         assert!(r.message.contains("still in the composer"), "got: {}", r.message);
+    }
+
+    #[test]
+    fn a_paste_is_never_made_from_a_clipboard_that_did_not_take_the_words() {
+        // The paste rung presses the paste keys and relies on the copy made just before it. With
+        // that copy failed, the keys would put whatever he had copied earlier into his text box,
+        // and the box would say "Sent". Every delivery is told whether the copy was made.
+        let clip = FakeClipboard::broken();
+        let dest = SpyDestination::pasting();
+        let r = complete_transcription(&Transcript::settled("not his old clipboard"), &clip,
+                                       Some(&dest), None);
+        assert_eq!(*dest.told_copied.borrow(), vec![false], "told the copy failed");
+        assert!(!dest.was_written_to(), "nothing may be pasted");
+        assert!(matches!(r.delivery, DeliveryOutcome::Failed { .. }), "and nothing is called sent");
+        assert!(!r.text_is_safe(), "the words are only in the box, and it must say so");
+
+        // The same destination, with the copy made: pasted as always.
+        let clip = FakeClipboard::working();
+        let dest = SpyDestination::pasting();
+        let r = complete_transcription(&Transcript::settled("his words"), &clip, Some(&dest), None);
+        assert_eq!(*dest.told_copied.borrow(), vec![true]);
+        assert!(dest.was_written_to());
+        assert!(matches!(r.delivery, DeliveryOutcome::Delivered { .. }));
+    }
+
+    #[test]
+    fn a_destination_that_writes_the_text_itself_does_not_need_the_clipboard() {
+        let clip = FakeClipboard::broken();
+        let dest = SpyDestination::alive();
+        let r = complete_transcription(&Transcript::settled("typed straight in"), &clip,
+                                       Some(&dest), None);
+        assert!(dest.was_written_to());
+        assert!(matches!(r.delivery, DeliveryOutcome::Delivered { .. }));
     }
 
     // ---------------------------------------------------------------- the liveness gate
@@ -396,7 +449,7 @@ mod tests {
         impl Destination for OrderingDest<'_> {
             fn label(&self) -> String { "ordering".into() }
             fn is_alive(&self) -> Liveness { Liveness::Alive }
-            fn deliver(&self, _t: &str) -> Result<(), DeliveryError> {
+            fn deliver(&self, _t: &str, _copied: bool) -> Result<(), DeliveryError> {
                 assert!(self.clip.last().is_some(),
                         "clipboard must already hold the transcript before delivery runs");
                 Ok(())

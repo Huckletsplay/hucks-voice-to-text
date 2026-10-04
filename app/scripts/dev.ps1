@@ -15,7 +15,7 @@
 # Needs: Rust (rustup, MSVC toolchain) and Visual Studio 2022 Build Tools with the C++ workload,
 # CMake and Clang components. See app/README.md.
 #
-# Usage: app\scripts\dev.ps1 [build|build-release|run|test] [extra cargo args]   (default: run)
+# Usage: app\scripts\dev.ps1 [build|build-release|run|test|bench] [extra cargo args]   (default: run)
 
 param(
     [Parameter(Position = 0)] [string] $Command = 'run',
@@ -74,7 +74,12 @@ try {
         # script supplies it rather than asking for it as dev.sh does.)
         'test'          { cargo test --workspace -- @Rest }
         'run'           { cargo run -p hvtt-desktop @Rest }
-        default         { throw 'usage: app\scripts\dev.ps1 [build|build-release|run|test]' }
+        # How well quick dictations are recognised, and how long they take:
+        # desktop\examples\accuracy.rs explains the cases. Built for THIS processor, like every
+        # dev.ps1 build; for what the public download does, set GGML_NATIVE=OFF and a
+        # CARGO_TARGET_DIR of its own first (whisper.cpp is not rebuilt for a changed flag).
+        'bench'         { cargo run --release -p hvtt-desktop --example accuracy -- @Rest }
+        default         { throw 'usage: app\scripts\dev.ps1 [build|build-release|run|test|bench]' }
     }
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }

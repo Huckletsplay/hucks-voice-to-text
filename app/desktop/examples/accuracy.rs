@@ -17,6 +17,7 @@
 //!              full | beam | beamfit     greedy / beam search of 5, whole window / sized window
 //!              pad | beampad             300 ms of silence either side, whole window
 //!              floorN                    `pad`, window sized to the audio but at least N seconds
+//!              scaleN                    `pad`, window N times the audio, at least 10 seconds
 //!              leadN                     N ms of silence before the speech only, whole window
 //!              engine                    exactly what the app's engine does for words it sends
 //!              rollingN[s]               (s: also kept for good after a second of quiet)
@@ -163,8 +164,8 @@ fn threads() -> i32 {
 }
 
 fn decode(ctx: &WhisperContext, kind: &str, audio: &[f32]) -> String {
-    // `floorN`: the window sized to the audio, but never under N seconds. `leadN`: N ms of silence
-    // before the speech only.
+    // `floorN`: the window sized to the audio, but never under N seconds. `scaleN`: N times the
+    // audio, never under 10 seconds. `leadN`: N ms of silence before the speech only.
     let (beam, fit, pad_ms, floor, lead_ms) = match kind {
         "fit" => (false, true, 0, 0.0, 0),
         "full" => (false, false, 0, 0.0, 0),
@@ -173,6 +174,10 @@ fn decode(ctx: &WhisperContext, kind: &str, audio: &[f32]) -> String {
         "pad" => (false, false, 300, 0.0, 0),
         "beampad" => (true, false, 300, 0.0, 0),
         k if k.starts_with("floor") => (false, true, 300, k[5..].parse::<f32>().unwrap(), 0),
+        k if k.starts_with("scale") => {
+            let times = k[5..].parse::<f32>().unwrap();
+            (false, true, 300, (times * audio.len() as f32 / 16_000.0).max(10.0), 0)
+        }
         k if k.starts_with("lead") => (false, false, 0, 0.0, k[4..].parse::<usize>().unwrap()),
         other => panic!("unknown decoder {other}"),
     };
@@ -342,7 +347,9 @@ fn main() {
     let mut cp = WhisperContextParameters::default();
     cp.use_gpu(cpu.is_none());
     let ctx = WhisperContext::new_with_params(&model, cp).expect("model loads");
-    let engine = hvtt_desktop::engine_whisper::WhisperEngine::load(&model).expect("engine loads");
+    // The program's own engine under the same conditions (`engine`, `stretches`).
+    let engine = hvtt_desktop::engine_whisper::WhisperEngine::load_with(&model, cpu.is_none(), cpu)
+        .expect("engine loads");
     let name = model.file_name().unwrap().to_string_lossy().replace("ggml-", "").replace(".bin", "");
 
     // Warm up, so the first clip's time is not the GPU's start-up.

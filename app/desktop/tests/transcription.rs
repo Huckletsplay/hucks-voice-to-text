@@ -138,7 +138,7 @@ fn a_transcript_reaches_the_clipboard_even_when_delivery_fails() {
     impl Destination for Dead {
         fn label(&self) -> String { "a window that closed".into() }
         fn is_alive(&self) -> Liveness { Liveness::dead("window-closed") }
-        fn deliver(&self, _: &str) -> Result<(), DeliveryError> {
+        fn deliver(&self, _: &str, _: bool) -> Result<(), DeliveryError> {
             panic!("deliver must never be called for a dead destination");
         }
     }
@@ -187,8 +187,9 @@ fn the_real_ax_destination_refuses_when_accessibility_is_not_granted() {
     }
 }
 
-/// The model inside the program ("Best") hears a quick phrase - the rest of these tests use base.en
-/// for speed, and a fresh setup now fetches only the default (Codex's thirteenth review).
+/// The model inside the program ("Best" on the Mac, "Quick" on Windows) hears a quick phrase - the
+/// rest of these tests use base.en for speed, and a fresh setup now fetches only the default
+/// (Codex's thirteenth review).
 #[test]
 fn the_built_in_model_hears_a_quick_phrase() {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -288,7 +289,8 @@ fn speech_recognised_a_window_at_a_time_keeps_every_sentence_once() {
     );
 
     assert!(windows >= 1, "a passage this long is recognised before the stop, not all at it");
-    let got = text.to_lowercase();
+    // Windows' voice has it written as two words; it is the same sentence, heard once.
+    let got = text.to_lowercase().replace("window sill", "windowsill");
     for word in ["weather", "river", "pancakes", "apples", "fence", "mountains", "coin", "cards", "windowsill"] {
         assert_eq!(got.matches(word).count(), 1, "{word:?} once, got {got:?}");
     }

@@ -12,6 +12,9 @@
 #ifndef SourceModel
   #error SourceModel must be supplied by release.ps1
 #endif
+#ifndef SourceDetector
+  #error SourceDetector must be supplied by release.ps1
+#endif
 #ifndef SourceLicense
   #error SourceLicense must be supplied by release.ps1
 #endif
@@ -72,6 +75,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: ignoreversion
 ; The speech model, so a download works straight away. A model in the app-data folder wins.
 Source: "{#SourceModel}"; DestDir: "{app}\models"; Flags: ignoreversion
+; The voice detector beside it (hvtt_core::models::VOICE_DETECTOR): it finds where speech ends, so
+; the stop press waits about half a second instead of always the full 1.2.
+Source: "{#SourceDetector}"; DestDir: "{app}\models"; Flags: ignoreversion
 Source: "{#SourceLicense}"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]

@@ -10,12 +10,15 @@
 //! | small.en ("Better") | 3.2% | 11.8% | 0.22 s |
 //! | large-v3-turbo, 5-bit ("Best") | 1.9% | 10.5% | 0.9 s |
 //!
-//! Its 8-bit version was no more accurate (1.9%) and is 300 MB bigger. On the processor-only
-//! Windows build the bigger models are several times slower; not measured there yet.
+//! Its 8-bit version was no more accurate (1.9%) and is 300 MB bigger. The Windows build
+//! recognises on the processor alone, and there the same phrase takes (measured 2026-10-03 on a
+//! six-core i5-11400F, 11 threads, built for that processor): Quick 1.25 s, Better 4.1 s, Best
+//! 20 s.
 //!
-//! "Best" (large-v3-turbo) is inside the program, on both platforms for now. "Quick" and "Better"
-//! are downloaded when he chooses one - the whisper.cpp project's own files, pinned to one commit -
-//! and kept only if the download's size and SHA-256 are exactly the ones written here.
+//! One model is inside the program - "Best" (large-v3-turbo) on the Mac, "Quick" on Windows
+//! (`MAC`). The others are downloaded when he chooses one - the whisper.cpp project's own files,
+//! pinned to one commit - and kept only if the download's size and SHA-256 are exactly the ones
+//! written here.
 
 /// One model on offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,9 +50,13 @@ const SOURCE: &str =
 /// confidence"; anyone wanting speed picks Better or Quick). Quick phrases 1.9% of words wrong
 /// against Better's 3.2% and Quick's 6.2%, and a clipped first word 14% against 21-23%, for about
 /// 0.9 s at the stop on an M3 Pro (~2 s estimated on an M1) and ~770 MB of memory. (Better was the
-/// default for a few hours the same day.) **Windows too, for now** - his call: "Windows will be Best
-/// as well until I test it myself." There it recognises on the processor alone, several times
-/// slower; to be measured on the PC, and changed back to Quick there if it is too slow.
+/// default for a few hours the same day.)
+///
+/// **On Windows, "Quick" is the one inside.** Best was Windows' too from 2026-10-02 - his call:
+/// "Windows will be Best as well until I test it myself", to be measured on the PC and changed
+/// back to Quick there if it was too slow. Measured 2026-10-03: there it recognises on the
+/// processor alone, and a quick phrase took 20 s with Best against 1.25 s with Quick (4.1 s with
+/// Better). Best is still his to choose from the menu.
 const MAC: bool = cfg!(target_os = "macos");
 
 pub const MODELS: &[Model] = &[
@@ -70,7 +77,7 @@ pub const MODELS: &[Model] = &[
         note: "very fast, more mistakes",
         bytes: 147_964_211,
         sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-        built_in: false,
+        built_in: !MAC,
         accuracy: 2,
         speed: 5,
         mac_ms: 79,
@@ -100,10 +107,10 @@ pub const MODELS: &[Model] = &[
     Model {
         file: "ggml-large-v3-turbo-q5_0.bin",
         name: "Best",
-        note: if MAC { "fewest mistakes" } else { "fewest mistakes, slower on a PC" },
+        note: if MAC { "fewest mistakes" } else { "fewest mistakes, very slow on most PCs" },
         bytes: 574_041_195,
         sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
-        built_in: true,
+        built_in: MAC,
         accuracy: 5,
         speed: 2,
         mac_ms: 911,
@@ -249,9 +256,11 @@ mod tests {
         assert!(line.ends_with("490 MB download"), "{line}");
         assert!(menu_label(better, true, false).ends_with("downloaded · 490 MB"));
         assert!(menu_label(better, false, true).ends_with("downloading 490 MB…"));
+        // "Best" on the Mac; "Quick" where recognition is on the processor alone.
         let inside = built_in();
-        assert_eq!(inside.name, "Best");
-        assert!(menu_label(inside, false, false).ends_with("built in · 570 MB"));
+        let (name, size) = if MAC { ("Best", "570 MB") } else { ("Quick", "150 MB") };
+        assert_eq!(inside.name, name);
+        assert!(menu_label(inside, false, false).ends_with(&format!("built in · {size}")));
     }
 
     #[test]

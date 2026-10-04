@@ -159,8 +159,8 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             shortcut: DEFAULT_SHORTCUT.to_string(),
-            // The model inside the program: "Best" (Windows too, until he has tried it there).
-            model: "ggml-large-v3-turbo-q5_0.bin".to_string(),
+            // The model inside the program: "Best" on the Mac, "Quick" on Windows.
+            model: crate::models::built_in().file.to_string(),
             input_device: None,
             keep_drafts: true,
             keep_recordings: false,

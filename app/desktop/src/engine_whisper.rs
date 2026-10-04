@@ -18,6 +18,12 @@ pub struct WhisperEngine {
 
 impl WhisperEngine {
     pub fn load(model_path: &Path) -> Result<Self, EngineError> {
+        Self::load_with(model_path, true, None)
+    }
+
+    /// `load`, with the graphics processor left out (`gpu` false) or a set number of threads - for
+    /// measuring what another computer would do (`examples/accuracy.rs`, `HVTT_BENCH_CPU`).
+    pub fn load_with(model_path: &Path, gpu: bool, threads: Option<i32>) -> Result<Self, EngineError> {
         // The public Windows build targets AVX2-class processors (Intel 2013 on, AMD 2015 on)
         // rather than the building machine's own. On anything older, whisper.cpp would stop the
         // program with an illegal instruction; say so plainly instead.
@@ -40,7 +46,7 @@ impl WhisperEngine {
 
         let mut params = WhisperContextParameters::default();
         // Metal on Apple Silicon; the flag is harmless where it is unavailable.
-        params.use_gpu(true);
+        params.use_gpu(gpu);
 
         let ctx = WhisperContext::new_with_params(model_path, params)
             .map_err(|e| EngineError::ModelLoad(e.to_string()))?;
@@ -51,11 +57,13 @@ impl WhisperEngine {
             .unwrap_or_else(|| "whisper".into());
 
         // Leave a core for the UI so the composer never stutters mid-recognition.
-        let threads = (std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .saturating_sub(1))
-        .max(1) as i32;
+        let threads = threads.unwrap_or_else(|| {
+            (std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .saturating_sub(1))
+            .max(1) as i32
+        });
 
         Ok(WhisperEngine { ctx: Mutex::new(ctx), label, threads })
     }

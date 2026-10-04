@@ -41,11 +41,12 @@ Windows 10 22H2; other versions have not yet been tested. Intel Macs are not sup
   menu bar or notification area.
 - **Keep it private.** Recognition runs entirely on your computer with
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Audio and text never leave it.
-- **Accurate first, faster if you like.** The most accurate speech model, *Best*, is built in.
-  H › Settings › Speech Model lists five more - *Tiny*, *Quick*, *Better*, *Medium*, *Large* - each
-  rated for accuracy and speed, downloaded once when you choose it. A speed check when the program
-  first opens sets it up for your computer, and offers a faster model if *Best* is slow there
-  (**Settings > Check This Computer's Speed** runs it again).
+- **Accurate first, faster if you like.** On a Mac the most accurate speech model, *Best*, is built
+  in. On Windows, where recognition runs on the processor alone for now, the built-in one is
+  *Quick*. H › Settings › Speech Model lists all six - *Tiny*, *Quick*, *Better*, *Medium*, *Best*,
+  *Large* - each rated for accuracy and speed, downloaded once when you choose it. A speed check
+  when the program first opens sets it up for your computer, and offers a faster model if yours is
+  slow there (**Settings > Check This Computer's Speed** runs it again).
 - **Keep your clipboard yours.** Choose the normal clipboard, or Huck's Clipboard, which leaves
   whatever you copied alone and pastes dictation with its own shortcut.
 - **Stay safe.** It never writes into a text box that has closed or been replaced, and never
@@ -216,7 +217,7 @@ Requirements:
 From the repository root, in PowerShell:
 
 ```powershell
-app\scripts\fetch-model.ps1          # the speech model (~574 MB) and voice detector, into %LOCALAPPDATA%
+app\scripts\fetch-model.ps1          # the speech model (~148 MB) and voice detector, into %LOCALAPPDATA%
 app\scripts\dev.ps1 test
 app\scripts\install.ps1              # build and install for this PC, and start it
 app\scripts\release.ps1 -UnsignedBeta  # the public installer and its checksum
