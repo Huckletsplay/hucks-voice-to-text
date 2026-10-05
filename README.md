@@ -12,13 +12,13 @@ No account. No cloud. Speech is recognized on your computer.
 
 ## Download
 
-Open the [latest release](https://github.com/Huckletsplay/hucks-voice-to-text/releases/latest)
-and download:
+Each platform has its own newest version. They do the same things; the numbers differ because
+each is updated when it needs it.
 
 | Platform | Download | Requirement |
 |---|---|---|
-| macOS | `HucksVoiceToText-0.1.3-macOS-arm64-unsigned-beta.dmg` | Apple silicon Mac (M1 or newer), macOS 11 or newer |
-| Windows | `HucksVoiceToText-0.1.3-windows-x64-setup.exe` | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
+| macOS | [`HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.7/HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.7/HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg.sha256.txt)) | Apple silicon Mac (M1 or newer), macOS 11 or newer |
+| Windows | [`HucksVoiceToText-0.1.8-windows-x64-setup.exe`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.8/HucksVoiceToText-0.1.8-windows-x64-setup.exe) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.8/HucksVoiceToText-0.1.8-windows-x64-setup.exe.sha256.txt)) | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
 
 This is an unsigned public beta: macOS Gatekeeper and Windows SmartScreen will both call the
 developer unknown. Installation instructions are below, and each download has a SHA-256 checksum
@@ -75,7 +75,7 @@ for the new copy. Your settings and shortcuts are kept.
 
 ## Install on Windows
 
-1. Download `HucksVoiceToText-0.1.3-windows-x64-setup.exe` and run it.
+1. Download `HucksVoiceToText-0.1.8-windows-x64-setup.exe` and run it.
 2. Because this beta is not code-signed, Windows may show **Windows protected your PC**. Choose
    **More info**, then **Run anyway**.
 3. Follow the installer. It needs no administrator rights: it installs for your account only, into
@@ -135,15 +135,15 @@ privately, see [SECURITY.md](SECURITY.md).
 
 ## Verify a download
 
-Each download has a checksum file beside it on the release page.
+Each download has a checksum file, linked beside it under [Download](#download).
 
 ```bash
-shasum -a 256 -c HucksVoiceToText-0.1.3-macOS-arm64-unsigned-beta.dmg.sha256.txt
+shasum -a 256 -c HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg.sha256.txt
 ```
 
 ```powershell
-Get-FileHash .\HucksVoiceToText-0.1.3-windows-x64-setup.exe -Algorithm SHA256
-Get-Content .\HucksVoiceToText-0.1.3-windows-x64-setup.exe.sha256.txt
+Get-FileHash .\HucksVoiceToText-0.1.8-windows-x64-setup.exe -Algorithm SHA256
+Get-Content .\HucksVoiceToText-0.1.8-windows-x64-setup.exe.sha256.txt
 ```
 
 On Windows, compare the hash printed by `Get-FileHash` with the first value in the checksum file.
