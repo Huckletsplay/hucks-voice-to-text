@@ -113,6 +113,8 @@ const LABEL = {
 function stateLabel(s) {
   if (s.shortcut_error) return "Shortcut not working";
   if (s.state === "paused" && s.settling) return "Pausing…";
+  // Hold to Talk: the one thing to know while holding.
+  if (s.state === "recording" && s.hold) return "Listening — let go to send";
   if (s.state !== "ready") return LABEL[s.state] ?? s.state;
   if (s.delivered) return "Sent";
   if (s.not_copied) return "Not copied";
@@ -143,8 +145,9 @@ function renderWords(s) {
     wantCaret = false;
   }
   const dictating = s.state === "recording" || s.state === "paused";
-  ui.controls.hidden = !dictating;
-  ui.learning.hidden = !dictating;
+  // Hold to Talk: his hand is on the keys, so there is nothing to read, pause, send or fix.
+  ui.controls.hidden = !dictating || !!s.hold;
+  ui.learning.hidden = !dictating || !!s.hold;
   ui.learning.setAttribute("aria-pressed", String(!!s.learning));
   // Only when it changes: this runs with every live update, and WebKit (macOS) drops a click
   // whose word was replaced between press and release - Pause worked only off its label.
@@ -153,7 +156,7 @@ function renderWords(s) {
 
   const paused = s.state === "paused";
   const held = notCopied(s);
-  const showLive = s.state === "recording" || s.state === "transcribing" || held;
+  const showLive = ((s.state === "recording" || s.state === "transcribing") && !s.hold) || held;
   ui.live.hidden = !showLive || (s.state === "transcribing" && !s.live_text);
   ui.edit.hidden = !paused;
   ui.unsavedActions.hidden = !held;
@@ -319,7 +322,8 @@ ui.updateLater.addEventListener("click", () => invoke("dismiss"));
 ui.permOpen.addEventListener("click", () => { invoke("open_accessibility_settings"); done(); });
 ui.permLater.addEventListener("click", done);
 ui.wordsCopy.addEventListener("click", () => invoke("copy_words"));
-ui.wordsDiscard.addEventListener("click", () => invoke("discard_words"));
+// With the number of the dictation in the box: a late click never discards a later one's words.
+ui.wordsDiscard.addEventListener("click", () => invoke("discard_words", { generation: input.generation }));
 
 ui.pause.addEventListener("click", () => invoke("pause_resume", { input: { ...input } }));
 ui.send.addEventListener("click", () => invoke("send", { input: { ...input } }));

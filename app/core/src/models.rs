@@ -107,7 +107,7 @@ pub const MODELS: &[Model] = &[
     Model {
         file: "ggml-large-v3-turbo-q5_0.bin",
         name: "Best",
-        note: if MAC { "fewest mistakes" } else { "fewest mistakes, very slow on most PCs" },
+        note: if MAC { "fewest mistakes" } else { "fewest mistakes; slow without a graphics card" },
         bytes: 574_041_195,
         sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
         built_in: MAC,
@@ -180,6 +180,21 @@ pub fn faster_choice(current: &Model, measured_ms: u128) -> Option<(&'static Mod
         .max_by_key(|m| (m.accuracy, std::cmp::Reverse(m.mac_ms)))
         .or_else(|| quicker.iter().min_by_key(|m| m.mac_ms))
         .map(|m| (*m, estimate(m)))
+}
+
+/// The model to offer when this computer is quick with `current` (`measured_ms` here): the most
+/// accurate one estimated to take at most 2 s - a PC whose graphics card carries "Best" should be
+/// told so (his aim, 2026-10-05: bring Best to as many people as possible). The estimate is the
+/// Mac's ratio between the two models, which a graphics card beats (Best measured 0.53 s on an Arc
+/// A750 where this says 1.4 s) and a processor alone does not reach; the model is timed for real
+/// once he switches. Never one that is no more accurate, so nothing is offered from Best.
+pub fn better_choice(current: &Model, measured_ms: u128) -> Option<(&'static Model, u128)> {
+    let estimate = |m: &Model| measured_ms * m.mac_ms as u128 / current.mac_ms.max(1) as u128;
+    MODELS
+        .iter()
+        .filter(|m| m.accuracy > current.accuracy && estimate(m) <= 2_000)
+        .max_by_key(|m| (m.accuracy, std::cmp::Reverse(m.mac_ms)))
+        .map(|m| (m, estimate(m)))
 }
 
 /// The model a settings file names, if it is one of these.
@@ -281,6 +296,21 @@ mod tests {
         assert_eq!(faster_choice(best, 60_000).unwrap().0.name, "Tiny");
         // Nothing is quicker than Tiny, and Quick is never offered from Tiny.
         assert!(faster_choice(find("ggml-tiny.en.bin").unwrap(), 9_000).is_none());
+    }
+
+    #[test]
+    fn a_quick_computer_is_offered_the_most_accurate_model_it_can_carry() {
+        let quick = find("ggml-base.en.bin").unwrap();
+        // Quick on a graphics card: Best is estimated at about 1.4 s.
+        let (offer, ms) = better_choice(quick, 120).unwrap();
+        assert_eq!(offer.name, "Best", "not Large: no more accurate, and slower");
+        assert!((1_300..1_500).contains(&ms), "{ms}");
+        // A weaker card: Better, the most accurate within 2 s.
+        assert_eq!(better_choice(quick, 400).unwrap().0.name, "Better");
+        // Quick on a processor alone (about a second): nothing more accurate is quick enough.
+        assert!(better_choice(quick, 1_050).is_none());
+        // Nothing is offered from Best.
+        assert!(better_choice(find("ggml-large-v3-turbo-q5_0.bin").unwrap(), 100).is_none());
     }
 
     #[test]

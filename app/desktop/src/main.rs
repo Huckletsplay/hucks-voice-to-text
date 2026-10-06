@@ -1,7 +1,13 @@
-// Entry point. Two modes, one binary.
+// Entry point. The app, Native Messaging and Windows driver probing share one binary.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // Driver probing must leave before Tauri, Native Messaging or the one-copy marker.
+    #[cfg(windows)]
+    if let Some(code) = hvtt_desktop::engine_whisper::run_card_probe_if_requested() {
+        std::process::exit(code);
+    }
+
     // Chrome launches this same executable as a Native Messaging host, passing the calling
     // extension's origin as an argument. In that mode it must be a silent stdio relay: no
     // window, no tray, no Tauri runtime. Shipping one binary means there is no helper app for

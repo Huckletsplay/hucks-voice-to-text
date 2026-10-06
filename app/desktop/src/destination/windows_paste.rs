@@ -62,8 +62,165 @@ static HELD: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 /// The virtual key of the dictation shortcut's own key (Space for Alt+Space); 0 if unknown.
 static TRIGGER: AtomicU32 = AtomicU32::new(0);
 
+/// The dictation shortcut's modifiers, one bit a kind (`modifier_bit`).
+static TRIGGER_MODIFIERS: AtomicU32 = AtomicU32::new(0);
+
+/// Which kind of modifier a key is - Ctrl 1, Alt 2, Shift 4, Windows 8 - or 0 for any other key.
+fn modifier_bit(vk: u32) -> u32 {
+    match vk {
+        0x11 | 0xA2 | 0xA3 => 1,
+        0x12 | 0xA4 | 0xA5 => 2,
+        0x10 | 0xA0 | 0xA1 => 4,
+        0x5B | 0x5C => 8,
+        _ => 0,
+    }
+}
+
+/// The modifiers an accelerator names (`Ctrl+Alt+Space`), as `modifier_bit`s.
+fn modifiers_of(accelerator: &str) -> u32 {
+    let mut parts: Vec<&str> = accelerator.split('+').map(str::trim).collect();
+    parts.pop();
+    parts.iter().fold(0, |bits, part| {
+        bits | match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" | "cmdorctrl" | "commandorcontrol" => 1,
+            "alt" | "option" => 2,
+            "shift" => 4,
+            "super" | "cmd" | "command" | "meta" => 8,
+            _ => 0,
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------- hold to talk
+//
+// Dictation Style > Hold to Talk: he holds the shortcut, talks, and lets go. Two things about a
+// held shortcut need the keyboard hook that already counts for the gate.
+//
+// 1. Its own key must not type. Windows keeps repeating the last key pressed. While every key of
+//    Alt+Space is down those repeats are the shortcut again and reach nobody; the moment he lets
+//    go of Alt first, they are plain Spaces, typed into his text box for as long as his thumb is
+//    still down. So from the start of a held dictation until that key comes up, its presses are
+//    swallowed here. (Only presses: the release goes through, so Windows and the shortcut's own
+//    watcher still see the key come up.)
+// 2. Letting go of ANY of its keys is letting go. The shortcut library reports a release only
+//    when the main key comes up; Alt up, Space still down, would otherwise keep recording.
+
+/// The held dictation whose keys are being watched, by a number of its own; 0 for none. One of
+/// its shortcut's keys coming up ends it - once.
+static HOLDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HOLD_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// That hold's own keys, as they were when it began - not the shortcut as it is now, which he
+/// can change while a key is still down (Codex's review, 2026-10-05).
+static HOLD_KEY: AtomicU32 = AtomicU32::new(0);
+static HOLD_MODIFIERS: AtomicU32 = AtomicU32::new(0);
+/// The key whose presses reach no program - a held dictation's own, until it comes up - with
+/// the number of the hold it is for (`swallowing`); 0 for none. An earlier hold's tidying, late,
+/// must not undo a newer hold's (Codex's second review).
+static SWALLOWING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Keeps the hooks in after the dictation is over, until that key is up - with the number of
+/// the hold it is kept for, so an old hold's tidying never takes a newer one's.
+static HOLD_WATCH: Mutex<Option<(u64, Arc<Watch>)>> = Mutex::new(None);
+/// How the program is told that a key of a held shortcut came up, and of which hold
+/// (`on_hold_key_up`).
+static HOLD_KEY_UP: std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>> = std::sync::OnceLock::new();
+
+/// Set once, when the program starts. `told` is given the hold's number (`hold_started`).
+pub fn on_hold_key_up(told: impl Fn(u64) + Send + Sync + 'static) {
+    let _ = HOLD_KEY_UP.set(Box::new(told));
+}
+
+/// A swallowed key and the hold it belongs to, as one number.
+fn swallowing(serial: u64, vk: u32) -> u64 {
+    (serial << 8) | (vk as u64 & 0xFF)
+}
+
+fn key_down(vk: u32) -> bool {
+    vk != 0 && unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
+}
+
+/// Is every kind of modifier in `wanted` held - on either side of the keyboard?
+fn modifiers_down(wanted: u32) -> bool {
+    let pairs: [(u32, [u32; 2]); 4] = [(1, [0xA2, 0xA3]), (2, [0xA4, 0xA5]), (4, [0xA0, 0xA1]), (8, [0x5B, 0x5C])];
+    pairs.iter().all(|(bit, keys)| wanted & bit == 0 || keys.iter().any(|k| key_down(*k)))
+}
+
+/// A held dictation has started, at the keypress: its number, by which a key coming up is
+/// reported (`on_hold_key_up`); 0 if the shortcut's key is not known. From here its own key
+/// types nothing, and any key of its shortcut coming up is told to the program.
+///
+/// The typing needs the keyboard hook - its own, if the gate has none running. If Windows will
+/// not install one, a modifier let go is still noticed, by looking (the thread below); only
+/// the swallowing is lost, and the held key then repeats into whatever has the keyboard, as any
+/// held key does. Said in the log; nothing more is possible without the hook.
+pub fn hold_started() -> u64 {
+    let trigger = TRIGGER.load(Ordering::Relaxed);
+    if trigger == 0 {
+        return 0;
+    }
+    let modifiers = TRIGGER_MODIFIERS.load(Ordering::Relaxed);
+    let serial = HOLD_SERIAL.fetch_add(1, Ordering::SeqCst) + 1;
+    let watch = watch();
+    let hooked = watch.is_some();
+    if !hooked {
+        eprintln!("[hvtt] hold to talk without the keyboard hook: the held key is not kept from other programs");
+    }
+    *HOLD_WATCH.lock() = watch.map(|w| (serial, w));
+    HOLD_KEY.store(trigger, Ordering::SeqCst);
+    HOLD_MODIFIERS.store(modifiers, Ordering::SeqCst);
+    let mine = swallowing(serial, trigger);
+    SWALLOWING.store(if hooked && key_down(trigger) { mine } else { 0 }, Ordering::SeqCst);
+    HOLDING.store(serial, Ordering::SeqCst);
+    // Looks, as well as the hook's listening: a modifier let go ends the hold even with no
+    // hook. And once the key is up - which can be after the dictation is over - the hooks may
+    // go. Everything here is this hold's own: a newer hold's is left alone.
+    std::thread::spawn(move || {
+        while key_down(trigger) {
+            if !modifiers_down(modifiers) {
+                hold_key_came_up(serial);
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        hold_key_came_up(serial);
+        let _ = SWALLOWING.compare_exchange(mine, 0, Ordering::SeqCst, Ordering::SeqCst);
+        let kept = {
+            let mut kept = HOLD_WATCH.lock();
+            if kept.as_ref().is_some_and(|(of, _)| *of == serial) { kept.take() } else { None }
+        };
+        // Outside the lock: dropping the last one stops the hook thread.
+        drop(kept);
+    });
+    serial
+}
+
+/// Asked once the recording exists: has a key of the held shortcut already come up - in the
+/// moment the microphone took to open, or before the hook was in? The caller ends the dictation
+/// itself; a report of the same thing, if one was also made, is then one too many and ignored.
+///
+/// `serial`: the hold's number from `hold_started`. With none (0) its keys were never noted -
+/// the ones on record are an earlier hold's - so nothing is concluded from them.
+pub fn hold_already_let_go(serial: u64) -> bool {
+    serial != 0
+        && !(key_down(HOLD_KEY.load(Ordering::SeqCst)) && modifiers_down(HOLD_MODIFIERS.load(Ordering::SeqCst)))
+}
+
+/// One of hold number `serial`'s keys came up: say so, once, naming the hold.
+fn hold_key_came_up(serial: u64) {
+    if serial != 0 && HOLDING.compare_exchange(serial, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        if let Some(told) = HOLD_KEY_UP.get() {
+            told(serial);
+        }
+    }
+}
+
+/// Should the hook keep this key event from every program? Only a press, made by him, of the key
+/// a held dictation is still holding down (`swallowing`; 0 for none).
+fn swallowed(vk: u32, down: bool, injected: bool, swallowing: u64) -> bool {
+    down && !injected && swallowing != 0 && vk as u64 == swallowing & 0xFF
+}
+
 /// Tell the gate which key starts and stops dictation, from its accelerator (`Alt+Space`).
 pub fn set_trigger_key(accelerator: &str) {
+    TRIGGER_MODIFIERS.store(modifiers_of(accelerator), Ordering::Relaxed);
     let key = accelerator.rsplit('+').next().unwrap_or("").trim();
     let key = key.strip_prefix("Key").or_else(|| key.strip_prefix("Digit")).unwrap_or(key);
     let vk = (0..=255u32)
@@ -134,6 +291,28 @@ unsafe extern "system" fn on_key(code: i32, wparam: WPARAM, lparam: LPARAM) -> L
         let vk = (info.vkCode & 0xFF) as usize;
         let message = wparam.0 as u32;
         let injected = info.flags.contains(LLKHF_INJECTED);
+        let down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+        // Hold to Talk: the held key types nothing, and any of the shortcut's keys coming up
+        // ends the dictation (see "hold to talk" above).
+        let swallowing = SWALLOWING.load(Ordering::SeqCst);
+        if swallowed(vk as u32, down, injected, swallowing) {
+            return LRESULT(1);
+        }
+        if !down && !injected {
+            // Up, so its next press is a fresh one and goes through - at once, not when the
+            // tidying thread next looks. Only the entry just read: a newer hold's stays.
+            if swallowing != 0 && vk as u64 == swallowing & 0xFF {
+                let _ = SWALLOWING.compare_exchange(swallowing, 0, Ordering::SeqCst, Ordering::SeqCst);
+            }
+            let holding = HOLDING.load(Ordering::SeqCst);
+            if holding != 0 {
+                let mine = vk as u32 == HOLD_KEY.load(Ordering::SeqCst)
+                    || modifier_bit(vk as u32) & HOLD_MODIFIERS.load(Ordering::SeqCst) != 0;
+                if mine {
+                    hold_key_came_up(holding);
+                }
+            }
+        }
         if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
             let repeat = !injected && HELD[vk].swap(true, Ordering::Relaxed);
             if counts_as_typing(vk as u32, injected, repeat) {
@@ -654,6 +833,29 @@ mod tests {
             assert!(is_mouse_button(vk));
         }
         assert!(!is_mouse_button(0x25), "Left Arrow is a key");
+    }
+
+    #[test]
+    fn a_held_shortcut_types_nothing_and_its_modifiers_are_known() {
+        // Alt+Space held: Space's presses are kept from every program...
+        let space = swallowing(7, 0x20);
+        assert!(swallowed(0x20, true, false, space));
+        // ...but not its release, another key, our own keystrokes, or any key once it is up.
+        assert!(!swallowed(0x20, false, false, space), "the release goes through");
+        assert!(!swallowed(0x41, true, false, space), "another key");
+        assert!(!swallowed(0x20, true, true, space), "a keystroke of our own");
+        // The same key held for two holds is two different entries: tidying one leaves the other.
+        assert_ne!(swallowing(7, 0x20), swallowing(8, 0x20));
+        assert!(!swallowed(0x20, true, false, 0), "not held any more");
+        assert!(!swallowed(0, true, false, 0), "no shortcut key known");
+
+        assert_eq!(modifiers_of("Alt+Space"), 2);
+        assert_eq!(modifiers_of("Ctrl+Alt+Shift+V"), 1 | 2 | 4);
+        assert_eq!(modifiers_of("F9"), 0);
+        // Either Alt is the shortcut's Alt; Space is no modifier.
+        assert_eq!(modifier_bit(0xA4), 2);
+        assert_eq!(modifier_bit(0xA5), 2);
+        assert_eq!(modifier_bit(0x20), 0);
     }
 
     #[test]

@@ -47,12 +47,19 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 # Metal is Apple-only; asking for it anywhere else fails the whisper.cpp build.
 whisper-rs = { version = "0.16.0", features = ["metal"] }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(not(any(target_os = "macos", windows)))'.dependencies]
 whisper-rs = { version = "0.16.0" }
 
 # Windows: UI Automation, the paste keystroke, the clipboard and the floating box's window style.
 # The same `windows` crate Tauri already builds on; these lines only switch on the parts used.
 [target.'cfg(windows)'.dependencies]
+# Vulkan: recognition on the PC's graphics card - Intel, NVIDIA or AMD alike - where one is quicker
+# than the processor (`engine_whisper::load_fastest`). Measured 2026-10-05 on an Arc A750: "Best"
+# in 0.53 s for a quick phrase, against 20 s on the processor alone. Building it needs the Vulkan
+# SDK (scripts\dev.ps1 finds it); running it needs nothing a graphics driver has not installed.
+whisper-rs = { version = "0.16.0", features = ["vulkan"] }
+# Already in the tree through whisper-rs; named to ask which graphics cards there are.
+whisper-rs-sys = "0.15.0"
 uds_windows = "1.1"
 windows = { version = "0.61", features = [
   "Win32_Foundation",
@@ -60,6 +67,7 @@ windows = { version = "0.61", features = [
   "Win32_Security",
   "Win32_System_Com",
   "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_Registry",
   "Win32_System_Threading",

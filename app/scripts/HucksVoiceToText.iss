@@ -78,6 +78,10 @@ Source: "{#SourceModel}"; DestDir: "{app}\models"; Flags: ignoreversion
 ; The voice detector beside it (hvtt_core::models::VOICE_DETECTOR): it finds where speech ends, so
 ; the stop press waits about half a second instead of always the full 1.2.
 Source: "{#SourceDetector}"; DestDir: "{app}\models"; Flags: ignoreversion
+; Vulkan's loader, for a PC whose graphics driver brought none: the program prefers the driver's
+; own copy and falls back to this one, which finds no card and leaves recognition to the processor.
+Source: "{#SourceVulkan}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceVulkanLicense}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceLicense}"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]

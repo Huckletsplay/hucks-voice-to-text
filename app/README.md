@@ -89,7 +89,7 @@ and window, and `engine` - exactly what the program does).
 | Change a shortcut | H › Settings › Shortcuts, pick one, press the new keys (Esc cancels) |
 | Recovery drafts | H › Settings › Keep Recovery Drafts, and Open Drafts Folder |
 | Recordings | None: a dictation's sound is held in memory until it is recognised, never written to disk. (The last five were kept from 2026-10-01 to 10-03; when it opens, the program deletes the recording files it made there - only those, by their exact names - and the app-data `recordings/` folder once it is empty.) |
-| Speech model | H › Settings › Speech Model, six choices, each line showing accuracy and speed (dots out of five) and its size: *Tiny* (tiny.en), *Quick* (base.en), *Better* (small.en), *Medium* (medium.en, 5-bit), *Best* (large-v3-turbo, 5-bit), *Large* (large-v3, 5-bit) - *Best* built in on the Mac, *Quick* on Windows (which recognises on the processor alone: a quick phrase took 1.25 s with Quick, 4.1 s with Better and 20 s with Best on a six-core PC). One not on the computer is downloaded once - the whisper.cpp project's files, pinned to one commit - and kept only if its size and SHA-256 are the ones in `core/src/models.rs` |
+| Speech model | H › Settings › Speech Model, six choices, each line showing accuracy and speed (dots out of five) and its size: *Tiny* (tiny.en), *Quick* (base.en), *Better* (small.en), *Medium* (medium.en, 5-bit), *Best* (large-v3-turbo, 5-bit), *Large* (large-v3, 5-bit) - *Best* built in on the Mac, *Quick* on Windows. There the model runs on one of the PC's graphics cards, through Vulkan, when a card is quick - each is tried in a separate process the first time a model loads, a quick one is taken, and a slow one is timed against the processor (`engine_whisper::load_fastest`): a quick phrase took 0.12 s with Quick, 0.25 s with Better and 0.53 s with Best on an Arc A750, against 1.25 s, 4.1 s and 20 s on that PC's six-core processor alone. One not on the computer is downloaded once - the whisper.cpp project's files, pinned to one commit - and kept only if its size and SHA-256 are the ones in `core/src/models.rs` |
 | Update | H › Settings › Check for Updates… — downloads this platform's newer release from GitHub (the DMG, or the Windows installer), checks its size and SHA-256, then offers to open it; on Windows the installer runs silently and starts the new copy |
 | Close the floating box | It leaves by itself; the × or `Esc` closes it early |
 
@@ -156,7 +156,7 @@ Never inside this repository:
 | Build output | `~/.hvtt-build/target` |
 | Windows: models, settings, drafts | `%LOCALAPPDATA%\Huck's Voice to Text\` (`models\`, `settings.json`, `drafts\`) |
 | Windows: Huck's clipboard | the running program's memory — Windows has no named clipboards |
-| Windows: build output | `%LOCALAPPDATA%\hvtt-build\target` |
+| Windows: build output | `C:\hvb` |
 
 ## Third-party dependencies
 
@@ -165,6 +165,7 @@ Never inside this repository:
 | `tauri` + plugins | MIT / Apache-2.0 | Window, menu-bar item, global shortcuts, clipboard |
 | `whisper-rs` | Unlicense | Bindings to whisper.cpp |
 | `whisper.cpp` (vendored by the above) | MIT | Local speech recognition |
+| Vulkan loader (`vulkan-1.dll`, Windows installer only) | MIT / Apache-2.0 | Lets whisper.cpp reach a graphics card; Khronos' own file, unchanged, for a PC whose graphics driver brought none |
 | `cpal` | Apache-2.0 | Microphone capture |
 | `hound` | Apache-2.0 | WAV reading, tests only |
 | `core-foundation` | MIT / Apache-2.0 | macOS Accessibility and Core Foundation types |

@@ -19,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 $name = "Huck's Voice to Text"
 $targetDir = Join-Path $env:LOCALAPPDATA 'Programs\HucksVoiceToText'
 $targetExe = Join-Path $targetDir 'HucksVoiceToText.exe'
-$targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $env:LOCALAPPDATA 'hvtt-build\target' }
+$targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $env:SystemDrive '\hvb' }
 $built = Join-Path $targetRoot 'release\hvtt-desktop.exe'
 
 if (-not $NoBuild) {
@@ -40,6 +40,15 @@ Start-Sleep -Milliseconds 500
 
 New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
 Copy-Item -LiteralPath $built -Destination $targetExe -Force
+# Vulkan's loader beside it, as the public installer does - for a PC whose graphics driver brought
+# none, where the program could otherwise not recognise at all (release.ps1 says where it is from).
+$vulkanDir = if ($env:HVTT_RELEASE_VULKAN) { $env:HVTT_RELEASE_VULKAN } else { Join-Path $env:LOCALAPPDATA 'VulkanSDK\runtime-1.4.363.0' }
+$vulkan = Join-Path $vulkanDir 'vulkan-1.dll'
+if (Test-Path -LiteralPath $vulkan) {
+    Copy-Item -LiteralPath $vulkan, (Join-Path $vulkanDir 'VulkanRT-License.txt') -Destination $targetDir -Force
+} else {
+    Write-Warning "No Vulkan loader at $vulkan - fine on this PC if its graphics driver has one; see release.ps1."
+}
 
 $startMenu = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\$name.lnk"
 $shell = New-Object -ComObject WScript.Shell

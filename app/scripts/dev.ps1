@@ -4,7 +4,7 @@
 # are easy to forget, so they live here rather than in a README step.
 #
 #   1. BUILD OFF THE SSD. The project source sits on an exFAT volume. Rust build output goes to
-#      the local disk instead (%LOCALAPPDATA%\hvtt-build\target).
+#      the local disk instead (C:\hvb - at the top of the drive on purpose: see step 5).
 #
 #   2. CMAKE. whisper.cpp is built with CMake, and the copy that comes with the Visual Studio
 #      Build Tools is not on PATH outside a Developer prompt. It is found with vswhere.
@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 $appDir = Split-Path -Parent $PSScriptRoot
 
 # 1. Build output on the local disk, never on the exFAT drive.
-if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'hvtt-build\target' }
+if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = Join-Path $env:SystemDrive '\hvb' }
 
 # Rust, even in a shell opened before it was installed.
 $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
@@ -59,6 +59,43 @@ if (-not $env:LIBCLANG_PATH) {
 #    will crash on machines without those instructions.
 if (-not $env:CMAKE_C_FLAGS_RELEASE) { $env:CMAKE_C_FLAGS_RELEASE = '/O2 /Ob2 /DNDEBUG' }
 if (-not $env:CMAKE_CXX_FLAGS_RELEASE) { $env:CMAKE_CXX_FLAGS_RELEASE = '/O2 /Ob2 /DNDEBUG' }
+
+# 5. VULKAN, AND NINJA TO BUILD IT. Recognition runs on the PC's graphics card through Vulkan
+#    (desktop\Cargo.toml), and whisper.cpp needs the Vulkan SDK to build that: its headers, its
+#    import library and its shader compiler. Only to build - nothing of the SDK is needed to run.
+#    Install it once, no administrator needed:
+#      vulkansdk-windows-X64-<version>.exe --root "%LOCALAPPDATA%\VulkanSDK\<version>"
+#          --accept-licenses --default-answer --confirm-command install copy_only=1
+#
+#    Visual Studio's own generator cannot build it: whisper.cpp builds its shader generator as a
+#    project inside the project, and MSBuild's folders for that pass Windows' 260-character limit
+#    even from a build folder as short as C:\hvk (found 2026-10-05). Ninja makes no such folders;
+#    it needs the compiler's environment (vcvars64), which is brought in here. Even so the build
+#    folder must be at the top of the drive: from %LOCALAPPDATA%\hvtt-build\target the same
+#    sub-build's compiler test still passed 260 characters, and from %LOCALAPPDATA%\hvb a debug
+#    build fitted and a release build - seven characters deeper - did not. Hence C:\hvb.
+if (-not $env:VULKAN_SDK) {
+    $sdk = @((Join-Path $env:LOCALAPPDATA 'VulkanSDK'), 'C:\VulkanSDK') | Where-Object { Test-Path $_ } |
+        ForEach-Object { Get-ChildItem -Path $_ -Directory } |
+        Where-Object { Test-Path (Join-Path $_.FullName 'Lib\vulkan-1.lib') } |
+        Sort-Object { [version] ($_.Name -replace '[^\d.]', '') } | Select-Object -Last 1
+    if (-not $sdk) { throw 'The Vulkan SDK is missing - see step 5 in app\scripts\dev.ps1.' }
+    $env:VULKAN_SDK = $sdk.FullName
+}
+$env:PATH = "$(Join-Path $env:VULKAN_SDK 'Bin');$env:PATH"
+if (-not $env:CMAKE_GENERATOR) {
+    $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'
+    if (-not (Test-Path (Join-Path $ninja 'ninja.exe'))) { throw 'Ninja is missing - it comes with "C++ CMake tools for Windows" in the Build Tools.' }
+    if (-not $env:VSCMD_VER) {
+        $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+        # vcvars grumbles on stderr about tools it does not need; 'Stop' would take that as failure.
+        cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+        }
+    }
+    $env:PATH = "$ninja;$env:PATH"
+    $env:CMAKE_GENERATOR = 'Ninja'
+}
 
 Push-Location $appDir
 # Cargo reports progress on stderr. Windows PowerShell turns redirected stderr into error

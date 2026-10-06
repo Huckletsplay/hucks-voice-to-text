@@ -379,3 +379,53 @@ fn a_live_pass_gives_up_when_asked() {
     eprintln!("whole pass {whole:?}; abandoned after {given_up:?} ({:?})", abandoned.as_ref().map(|r| r.text.len()));
     assert!(given_up < whole / 2, "gave up in {given_up:?}, a whole pass takes {whole:?}");
 }
+
+/// Windows: the model is put where this computer runs it quickest - a graphics card or the
+/// processor - and that place is found again by name, with the remembered card checked in a
+/// child again. Cargo builds the program itself beside this test executable.
+#[cfg(windows)]
+#[test]
+fn the_quickest_place_for_the_model_is_found_and_found_again() {
+    use hvtt_desktop::engine_whisper::{graphics_cards, WhisperEngine, PROCESSOR};
+    let Some(model) = model_path() else { return };
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let cards = graphics_cards();
+    let somewhere = |on: &str| on == PROCESSOR || cards.iter().any(|c| c == on);
+
+    // A real successful quick-card probe must lead to a card choice, not a silent CPU fallback
+    // because the test harness could not find/dispatch the desktop executable.
+    let mut quick_card = false;
+    for (i, name) in cards.iter().enumerate() {
+        if let Some(ms) = hvtt_desktop::engine_whisper::probe_card(
+            std::path::Path::new(env!("CARGO_BIN_EXE_hvtt-desktop")), &model, i as i32, name,
+        ) {
+            quick_card |= ms <= 1_500;
+        }
+    }
+
+    let (_, on) = WhisperEngine::load_fastest(&model, None).expect("the model loads somewhere");
+    eprintln!("graphics cards: {cards:?}; quickest: {on}");
+    assert!(somewhere(&on), "{on}");
+    if quick_card { assert_ne!(on, PROCESSOR, "a quick card that passed its probe is used"); }
+
+    let started = std::time::Instant::now();
+    let (_, again) = WhisperEngine::load_fastest(&model, Some(&on)).expect("and there again");
+    eprintln!("found again in {} ms", started.elapsed().as_millis());
+    assert_eq!(again, on);
+
+    // A card that has since been taken out is not believed: the places are timed afresh.
+    let (_, afresh) = WhisperEngine::load_fastest(&model, Some("a card taken out")).expect("still loads");
+    assert!(somewhere(&afresh), "{afresh}");
+}
+
+/// Invalid hidden-probe input exits before any app startup, even on a computer with no card.
+#[cfg(windows)]
+#[test]
+fn a_probe_with_no_model_exits_without_starting_the_program() {
+    use std::os::windows::process::CommandExt;
+    let result = Command::new(env!("CARGO_BIN_EXE_hvtt-desktop"))
+        .arg("--probe-graphics-card").arg("").arg("0")
+        .creation_flags(0x08000000).output().expect("the probe starts");
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+}

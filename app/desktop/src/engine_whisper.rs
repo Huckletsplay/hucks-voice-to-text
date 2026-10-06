@@ -24,6 +24,25 @@ impl WhisperEngine {
     /// `load`, with the graphics processor left out (`gpu` false) or a set number of threads - for
     /// measuring what another computer would do (`examples/accuracy.rs`, `HVTT_BENCH_CPU`).
     pub fn load_with(model_path: &Path, gpu: bool, threads: Option<i32>) -> Result<Self, EngineError> {
+        Self::load_on(model_path, gpu.then_some(0), threads)
+    }
+
+    /// `load`, on one graphics card (`card`, counted as `graphics_cards` lists them) or on the
+    /// processor alone (`None`).
+    pub fn load_on(model_path: &Path, card: Option<i32>, threads: Option<i32>) -> Result<Self, EngineError> {
+        // Direct callers (including tests) get the same protection as load_fastest. No helper
+        // executable, or a driver that fails in it: use the processor without touching that card.
+        #[cfg(windows)]
+        let card = card.filter(|&i| {
+            graphics_cards().get(i as usize).is_some_and(|name| {
+                probe_executable().and_then(|exe| probe_card(&exe, model_path, i, name)).is_some()
+            })
+        });
+        Self::load_on_probed(model_path, card, threads)
+    }
+
+    // On Windows, called with a card only by the probe itself or after that probe succeeded.
+    fn load_on_probed(model_path: &Path, card: Option<i32>, threads: Option<i32>) -> Result<Self, EngineError> {
         // The public Windows build targets AVX2-class processors (Intel 2013 on, AMD 2015 on)
         // rather than the building machine's own. On anything older, whisper.cpp would stop the
         // program with an illegal instruction; say so plainly instead.
@@ -44,9 +63,18 @@ impl WhisperEngine {
             });
         }
 
+        // Without Vulkan's loader the engine cannot start at all, graphics card or not.
+        #[cfg(windows)]
+        if !vulkan_ready() {
+            return Err(EngineError::ModelLoad(
+                "a file this program needs (vulkan-1.dll) is missing. Install Huck's Voice to Text again.".into(),
+            ));
+        }
+
         let mut params = WhisperContextParameters::default();
-        // Metal on Apple Silicon; the flag is harmless where it is unavailable.
-        params.use_gpu(gpu);
+        // Metal on Apple Silicon, Vulkan on Windows; the flag is harmless where neither is there.
+        params.use_gpu(card.is_some());
+        params.gpu_device(card.unwrap_or(0));
 
         let ctx = WhisperContext::new_with_params(model_path, params)
             .map_err(|e| EngineError::ModelLoad(e.to_string()))?;
@@ -66,6 +94,93 @@ impl WhisperEngine {
         });
 
         Ok(WhisperEngine { ctx: Mutex::new(ctx), label, threads })
+    }
+
+    /// Windows: the model loaded where this computer runs it quickest - one of its graphics cards,
+    /// or the processor - and the name of that place, to remember (`known`: the place found
+    /// before, for this model and these cards).
+    ///
+    /// His idea, 2026-10-05: "when it does a test it'll just figure out" which is better. Nobody
+    /// is asked "processor or graphics card?"; a card built into the processor can be slower than
+    /// the processor itself, so each is timed rather than assumed. Each card gets a first pass
+    /// that readies it and a second that is timed. A card that is quick enough (`CARD_IS_FINE`)
+    /// is taken there and then: timing the processor against it could not change anything he
+    /// would notice, and can take most of a minute with a large model - whisper.cpp looks for
+    /// "give up" only between its steps, never inside the long one (Codex's review, 2026-10-05).
+    /// Only a slow card is raced against the processor, which is then worth its time. All card
+    /// loads and measurements happen in a child first: a driver may throw or exit the process.
+    /// A remembered card is probed again (drivers can change); a remembered processor is not.
+    #[cfg(windows)]
+    pub fn load_fastest(model_path: &Path, known: Option<&str>) -> Result<(Self, String), EngineError> {
+        let processor = || {
+            Ok((Self::load_on_probed(model_path, None, None)?, PROCESSOR.to_string()))
+        };
+        if known == Some(PROCESSOR) {
+            return processor();
+        }
+        let cards = graphics_cards();
+        let Some(exe) = probe_executable().filter(|_| !cards.is_empty()) else {
+            return processor();
+        };
+        if let Some((i, name)) = known.and_then(|name| cards.iter().enumerate().find(|(_, c)| c.as_str() == name)) {
+            // Failure goes straight to the processor and is remembered by load_engine; do not
+            // re-probe this failing card on every start under the same cache key.
+            if probe_card(&exe, model_path, i as i32, name).is_some() {
+                if let Ok(engine) = Self::load_on_probed(model_path, Some(i as i32), None) {
+                    return Ok((engine, name.clone()));
+                }
+            }
+            return processor();
+        }
+        let mut best: Option<(u128, i32, String)> = None;
+        for (i, name) in cards.iter().enumerate() {
+            let started = Instant::now();
+            let Some(ms) = probe_card(&exe, model_path, i as i32, name) else { continue };
+            eprintln!("[hvtt] {name}: {ms} ms a pass, ready after {} ms", started.elapsed().as_millis());
+            if best.as_ref().map_or(true, |b| ms < b.0) {
+                best = Some((ms, i as i32, name.clone()));
+            }
+        }
+        let Some((card_ms, card, name)) = best else { return processor() };
+        if card_ms <= CARD_IS_FINE {
+            return match Self::load_on_probed(model_path, Some(card), None) {
+                Ok(engine) => Ok((engine, name)),
+                Err(_) => processor(),
+            };
+        }
+        if let Ok(engine) = Self::load_on_probed(model_path, None, None) {
+            if let Some(ms) = engine.timed_pass(false, Some(card_ms)).filter(|&ms| ms < card_ms) {
+                eprintln!("[hvtt] the processor is quicker: {ms} ms a pass");
+                return Ok((engine, PROCESSOR.to_string()));
+            }
+            // Drop the CPU candidate before loading the winning card in this process.
+        }
+        match Self::load_on_probed(model_path, Some(card), None) {
+            Ok(engine) => Ok((engine, name)),
+            Err(_) => processor(),
+        }
+    }
+
+    /// One recognition of a second of faint made-up sound, timed - after one that is not, when
+    /// `warm` (a graphics card's first pass readies it). Given up on past `limit_ms`.
+    #[cfg(windows)]
+    fn timed_pass(&self, warm: bool, limit_ms: Option<u128>) -> Option<u128> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let samples: Vec<f32> =
+            (0..48_000u32).map(|i| 0.002 * (((i.wrapping_mul(2_654_435_761)) >> 16) as f32 / 65_536.0 - 0.5)).collect();
+        let counter = std::sync::Arc::new(AtomicU64::new(0));
+        let give_up = Some(hvtt_core::engine::GiveUp { counter: counter.clone(), value: 0 });
+        let request = TranscriptionRequest { samples, vocabulary_prompt: None, give_up, provisional: false };
+        if warm {
+            self.transcribe(&request).ok()?;
+        }
+        if let Some(ms) = limit_ms {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                counter.store(1, Ordering::SeqCst);
+            });
+        }
+        self.transcribe(&request).ok().map(|r| r.elapsed_ms)
     }
 
     /// The model this engine would load, from settings.
@@ -90,6 +205,186 @@ impl WhisperEngine {
             _ => own,
         }
     }
+}
+
+/// What `load_fastest` calls the processor, beside the graphics cards' own names.
+pub const PROCESSOR: &str = "processor";
+
+/// A graphics card this quick for one pass, in ms, is used without timing the processor against
+/// it - the speed check's own "quick enough" (`hvtt_core::models::speed_advice`).
+#[cfg(windows)]
+const CARD_IS_FINE: u128 = 1_500;
+
+#[cfg(windows)]
+const CARD_PROBE_ARGUMENT: &str = "--probe-graphics-card";
+
+/// Dispatch only the hidden Windows probe. No app state, settings, mutex or window is created.
+#[cfg(windows)]
+pub fn run_card_probe_if_requested() -> Option<i32> {
+    use std::io::Write;
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new(CARD_PROBE_ARGUMENT)) {
+        return None;
+    }
+    // A crashing driver must not open a Windows error dialog either.
+    #[link(name = "kernel32")]
+    extern "system" { fn SetErrorMode(mode: u32) -> u32; }
+    unsafe { SetErrorMode(0x0001 | 0x0002 | 0x8000); }
+    let probe = || -> Option<u128> {
+        let model = PathBuf::from(args.next()?);
+        let card: i32 = args.next()?.to_str()?.parse().ok()?;
+        let expected = args.next();
+        if card < 0 || !model.is_file() || args.next().is_some() { return None; }
+        let cards = graphics_cards();
+        let name = cards.get(card as usize)?;
+        if expected.as_ref().is_some_and(|e| e != std::ffi::OsStr::new(name)) {
+            return None;
+        }
+        let engine = WhisperEngine::load_on_probed(&model, Some(card), None).ok()?;
+        engine.timed_pass(true, None)
+    };
+    let mut probe = probe;
+    Some(match probe() {
+        Some(ms) if writeln!(std::io::stdout().lock(), "{ms}").is_ok() => 0,
+        _ => 1,
+    })
+}
+
+/// Cargo's test/example executables live in deps/ or examples/ beside the desktop executable.
+/// Never invoke a test harness as a probe, or fall back to an installed (possibly older) app.
+#[cfg(windows)]
+fn probe_executable() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    let name = current.file_name()?.to_str()?;
+    if name.eq_ignore_ascii_case("hvtt-desktop.exe") || name.eq_ignore_ascii_case("HucksVoiceToText.exe") {
+        return Some(current);
+    }
+    let dir = current.parent()?;
+    let profile = match dir.file_name()?.to_str()? {
+        "deps" | "examples" => dir.parent()?,
+        _ => return None,
+    };
+    let exe = profile.join("hvtt-desktop.exe");
+    // An example-only build may leave an older desktop binary here. Do not launch one whose
+    // entry point predates probe mode (it would start the ordinary app instead).
+    let bytes = std::fs::read(&exe).ok()?;
+    bytes.windows(CARD_PROBE_ARGUMENT.len())
+        .any(|part| part == CARD_PROBE_ARGUMENT.as_bytes()).then_some(exe)
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum ProbeExit { Exited(bool), TimedOut, Failed }
+
+/// Only a clean exit and one decimal number are evidence that the card completed both passes.
+#[cfg(windows)]
+fn probe_milliseconds(exit: ProbeExit, output: &[u8]) -> Option<u128> {
+    if !matches!(exit, ProbeExit::Exited(true)) { return None; }
+    let number = std::str::from_utf8(output).ok()?.trim();
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    number.parse().ok()
+}
+
+/// A generous two minutes includes model loading and first-use shader compilation. Drain stdout
+/// concurrently (bounded), so even unexpected driver output cannot block the timeout. Reap the
+/// child on failure. Cleanup is bounded too: a broken driver must not turn wait() after kill()
+/// into another indefinite wait. Windows releases our process handle when Child is dropped.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn probe_card(exe: &Path, model: &Path, card: i32, name: &str) -> Option<u128> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    let mut child = Command::new(exe)
+        .arg(CARD_PROBE_ARGUMENT).arg(model).arg(card.to_string()).arg(name)
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().ok()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.take(128).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = send.send(result);
+    });
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let exit = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break ProbeExit::Exited(status.success()),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            result => {
+                let _ = child.kill();
+                let cleanup_until = Instant::now() + Duration::from_secs(1);
+                while matches!(child.try_wait(), Ok(None)) && Instant::now() < cleanup_until {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                break if result.is_err() { ProbeExit::Failed } else { ProbeExit::TimedOut };
+            }
+        }
+    };
+    let bytes = receive.recv_timeout(Duration::from_secs(1)).ok()?.ok()?;
+    probe_milliseconds(exit, &bytes)
+}
+
+/// Windows: is Vulkan's loader in the program? It must be before whisper.cpp is first touched:
+/// the engine looks for graphics cards whenever it starts, and with no loader that look would end
+/// the program. The graphics driver's own copy comes first - it is the one that matches the
+/// driver; on a PC with none, the copy the installer puts beside the program is used, finds no
+/// card, and recognition runs on the processor.
+#[cfg(windows)]
+pub fn vulkan_ready() -> bool {
+    use windows::core::w;
+    use windows::Win32::System::LibraryLoader::{LoadLibraryExW, LoadLibraryW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *READY.get_or_init(|| unsafe {
+        LoadLibraryExW(w!("vulkan-1.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).is_ok()
+            || LoadLibraryW(w!("vulkan-1.dll")).is_ok()
+    })
+}
+
+/// The graphics cards whisper.cpp can run on here, by the names their drivers give, in the order
+/// `load_on` counts them. Two cards of the same name are told apart - "… (2)" - so the one
+/// remembered is the one found again, not the first of that name (Codex's review, 2026-10-05).
+/// Empty off Windows, where `load` needs no choosing.
+pub fn graphics_cards() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        use whisper_rs_sys as sys;
+        if !vulkan_ready() {
+            return Vec::new();
+        }
+        let mut cards = Vec::new();
+        unsafe {
+            for i in 0..sys::ggml_backend_dev_count() {
+                let device = sys::ggml_backend_dev_get(i);
+                let kind = sys::ggml_backend_dev_type(device);
+                if kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+                    || kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU
+                {
+                    let name = sys::ggml_backend_dev_description(device);
+                    let name = if name.is_null() {
+                        "graphics card".to_string()
+                    } else {
+                        std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
+                    };
+                    cards.push(numbered(&cards, name));
+                }
+            }
+        }
+        cards
+    }
+    #[cfg(not(windows))]
+    Vec::new()
+}
+
+/// `name`, or "`name` (2)", "`name` (3)"… when `cards` already has one called that.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn numbered(cards: &[String], name: String) -> String {
+    (1..)
+        .map(|n| if n == 1 { name.clone() } else { format!("{name} ({n})") })
+        .find(|candidate| !cards.contains(candidate))
+        .expect("some number is free")
 }
 
 /// Whisper asks this between steps; `true` abandons the recognition.
@@ -228,5 +523,47 @@ impl Transcriber for WhisperEngine {
             sentences,
             elapsed_ms: started.elapsed().as_millis(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn only_a_clean_probe_with_a_number_is_usable() {
+        assert_eq!(probe_milliseconds(ProbeExit::Exited(true), b"530\r\n"), Some(530));
+        assert_eq!(probe_milliseconds(ProbeExit::Exited(true), b"0\n"), Some(0));
+        for output in [b"".as_slice(), b"driver error", b"12\n34", b"-1", b"NaN", b"\xff"] {
+            assert_eq!(probe_milliseconds(ProbeExit::Exited(true), output), None);
+        }
+        assert_eq!(probe_milliseconds(ProbeExit::Exited(true), &[b'9'; 128]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_or_timed_out_probe_is_unusable_even_if_it_printed_a_time() {
+        for exit in [ProbeExit::Exited(false), ProbeExit::TimedOut, ProbeExit::Failed] {
+            assert_eq!(probe_milliseconds(exit, b"530\n"), None);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tests_find_the_desktop_binary_instead_of_probing_the_test_harness() {
+        let exe = probe_executable().expect("cargo test builds the desktop binary for integration tests");
+        assert_eq!(exe.file_name().unwrap(), "hvtt-desktop.exe");
+        assert_ne!(exe, std::env::current_exe().unwrap());
+    }
+
+    #[test]
+    fn two_graphics_cards_of_the_same_name_are_told_apart() {
+        let mut cards: Vec<String> = Vec::new();
+        for name in ["Arc A750", "Radeon", "Arc A750", "Arc A750"] {
+            let name = numbered(&cards, name.to_string());
+            cards.push(name);
+        }
+        assert_eq!(cards, ["Arc A750", "Radeon", "Arc A750 (2)", "Arc A750 (3)"]);
     }
 }

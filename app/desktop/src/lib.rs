@@ -45,7 +45,7 @@ use hvtt_core::drafts::DraftStore;
 use hvtt_core::pipeline::Destination;
 use hvtt_core::engine::{Transcriber, TranscriptionRequest};
 use hvtt_core::session::SessionState;
-use hvtt_core::settings::{ClipboardChoice, LiveWords, Settings};
+use hvtt_core::settings::{ClipboardChoice, DictationStyle, LiveWords, Settings};
 use hvtt_core::transcript::Transcript;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -110,6 +110,8 @@ struct Snapshot {
     live_words: LiveWords,
     /// Which dictation this is, so the box's own click and key counts are never mixed up.
     generation: u64,
+    /// This dictation is a held one (Dictation Style > Hold to Talk): no words, Pause or Send.
+    hold: bool,
 }
 
 /// The product's latency numbers. Measured every session so a regression shows up in normal use
@@ -305,6 +307,9 @@ impl App {
             (s.shortcut.clone(), s.clipboard, s.paste_shortcut.clone(), s.learning, s.live_words)
         };
         let live = self.live.lock().clone();
+        // Read once: a lock taken twice in the one expression below never comes back (it froze
+        // the program on opening, 2026-10-05).
+        let generation = *self.generation.lock();
         Snapshot {
             state: session.name().to_string(),
             message: self.message.lock().clone(),
@@ -335,7 +340,8 @@ impl App {
             settling: live.settling,
             learning,
             live_words,
-            generation: *self.generation.lock(),
+            generation,
+            hold: held(generation),
         }
     }
 
@@ -397,6 +403,15 @@ fn on_main<T: Send + 'static>(
     .ok()?;
     answer.recv_timeout(std::time::Duration::from_secs(5)).ok()
 }
+
+/// Held while which dictation is the current one changes - one starting (`start_recording`), or
+/// the box put away with nothing kept (`dismiss_now`) - and while a `finish` worker makes a
+/// dictation its own. Those changes are several steps on the main thread, and a worker looking
+/// in between them could check the dictation it was asked about and then take the *next* one's
+/// recording (Codex's second review of hold to talk, 2026-10-05). The main thread holds it only
+/// across its own steps and the worker only across its few; neither waits on the other
+/// meanwhile, so this is not the kind of lock `on_main` warns about.
+static DICTATION_CHANGES: Mutex<()> = Mutex::new(());
 
 /// `on_main` for work nobody waits on: it takes its turn on the main thread and the caller goes on.
 fn post_to_main(app: &AppHandle, f: impl FnOnce(&AppHandle) + Send + 'static) {
@@ -495,7 +510,8 @@ fn register_shortcut(app: &AppHandle, accelerator: &str, action: Action) -> Resu
             // real V is still held, so a paste sent on press never arrived (measured
             // 2026-09-25). Control and Option may still be down; they do not leak.
             match (action, event.state()) {
-                (Action::Dictate, ShortcutState::Pressed) => toggle(handle.clone()),
+                (Action::Dictate, ShortcutState::Pressed) => dictate_pressed(handle.clone()),
+                (Action::Dictate, ShortcutState::Released) => post_to_main(handle, hold_released),
                 (Action::PasteLast, ShortcutState::Released) => paste_last(),
                 _ => {}
             }
@@ -694,7 +710,7 @@ fn show_update(app: &AppHandle, stage: &'static str, title: String, detail: Stri
 ///
 /// Setting a message is not the same as showing it: a warning must not be counted as given unless
 /// this says so (Codex's third review of the 0.1.8 candidate).
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn message_on_screen(session: &SessionState, rebinding: bool, view: Option<&UpdateView>, title: &str) -> bool {
     let Some(view) = view.filter(|v| v.title == title) else { return false };
     if rebinding {
@@ -708,7 +724,7 @@ fn message_on_screen(session: &SessionState, rebinding: bool, view: Option<&Upda
 }
 
 /// `message_on_screen`, for the program as it stands.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn on_screen(state: &App, title: &str) -> bool {
     // One lock at a time: `snapshot` holds the session while it reads the others.
     let rebinding = state.rebinding.lock().is_some();
@@ -1045,7 +1061,8 @@ const TRAY: &str = "hvtt";
 fn menu_key(state: &App) -> String {
     let s = state.settings.lock().clone();
     format!(
-        "{}|{}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{}|{:?}|{}|{}",
+        "{:?}|{}|{}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{}|{:?}|{}|{}",
+        s.dictation_style,
         state.session.lock().is_dictating(),
         s.shortcut,
         s.paste_shortcut,
@@ -1143,8 +1160,16 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
         huck,
     )?)?;
 
-    // Plain words, so nobody has to know what processor they have.
-    let live = Submenu::with_id(app, "live-words", "Live Words", true)?;
+    // How he dictates: it decides whether Live Words, just below it, applies.
+    let hold = HOLD_TO_TALK_HERE && s.dictation_style == DictationStyle::HoldToTalk;
+    let style = Submenu::with_id(app, "dictation-style", "Dictation Style", !recording)?;
+    style.append(&check("style-press", "Press to Start, Press to Send", !hold)?)?;
+    style.append(&check("style-hold", "Hold to Talk — let go to send", hold)?)?;
+
+    // Plain words, so nobody has to know what processor they have. Greyed with Hold to Talk,
+    // which shows no words while he holds - and saying so, so the grey explains itself.
+    let live_title = if hold { "Live Words — only with Press to Start, Press to Send" } else { "Live Words" };
+    let live = Submenu::with_id(app, "live-words", live_title, !hold)?;
     live.append(&check("live-as-you-talk", "As You Talk", s.live_words == LiveWords::AsYouTalk)?)?;
     live.append(&check(
         "live-lighter",
@@ -1156,6 +1181,10 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     let settings = Submenu::with_id(app, "settings", "Settings", true)?;
     settings.append(&shortcuts)?;
     settings.append(&clipboard)?;
+    // Right above Live Words (his placing, 2026-10-05): it decides whether Live Words applies.
+    if HOLD_TO_TALK_HERE {
+        settings.append(&style)?;
+    }
     settings.append(&live)?;
     // Same plain words: what happens, and what it costs.
     let stop = Submenu::with_id(app, "stop-talking", "When I Stop Talking", true)?;
@@ -1289,6 +1318,8 @@ fn on_menu(app: &AppHandle, id: &str) {
         "live-as-you-talk" => update_settings(app, |s| s.live_words = LiveWords::AsYouTalk),
         "live-lighter" => update_settings(app, |s| s.live_words = LiveWords::Lighter),
         "live-off" => update_settings(app, |s| s.live_words = LiveWords::Off),
+        "style-press" => update_settings(app, |s| s.dictation_style = DictationStyle::PressToSend),
+        "style-hold" => update_settings(app, |s| s.dictation_style = DictationStyle::HoldToTalk),
         "stop-quick" => update_settings(app, |s| s.careful_stop = false),
         "stop-careful" => update_settings(app, |s| s.careful_stop = true),
         "forget-all" => update_settings(app, |s| s.fixes.clear()),
@@ -1385,9 +1416,9 @@ fn quit(app: AppHandle) {
             // chosen arrived while this Quit was keeping everything.
             #[cfg(windows)]
             let held_now = held_on_huck_clipboard();
-            // Windows: his clipboard is out on loan and cannot be given back. Said once; chosen
-            // again with that on the box, what he had copied is let go, and the way is clear.
-            #[cfg(windows)]
+            // His clipboard is out on loan and cannot be given back. Said once; chosen again with
+            // that on the box, what he had copied is let go, and the way is clear. (The Mac too
+            // since 2026-10-04.)
             let kept = kept || left_without_his_clipboard(&app, "warning", "Quit", "leave", asked.clipboard);
             // Windows: words a Quit has put on Huck's Clipboard leave with the program
             // (`HuckUntold`). The box says so and this Quit stays; chosen again with that
@@ -1468,8 +1499,7 @@ struct Asked {
     /// Windows: what Huck's Clipboard held.
     #[cfg(windows)]
     held: Option<String>,
-    /// Windows: the borrow whose "not back yet" warning was on the box.
-    #[cfg(windows)]
+    /// The borrow whose "not back yet" warning was on the box.
     clipboard: Option<u64>,
     /// Windows: the words whose "paste what you need first" warning was on the box.
     #[cfg(windows)]
@@ -1487,7 +1517,6 @@ impl Asked {
             unsaved_seen: quit_confirmation_showing(&state),
             #[cfg(windows)]
             held: held_on_huck_clipboard(),
-            #[cfg(windows)]
             clipboard: agreed_to_leave_without_clipboard(&state),
             #[cfg(windows)]
             words: HUCK_UNTOLD.lock().agreed(paste_first),
@@ -1495,10 +1524,11 @@ impl Asked {
     }
 }
 
-/// The two things the box says before the program leaves with something of his (Windows).
+/// The two things the box says before the program leaves with something of his. The first is
+/// Windows' alone: there Huck's Clipboard leaves with the program.
 #[cfg(windows)]
 const PASTE_FIRST: &str = "Paste what you need first";
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 const CLIPBOARD_NOT_BACK: &str = "Your clipboard isn't back yet";
 
 /// What Huck's Clipboard holds, if it holds any words.
@@ -1664,7 +1694,7 @@ fn paste_first_shown(app: &AppHandle) -> bool {
 }
 
 /// The borrow whose stuck give-back the box has told him about (`left_without_his_clipboard`).
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 static CLIPBOARD_TOLD: Mutex<Option<u64>> = Mutex::new(None);
 
 /// The borrow he is agreeing to leave without: the box's warning about it is in front of him as
@@ -1672,16 +1702,16 @@ static CLIPBOARD_TOLD: Mutex<Option<u64>> = Mutex::new(None);
 /// Open Update puts up "Installing…", and a Quit that finishes a dictation puts the box away; read
 /// afterwards, the warning was always already gone, and Open Update could only ever say it again
 /// (Codex's fourth review).
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 fn agreed_to_leave_without_clipboard(state: &App) -> Option<u64> {
     let (borrow, _) = crate::clip::huck::unreturned()?;
     let told = *CLIPBOARD_TOLD.lock() == Some(borrow);
     (told && on_screen(state, CLIPBOARD_NOT_BACK)).then_some(borrow)
 }
 
-/// Windows: the program is asked to leave while his clipboard is out on loan for a paste and
-/// cannot be given back - another program is holding the clipboard, or the clipboard will not
-/// take his things. What he had copied is never dropped silently: the first time, the box says so
+/// The program is asked to leave while his clipboard is out on loan for a paste and cannot be
+/// given back - another program is holding the clipboard (Windows), or the clipboard will not
+/// take his things (both; the Mac since 2026-10-04). What he had copied is never dropped silently: the first time, the box says so
 /// and the program stays (the give-back keeps trying meanwhile, and a new copy of his own ends
 /// it); asked again, it is let go, and `true` says the way is clear. (Codex's second review of
 /// the 0.1.8 candidate.)
@@ -1695,7 +1725,7 @@ fn agreed_to_leave_without_clipboard(state: &App) -> Option<u64> {
 /// `stage`: how the box shows it - `"warning"` is said in every resting state; `"ready"` keeps
 /// Open Update's button, and shows only when the box is idle. `agreed`: the borrow whose warning
 /// was in front of him when he asked (`agreed_to_leave_without_clipboard`).
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 fn left_without_his_clipboard(
     app: &AppHandle,
     stage: &'static str,
@@ -1882,10 +1912,14 @@ fn copy_words(app: AppHandle) {
 /// The box's Discard button: he does not want the words that could not be copied. The one way,
 /// besides a second Quit with them in front of him, that such words are let go.
 #[tauri::command]
-fn discard_words(app: AppHandle) {
-    post_to_main(&app, |app| {
+fn discard_words(app: AppHandle, generation: u64) {
+    post_to_main(&app, move |app| {
         let state: State<App> = app.state();
-        // Only the box it was pressed in: a dictation started since is not closed by a late click.
+        // Only the box it was pressed in, by its dictation's number: a late click must not let
+        // go of a later dictation's words, which may be unsaved too.
+        if !from_this_box(&state, generation) {
+            return;
+        }
         let ready = matches!(*state.session.lock(), SessionState::Ready);
         if !ready || !*state.not_copied.lock() {
             return;
@@ -2044,7 +2078,7 @@ fn keep_everything_before_exit(app: &AppHandle, limit: std::time::Duration) -> b
         }
     }
     if state.session.lock().is_dictating() {
-        finish(app.clone(), false);
+        finish(app.clone(), false, None);
     }
     loop {
         let busy = {
@@ -2060,11 +2094,73 @@ fn keep_everything_before_exit(app: &AppHandle, limit: std::time::Duration) -> b
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let left = deadline.saturating_duration_since(std::time::Instant::now());
-    // Windows: a give-back already known to be stuck gets a moment, not the whole wait - the
-    // caller tells him instead (`left_without_his_clipboard`).
-    #[cfg(windows)]
+    // A give-back already known to be stuck gets a moment, not the whole wait - the caller
+    // tells him instead (`left_without_his_clipboard`).
     let left = if clip::huck::unreturned().is_some() { left.min(std::time::Duration::from_secs(2)) } else { left };
     clip::huck::stop_borrowing(left)
+}
+
+/// The dictation a held shortcut started (Dictation Style > Hold to Talk), by its number; 0 for
+/// none. Fixed when the dictation starts, as its clipboard is: a change in the menu while he
+/// holds applies from the next one.
+static HELD_DICTATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The dictation about to start is a held one: set around `toggle_now`, read by
+/// `start_recording`. Both on the main thread.
+static HOLD_NEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A held dictation that letting go has not ended yet - so the two ways of noticing the release
+/// (the shortcut's own report, and on Windows the keyboard hook) end it once.
+static HOLD_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Windows: the number `windows_paste` gave the held dictation's keys; 0 for none. A report that
+/// a held key came up names its hold, and is acted on only if it is still this one.
+#[cfg(windows)]
+static HOLD_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the box says while he holds.
+const HOLD_LISTENING: &str = "Listening — let go to send";
+
+/// Hold to Talk exists on Windows only until the Mac's half is written (`macos_paste.rs` must
+/// leave a held key's own auto-repeat out of its count, and end on either key): until then the
+/// Mac neither offers the style nor acts on it, whatever a settings file says.
+const HOLD_TO_TALK_HERE: bool = cfg!(windows);
+
+/// Is dictation number `generation` a held one?
+fn held(generation: u64) -> bool {
+    generation != 0 && HELD_DICTATION.load(std::sync::atomic::Ordering::SeqCst) == generation
+}
+
+/// The dictation shortcut going down. Press style: start, or send. Hold style: start, and
+/// letting go sends (`hold_released`).
+fn dictate_pressed(app: AppHandle) {
+    post_to_main(&app, |app| {
+        use std::sync::atomic::Ordering::SeqCst;
+        let state: State<App> = app.state();
+        let hold = HOLD_TO_TALK_HERE && state.settings.lock().dictation_style == DictationStyle::HoldToTalk;
+        HOLD_NEXT.store(hold, SeqCst);
+        toggle_now(app, true);
+        HOLD_NEXT.store(false, SeqCst);
+    });
+}
+
+/// The dictation shortcut coming up - or, on Windows, any one of its keys (`windows_paste`'s
+/// hook). Ends a held dictation and sends it; does nothing for any other. No stop *press* was
+/// made, so the paste gate is told to expect none.
+fn hold_released(app: &AppHandle) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let state: State<App> = app.state();
+    // One lock, let go, then the other: both in one condition would hold the dictation's number
+    // while waiting for the session - the other way round from `snapshot`, which any thread
+    // may be in the middle of (found in Claude's own re-read, 2026-10-05, before it froze anything).
+    let generation = *state.generation.lock();
+    let dictating = state.session.lock().is_dictating();
+    if !held(generation) || !dictating {
+        return;
+    }
+    // Leaving: the dictation is being finished and kept, as with the shortcut pressed again.
+    if LEAVING.lock().leaving || !HOLD_OPEN.swap(false, SeqCst) {
+        return;
+    }
+    finish(app.clone(), true, Some(false));
 }
 
 /// The dictation shortcut: start, or - listening or paused - send.
@@ -2098,8 +2194,7 @@ fn toggle_now(app: &AppHandle, by_key: bool) {
         if LEAVING.lock().leaving {
             return;
         }
-        crate::destination::box_input::set_stopped_by_key(by_key);
-        finish(app.clone(), true);
+        finish(app.clone(), true, Some(by_key));
     } else if !busy {
         // Words that are only in the box are not thrown away by starting again. One more try at
         // copying them; if the clipboard still will not take them the box says so, and no
@@ -2125,6 +2220,16 @@ struct BoxInput {
     keys_repeated: u32,
 }
 
+/// Is a command from the box about the dictation that is the current one now? The box sends the
+/// number of the dictation it was showing when the button was pressed. A click that arrives late -
+/// that dictation over, another in the box - must do nothing to the other: until 2026-10-05 a
+/// late Discard could let go of the next dictation's unsaved words, and a late edit could write
+/// one dictation's words over another's (Codex's fourth review of hold to talk; both platforms,
+/// older than that work).
+fn from_this_box(state: &App, generation: u64) -> bool {
+    *state.generation.lock() == generation
+}
+
 fn note_input(input: BoxInput) {
     crate::destination::box_input::record(
         input.generation,
@@ -2144,6 +2249,9 @@ fn box_input(input: BoxInput) {
 fn pause_resume(app: AppHandle, input: BoxInput) {
     note_input(input);
     let state: State<App> = app.state();
+    if !from_this_box(&state, input.generation) {
+        return;
+    }
     let now = state.session.lock().clone();
     match now {
         SessionState::Recording => pause(app.clone()),
@@ -2185,16 +2293,21 @@ fn box_became_key(app: &AppHandle) {
 #[tauri::command]
 fn send(app: AppHandle, input: BoxInput) {
     note_input(input);
+    if !from_this_box(&app.state::<App>(), input.generation) {
+        return;
+    }
     let dictating = app.state::<App>().session.lock().is_dictating();
-    if dictating {
-        crate::destination::box_input::set_stopped_by_key(false);
+    // Leaving: the dictation is being finished and kept, and Send - like the shortcut - does
+    // nothing; it could otherwise get in ahead of the keeping and deliver (Codex's second review
+    // of hold to talk).
+    if dictating && !LEAVING.lock().leaving {
         // macOS: the click made this the active app, so the box does hold the keyboard; saying so
         // has `finish` hand it back, and wait for the caret, before anything is pasted.
         #[cfg(target_os = "macos")]
         {
             *app.state::<App>().box_has_keyboard.lock() = true;
         }
-        finish(app.clone(), true);
+        finish(app.clone(), true, Some(false));
     }
 }
 
@@ -2203,6 +2316,9 @@ fn send(app: AppHandle, input: BoxInput) {
 fn edit_text(app: AppHandle, text: String, input: BoxInput) {
     note_input(input);
     let state: State<App> = app.state();
+    if !from_this_box(&state, input.generation) {
+        return;
+    }
     let paused = matches!(*state.session.lock(), SessionState::Paused);
     let mut live = state.live.lock();
     if paused && !live.settling && live.text != text {
@@ -2216,6 +2332,9 @@ fn edit_text(app: AppHandle, text: String, input: BoxInput) {
 fn take_keyboard(app: AppHandle, input: BoxInput) {
     note_input(input);
     let state: State<App> = app.state();
+    if !from_this_box(&state, input.generation) {
+        return;
+    }
     if !state.session.lock().is_dictating() {
         return;
     }
@@ -2298,6 +2417,14 @@ fn end_rebinding(app: &AppHandle) -> bool {
 /// `dismiss`, in its turn on the main thread - the only place the box is put away (`on_main`).
 fn dismiss_now(app: &AppHandle) {
     let state: State<App> = app.state();
+    // Everything this decides, it decides with nothing able to change underneath
+    // (`DICTATION_CHANGES`), and once. Looked at before the lock, a dictation could move on
+    // before the reset below: a live pass settles words and a `finish` already asked for takes
+    // the dictation - or goes all the way to "finished, and its words saved nowhere" - and the
+    // reset then wiped words it had judged not to be there (Codex's third and fourth reviews of
+    // hold to talk, 2026-10-05). Under the lock no `finish` can begin; one that has begun shows
+    // as Transcribing, and one that is done shows what it left. Let go before the box is hidden.
+    let changing = DICTATION_CHANGES.lock();
     let (busy, dictating) = {
         let session = state.session.lock();
         (matches!(*session, SessionState::Transcribing), session.is_dictating())
@@ -2306,9 +2433,14 @@ fn dismiss_now(app: &AppHandle) {
         // The words are about to be copied and delivered.
         return;
     }
-    if dictating && dictation_has_words(&state) {
-        finish(app.clone(), false);
-        return;
+    if dictating {
+        // No pass settles anything after this, so what is looked at next is all there will be.
+        state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if dictation_has_words(&state) {
+            drop(changing);
+            finish(app.clone(), false, None);
+            return;
+        }
     }
     // Words that are saved nowhere else - the clipboard would not take them, and no draft was
     // written - are not thrown away by closing the box. It shows them, with Copy and Discard.
@@ -2349,6 +2481,7 @@ fn dismiss_now(app: &AppHandle) {
     *state.message.lock() = String::new();
     *state.elapsed_ms.lock() = 0;
     state.set_state(SessionState::Idle);
+    drop(changing);
     // The dictation is over, so let go of where it went. On Windows this is also what ends the
     // click and key count behind the paste gate, which runs only while a dictation needs it.
     #[cfg(windows)]
@@ -2443,12 +2576,24 @@ fn start_recording(app: AppHandle, admitted: Admitted) {
     //    visible; it is the most felt number in the product.
     // A new dictation starts empty. The previous words are already in their text box, or on
     // the clipboard and in the recovery draft; appending them would send old words somewhere new.
+    // From here until this dictation's recording is stored, one piece as far as a `finish`
+    // worker can tell (`DICTATION_CHANGES`).
+    let changing = DICTATION_CHANGES.lock();
     let generation = {
         let mut g = state.generation.lock();
         *g += 1;
         *g
     };
     crate::destination::box_input::reset(generation);
+    // Held (Hold to Talk), or not: decided here, for the whole dictation.
+    let hold = HOLD_NEXT.swap(false, std::sync::atomic::Ordering::SeqCst);
+    HELD_DICTATION.store(if hold { generation } else { 0 }, std::sync::atomic::Ordering::SeqCst);
+    HOLD_OPEN.store(hold, std::sync::atomic::Ordering::SeqCst);
+    // Windows: from here until the shortcut's own key comes up, its auto-repeat reaches no
+    // program, and any one of the shortcut's keys coming up ends the dictation - this hold's
+    // keys, by its own number, so a late word about an earlier hold ends nothing.
+    #[cfg(windows)]
+    HOLD_KEYS.store(if hold { platform_paste::hold_started() } else { 0 }, std::sync::atomic::Ordering::SeqCst);
     state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     *state.live.lock() = Live::default();
     *state.box_has_keyboard.lock() = false;
@@ -2475,7 +2620,7 @@ fn start_recording(app: AppHandle, admitted: Admitted) {
     // Counted again now it shows as recording: a speed check that found nothing happening read the
     // count before this, so it is given up (Codex's eighteenth review).
     state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    *state.message.lock() = "Listening…".into();
+    *state.message.lock() = if hold { HOLD_LISTENING.into() } else { "Listening…".into() };
     *state.elapsed_ms.lock() = 0;
     *state.pin_note.lock() = None;
     *state.destination.lock() = None;
@@ -2495,7 +2640,14 @@ fn start_recording(app: AppHandle, admitted: Admitted) {
     match opened {
         Ok(rec) => {
             *state.recording.lock() = Some(rec);
+            drop(changing);
             state.timings.lock().shortcut_to_capture_ms = pressed.elapsed().as_millis();
+            // Windows, held: a key of the shortcut let go while the microphone was opening. Looked
+            // for here, not where the hold began - only now is there a recording to end.
+            #[cfg(windows)]
+            if hold && platform_paste::hold_already_let_go(HOLD_KEYS.load(std::sync::atomic::Ordering::SeqCst)) {
+                hold_released(&app);
+            }
             spawn_level_pump(app.clone());
             spawn_live(app.clone(), generation);
         }
@@ -2527,7 +2679,7 @@ fn start_recording(app: AppHandle, admitted: Admitted) {
         let browser = browser_pin.join().ok();
         let found = std::cell::RefCell::new(Pinned::default());
         #[cfg(target_os = "macos")]
-        resolve_pin(&app2, pending, stamp, browser, borrow, &found);
+        resolve_pin(pending, stamp, browser, borrow, &found);
         #[cfg(windows)]
         resolve_pin_windows(&app2, stamp, browser, borrow, &found);
         #[cfg(not(any(target_os = "macos", windows)))]
@@ -2535,6 +2687,13 @@ fn start_recording(app: AppHandle, admitted: Admitted) {
         let found = found.into_inner();
         post_to_main(&app2, move |app| {
             let state: State<App> = app.state();
+            // macOS: whether Accessibility is granted is a fact about the program, not about
+            // this dictation, so it is kept up even when the dictation is over - asked afresh
+            // here rather than taken from a worker that may have asked long ago.
+            #[cfg(target_os = "macos")]
+            if found.accessibility.is_some() {
+                *state.ax_trusted.lock() = accessibility_ready();
+            }
             let session = state.session.lock().clone();
             let now = *state.generation.lock();
             let Some(found) = place_pin(&state.destination, found, generation, now, &session) else {
@@ -2544,7 +2703,11 @@ fn start_recording(app: AppHandle, admitted: Admitted) {
             if let Some(label) = found.label {
                 // Still listening or paused: say where it will go. Later, the line is busy.
                 if session.is_dictating() {
-                    *state.message.lock() = format!("Listening — will send to {label}");
+                    *state.message.lock() = if held(generation) {
+                        format!("{HOLD_LISTENING} to {label}")
+                    } else {
+                        format!("Listening — will send to {label}")
+                    };
                 }
             }
             if let Some(e) = found.note {
@@ -2574,6 +2737,11 @@ struct Pinned {
     /// macOS: Accessibility has not been granted, and the one-time ask is due.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ask_permission: bool,
+    /// macOS: the worker asked whether Accessibility is granted. It does not write the answer
+    /// itself (`App::ax_trusted`): the main thread asks again in its own turn, so a worker that
+    /// finishes late cannot put an old answer over a grant made since.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    accessibility: Option<bool>,
 }
 
 /// What is left to say once a destination has been placed.
@@ -2746,7 +2914,6 @@ fn resolve_pin_windows(
 /// words whichever way this goes.
 #[cfg(target_os = "macos")]
 fn resolve_pin(
-    app: &AppHandle,
     pending: hvtt_core::pinning::PendingPin<crate::destination::macos_ax::AxElement>,
     stamp: Option<crate::destination::macos_paste::FocusStamp>,
     browser: Option<Result<crate::destination::chromium::ChromiumDestination, String>>,
@@ -2755,8 +2922,6 @@ fn resolve_pin(
 ) {
     use crate::destination::macos_paste::{PasteDestination, SameWindow};
     use crate::destination::{is_chromium_executable, is_unsupported_executable, macos_ax};
-
-    let state: State<App> = app.state();
 
     // The front window's owner stands in when Accessibility shows no focused element, which is
     // how Electron apps look from outside.
@@ -2800,8 +2965,10 @@ fn resolve_pin(
     // Everything below writes or pastes into another app, and macOS allows neither without
     // Accessibility. Its own prompt adds the app to the list - the plain check never did, which
     // left nothing to switch on. Once per launch.
+    // Whether it is granted is for the menu too (`ax_trusted`), and is written where this
+    // worker's other findings are applied: on the main thread, by `Pinned::accessibility`.
     let trusted = macos_ax::accessibility_trusted();
-    *state.ax_trusted.lock() = trusted;
+    found.borrow_mut().accessibility = Some(trusted);
     if !trusted {
         // The ask itself is made on the main thread, with the rest of what was found.
         found.borrow_mut().ask_permission = true;
@@ -3032,7 +3199,12 @@ fn spawn_live(app: AppHandle, generation: u64) {
         if !same || !state.session.lock().is_dictating() {
             break;
         }
-        let live_words = state.settings.lock().live_words;
+        // Held: nothing is shown - but the words are still recognised as he talks, at the
+        // lighter pace, whatever Live Words says. They are what a Quit, a sign-out or a shutdown
+        // keeps (`keep_words_so_far`); without them a held dictation cut short by a shutdown
+        // had nothing recognised at all, and four seconds to do the whole of it (Codex's review
+        // of hold to talk, 2026-10-05).
+        let live_words = if held(generation) { LiveWords::Lighter } else { state.settings.lock().live_words };
         if !state.session.lock().is_capturing() || live_words == LiveWords::Off {
             breather = std::time::Duration::from_millis(300);
             continue;
@@ -3121,27 +3293,42 @@ fn spawn_live(app: AppHandle, generation: u64) {
 
 /// Pause: the microphone stops, the words he was in the middle of are finished, and the text
 /// can be fixed in the box. Nothing said while paused is kept.
+///
+/// **Of the dictation it was asked for, and no other** (Codex's third review of hold to talk,
+/// 2026-10-05; both platforms, older than that work). This is a worker: by the time it runs, or
+/// by the time its recognition is done, that dictation may have been closed and another begun -
+/// which it then marked Paused, and whose first seconds it then marked as already heard. The
+/// dictation is named where Pause is asked for, and both of this worker's changes are made
+/// only while it is still the one (`DICTATION_CHANGES`).
 fn pause(app: AppHandle) {
+    let wanted = *app.state::<App>().generation.lock();
     std::thread::spawn(move || {
         let state: State<App> = app.state();
         let _pass = state.live_pass.lock();
-        if !state.session.lock().is_capturing() {
-            return;
-        }
-        state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Nothing else moves `heard_upto` while this holds `live_pass`.
-        let (from, before) = {
-            let live = state.live.lock();
-            (live.heard_upto, live.text.clone())
+        let (from, before, rest) = {
+            let _same = DICTATION_CHANGES.lock();
+            if *state.generation.lock() != wanted {
+                return;
+            }
+            if !state.session.lock().is_capturing() {
+                return;
+            }
+            state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Nothing else moves `heard_upto` while this holds `live_pass`.
+            let (from, before) = {
+                let live = state.live.lock();
+                (live.heard_upto, live.text.clone())
+            };
+            let rest = {
+                let rec = state.recording.lock();
+                let Some(r) = rec.as_ref() else { return };
+                r.pause();
+                r.peek_from(from)
+            };
+            state.set_state(SessionState::Paused);
+            state.live.lock().settling = true;
+            (from, before, rest)
         };
-        let rest = {
-            let rec = state.recording.lock();
-            let Some(r) = rec.as_ref() else { return };
-            r.pause();
-            r.peek_from(from)
-        };
-        state.set_state(SessionState::Paused);
-        state.live.lock().settling = true;
         *state.level.lock() = 0.0;
         push(&app);
 
@@ -3153,6 +3340,12 @@ fn pause(app: AppHandle) {
             None => Rest { words: None, unrecognised_secs: 0.0, failed: Some((0, "no speech model is loaded".into())) },
         };
         {
+            // Still that dictation: another's words and place in its sound are not this one's
+            // to write.
+            let _same = DICTATION_CHANGES.lock();
+            if *state.generation.lock() != wanted {
+                return;
+            }
             let mut live = state.live.lock();
             live.heard_upto = from + heard.failed.as_ref().map_or(rest.len(), |(at, _)| *at);
             if let Some(words) = &heard.words {
@@ -3175,18 +3368,30 @@ fn pause(app: AppHandle) {
 }
 
 /// Resume: the microphone opens again and new words carry on after the ones in the box.
+///
+/// Of the dictation it was asked for, as `pause` is - and only if its recording is still there:
+/// without one, "Recording" would be a dictation nothing could finish.
 fn resume(app: AppHandle) {
+    let wanted = *app.state::<App>().generation.lock();
     std::thread::spawn(move || {
         let state: State<App> = app.state();
         let _pass = state.live_pass.lock();
-        if !matches!(*state.session.lock(), SessionState::Paused) {
-            return;
+        {
+            let _same = DICTATION_CHANGES.lock();
+            if *state.generation.lock() != wanted {
+                return;
+            }
+            if !matches!(*state.session.lock(), SessionState::Paused) {
+                return;
+            }
+            {
+                let rec = state.recording.lock();
+                let Some(r) = rec.as_ref() else { return };
+                r.resume();
+            }
+            state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            state.set_state(SessionState::Recording);
         }
-        if let Some(r) = state.recording.lock().as_ref() {
-            r.resume();
-        }
-        state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        state.set_state(SessionState::Recording);
         push(&app);
     });
 }
@@ -3245,20 +3450,53 @@ fn learn_from(app: &AppHandle, recognised: &str, sent: &str) {
 
 /// Finish the dictation: recognise the last few seconds, then deliver - or, when he closed the
 /// box instead of sending, only keep the words (draft and clipboard) and put the box away.
-fn finish(app: AppHandle, deliver: bool) {
+///
+/// **The first ending asked for is the one a dictation gets, and it is that dictation's alone**
+/// (Codex's review of hold to talk, 2026-10-05). The session only shows as ending once this
+/// worker has its turn, so until then a second request could still be made - he closes the box
+/// while holding, then lets go - and whichever worker ran first decided whether his words were
+/// sent or only kept. And a worker that waited could end the dictation *after* the one it was
+/// asked about. So the dictation is named here, where the ending is asked for, and asked once.
+///
+/// `stopped_by_key`: what the paste gate is to expect of this ending - a stop press, or none -
+/// when the caller knows. Noted only if this request is the one taken: a request that is
+/// refused must change nothing about the one that was (Codex's second review).
+///
+/// Whether the request was taken.
+fn finish(app: AppHandle, deliver: bool, stopped_by_key: Option<bool>) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    static ASKED_FOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let wanted = *app.state::<App>().generation.lock();
+    if ASKED_FOR.swap(wanted, SeqCst) == wanted {
+        return false;
+    }
+    if let Some(by_key) = stopped_by_key {
+        crate::destination::box_input::set_stopped_by_key(by_key);
+    }
     std::thread::spawn(move || {
         let state: State<App> = app.state();
+        // A worker that ends nothing leaves the dictation free to be ended by a later request.
+        let not_taken = || {
+            let _ = ASKED_FOR.compare_exchange(wanted, u64::MAX, SeqCst, SeqCst);
+        };
         let (from, before, rec, listening) = {
             // A pause still finishing its words completes first.
             let _pass = state.live_pass.lock();
+            // Its dictation, still, from here until the recording is this worker's and the
+            // session says so: nothing may put the box away or start another in between
+            // (`DICTATION_CHANGES`), or this would take the next dictation's recording.
+            let _same = DICTATION_CHANGES.lock();
+            if *state.generation.lock() != wanted {
+                return not_taken();
+            }
             let listening = {
                 let session = state.session.lock();
                 if !session.is_dictating() {
-                    return;
+                    return not_taken();
                 }
                 matches!(*session, SessionState::Recording)
             };
-            let Some(rec) = state.recording.lock().take() else { return };
+            let Some(rec) = state.recording.lock().take() else { return not_taken() };
             {
                 let mut t = state.timings.lock();
                 t.shortcut_to_first_sound_ms = match (t.pressed, rec.first_sound()) {
@@ -3369,6 +3607,7 @@ fn finish(app: AppHandle, deliver: bool) {
         }
         deliver_words(&app, text, if deliver { Ending::Deliver } else { Ending::Close });
     });
+    true
 }
 
 /// The product rule, in one call: draft to disk, then clipboard, then delivery. Nothing here
@@ -3535,6 +3774,12 @@ pub fn load_voice_detector_loaded() -> bool {
 
 pub fn load_voice_detector() {
     use whisper_rs::{WhisperVadContext, WhisperVadContextParams, WhisperVadParams};
+    // whisper.cpp must not be touched before Vulkan's loader is in (`vulkan_ready`).
+    #[cfg(windows)]
+    if !engine_whisper::vulkan_ready() {
+        eprintln!("[hvtt] no vulkan-1.dll; the voice detector is left out");
+        return;
+    }
     let file = hvtt_core::models::VOICE_DETECTOR.file;
     let Some(path) = engine_whisper::WhisperEngine::expected_path(file).filter(|p| p.exists()) else {
         eprintln!("[hvtt] no voice detector ({file}); loudness alone decides");
@@ -3578,7 +3823,7 @@ fn load_model_now(app: &AppHandle, file: &str, chosen: bool) -> Result<(), Strin
     *state.engine_status.lock() = format!("Loading {file}…");
     push(app);
 
-    let loaded = engine_whisper::WhisperEngine::load(&path);
+    let loaded = load_engine(app, &path, file);
     let result = match loaded {
         Ok(engine) => {
             let mut changes = state.model_changes.lock();
@@ -3609,6 +3854,43 @@ fn load_model_now(app: &AppHandle, file: &str, chosen: bool) -> Result<(), Strin
     };
     push(app);
     result
+}
+
+/// The engine for `file`. On Windows, wherever this computer runs it quickest - one of its
+/// graphics cards or the processor (`engine_whisper::load_fastest`) - found once for this version,
+/// model and set of cards, and remembered. A remembered card is checked in the hidden child on
+/// each load because its driver can change; a failed card becomes a remembered processor.
+#[cfg(windows)]
+fn load_engine(
+    app: &AppHandle,
+    path: &std::path::Path,
+    file: &str,
+) -> Result<engine_whisper::WhisperEngine, hvtt_core::engine::EngineError> {
+    let state: State<App> = app.state();
+    let cards = engine_whisper::graphics_cards();
+    let key = format!("{} {file} {}", app.package_info().version, cards.join(" | "));
+    let known = {
+        let settings = state.settings.lock();
+        (settings.fastest_for == key).then(|| settings.fastest.clone())
+    };
+    let (engine, on) = engine_whisper::WhisperEngine::load_fastest(path, known.as_deref())?;
+    eprintln!("[hvtt] {file} runs on: {on}");
+    if known.as_deref() != Some(on.as_str()) {
+        update_settings(app, |s| {
+            s.fastest_for = key;
+            s.fastest = on;
+        });
+    }
+    Ok(engine)
+}
+
+#[cfg(not(windows))]
+fn load_engine(
+    _app: &AppHandle,
+    path: &std::path::Path,
+    _file: &str,
+) -> Result<engine_whisper::WhisperEngine, hvtt_core::engine::EngineError> {
+    engine_whisper::WhisperEngine::load(path)
 }
 
 /// H › Settings › Speech Model: use one that is here, or download it first - once, and kept only
@@ -3953,10 +4235,41 @@ fn speed_check_once(app: &AppHandle) {
         });
     };
     use hvtt_core::models::SpeedAdvice;
+    // The offer below is of a more accurate model, not a quicker one.
+    let mut better = false;
     let (view, hide_after) = match hvtt_core::models::speed_advice(ms) {
-        SpeedAdvice::Fine if announce => (Some(notice("This computer is quick enough",
-            format!("A short test with {name} took {}. Nothing needs changing.", secs(ms)))), Some(5000)),
-        SpeedAdvice::Fine => (None, None),
+        // Quick enough for a more accurate model: said once unasked, and whenever he asks.
+        // Windows only: there the model inside the program is Quick, and a graphics card can
+        // carry far more. On the Mac the one inside is already Best, and a model he chose
+        // himself is left alone (Codex's review of the graphics-card work, 2026-10-05).
+        SpeedAdvice::Fine => match current
+            .filter(|_| cfg!(windows))
+            .and_then(|c| hvtt_core::models::better_choice(c, ms))
+            .filter(|_| announce || !state.settings.lock().better_offered)
+        {
+            Some((offer, estimate)) => {
+                let download = if model_on_this_computer(offer) {
+                    String::new()
+                } else {
+                    format!(" ({} download)", hvtt_core::models::megabytes(offer.bytes))
+                };
+                // Forgotten again below if the message cannot be shown - and counted as made
+                // (`better_offered`) only once it has been.
+                better = true;
+                *state.offered_model.lock() = Some((offer, measured_under));
+                (Some(UpdateView {
+                    stage: "offer",
+                    title: format!("This computer can run {}", offer.name),
+                    detail: format!("A short test with {name} took {}. {} should take roughly {} here \
+                        (an estimate, checked once you switch) - {}{download}.",
+                        secs(ms), offer.name, secs(estimate), offer.note),
+                    action: Some(format!("Switch to {}", offer.name)),
+                }), None)
+            }
+            None if announce => (Some(notice("This computer is quick enough",
+                format!("A short test with {name} took {}. Nothing needs changing.", secs(ms)))), Some(5000)),
+            None => (None, None),
+        },
         SpeedAdvice::Lighter => {
             lighter(app);
             (Some(notice("Set up for this computer", format!(
@@ -3994,8 +4307,16 @@ fn speed_check_once(app: &AppHandle) {
         return;
     };
     let offering = view.stage == "offer";
-    if !speed_notice(app, view, hide_after) && offering {
+    let title = view.title.clone();
+    let shown = speed_notice(app, view, hide_after);
+    if !shown && offering {
         *state.offered_model.lock() = None;
+    }
+    // Made once unasked - so only an offer he could see counts as made: accepted by the box,
+    // and on it (`on_screen`), not behind the shortcut prompt or a dictation (Codex's reviews,
+    // 2026-10-05). One that went unseen is made again at the next check.
+    if shown && better && on_screen(&state, &title) {
+        update_settings(app, |s| s.better_offered = true);
     }
     drop(changes);
 }
@@ -4147,6 +4468,19 @@ pub fn run() {
                     if let tauri::WindowEvent::Focused(true) = event {
                         box_became_key(&handle);
                     }
+                });
+            }
+            // Windows: the keyboard hook says when one of the shortcut's keys comes up while he
+            // holds (the shortcut's own report waits for its main key alone).
+            #[cfg(windows)]
+            {
+                let handle = app.handle().clone();
+                platform_paste::on_hold_key_up(move |keys| {
+                    post_to_main(&handle, move |app| {
+                        if keys != 0 && HOLD_KEYS.load(std::sync::atomic::Ordering::SeqCst) == keys {
+                            hold_released(app);
+                        }
+                    })
                 });
             }
             // Windows has no such policy; the box carries never-activate styles instead.

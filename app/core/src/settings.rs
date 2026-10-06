@@ -54,6 +54,32 @@ pub struct Settings {
     /// The program version and model the speed check last ran for ("0.1.7 ggml-...bin"): it runs
     /// again when either changes.
     pub speed_checked: String,
+    /// Windows: what `fastest` was found for - the program version, the model and this computer's
+    /// graphics cards. When any of them changes, the model is timed on each again.
+    pub fastest_for: String,
+    /// Windows: where that model runs quickest here - a graphics card's name, or "processor"
+    /// (`engine_whisper::load_fastest`). Found by the program; nothing he sets.
+    pub fastest: String,
+    /// The speed check has once offered a more accurate model because this computer is quick
+    /// enough for it. Unasked, it offers that once; asked for from the menu, every time.
+    pub better_offered: bool,
+    /// H > Settings > Dictation Style: press to start and press to send, or hold to talk.
+    pub dictation_style: DictationStyle,
+}
+
+/// H > Settings > Dictation Style. His decision, 2026-10-05: hold to talk is another way to
+/// dictate, never a replacement - "some people like the hold to talk, some people don't" - and
+/// press, talk, press stays what the program does unless he chooses otherwise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DictationStyle {
+    /// Press the shortcut, talk, press it again. The words fill in while he talks; he can
+    /// pause, fix them, and send.
+    #[default]
+    PressToSend,
+    /// Hold the shortcut, talk, let go: letting go ends the recording and sends. Nothing to
+    /// read or fix while his hand is on the keys, so no live words, no Pause, no Send.
+    HoldToTalk,
 }
 
 /// H › Settings › Live Words: how much of the processor showing the words while he talks may
@@ -173,6 +199,10 @@ impl Default for Settings {
             careful_stop: false,
             check_updates_on_start: true,
             speed_checked: String::new(),
+            fastest_for: String::new(),
+            fastest: String::new(),
+            better_offered: false,
+            dictation_style: DictationStyle::PressToSend,
         }
     }
 }

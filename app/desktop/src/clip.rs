@@ -196,6 +196,216 @@ mod turns {
     }
 }
 
+/// A give-back that could not be done is kept and tried again, on both platforms - what he had
+/// copied is never dropped because the clipboard would not take it back just then. Each platform's
+/// `huck::Borrowed::give_back` says what one try is; this says what happens between tries, what
+/// the rest of the program can ask about it (`unreturned`), and the one way it ends without his
+/// clipboard going back (`let_go`).
+#[cfg(any(target_os = "macos", windows))]
+mod giving_back {
+    use parking_lot::Mutex;
+    use std::time::Duration;
+
+    /// Numbers the borrows, from 1.
+    static BORROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// The number of a new borrow, so that telling him it is not back and letting it go are about
+    /// the same one (`unreturned`, `let_go`).
+    pub(super) fn next_borrow() -> u64 {
+        BORROWS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// How often a give-back that is not done looks again - and how soon it notices that he has
+    /// said to let it go.
+    const GIVE_BACK_STEP: Duration = Duration::from_millis(250);
+
+    /// How many steps a give-back sits out after the clipboard *refused* his things, before it
+    /// tries again - five seconds. Each try empties and rewrites the clipboard, which every
+    /// program watching it sees.
+    const REFUSED_REST: u32 = 20;
+
+    /// One try at giving his clipboard back.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Attempt {
+        /// It is back as it was.
+        Restored,
+        /// He has copied something new since: that wins.
+        Superseded,
+        /// Another program is holding the clipboard (Windows; a Mac pasteboard is never held).
+        #[cfg_attr(not(windows), allow(dead_code))]
+        Busy,
+        /// The clipboard would not take his things back.
+        Refused,
+    }
+
+    /// Why his clipboard is not back yet.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Unreturned {
+        /// Another program is holding the clipboard.
+        Busy,
+        /// The clipboard opened and would not take his things back.
+        Refused,
+    }
+
+    /// The borrow whose give-back is not done, and why. What he had copied is still held by this
+    /// program, and so is that borrow's turn: nothing else borrows, and `stop_borrowing` says it
+    /// is still on loan.
+    static UNRETURNED: Mutex<Option<(u64, Unreturned)>> = Mutex::new(None);
+
+    /// The borrow he has said to let go, by number; 0 is none.
+    static LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// His clipboard is out on loan and its give-back is not done: which borrow, and why.
+    pub fn unreturned() -> Option<(u64, Unreturned)> {
+        *UNRETURNED.lock()
+    }
+
+    /// He has been told his clipboard is not back, and has chosen to leave without it: that
+    /// borrow's give-back stops trying, and what he had copied is let go. The only way it is ever
+    /// dropped without going back.
+    pub fn let_go(borrow: u64) {
+        LET_GO.store(borrow, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Keep trying to give his clipboard back until it is back, he has copied something new, or
+    /// he has said to let it go (`let_go`). The caller holds what he had, and the borrow's turn,
+    /// for as long as this runs. `true` when his clipboard is as it was, or newer.
+    ///
+    /// Until 2026-10-03 on Windows a clipboard held by another program was given 0.2 s and a
+    /// clipboard that refused his things three tries; then what he had was dropped, the borrow
+    /// counted as given back, and Quit and Open Update went ahead (Codex's two reviews of the
+    /// 0.1.8 candidate). The Mac tried once and dropped it until 2026-10-04.
+    fn keep_giving_back(
+        borrow: u64,
+        mut attempt: impl FnMut() -> Attempt,
+        mut pause: impl FnMut(),
+        unreturned: &Mutex<Option<(u64, Unreturned)>>,
+        let_go: &std::sync::atomic::AtomicU64,
+    ) -> bool {
+        let mut rest = 0;
+        loop {
+            if let_go.load(std::sync::atomic::Ordering::SeqCst) == borrow {
+                *unreturned.lock() = None;
+                eprintln!("[hvtt] his clipboard was not given back: he was told, and chose to leave without it");
+                return false;
+            }
+            if rest > 0 {
+                rest -= 1;
+                pause();
+                continue;
+            }
+            let why = match attempt() {
+                Attempt::Restored | Attempt::Superseded => {
+                    *unreturned.lock() = None;
+                    return true;
+                }
+                Attempt::Busy => Unreturned::Busy,
+                Attempt::Refused => {
+                    rest = REFUSED_REST;
+                    Unreturned::Refused
+                }
+            };
+            if unreturned.lock().replace((borrow, why)) != Some((borrow, why)) {
+                eprintln!("[hvtt] his clipboard is not back yet ({why:?}); it is kept, and tried again");
+            }
+            pause();
+        }
+    }
+
+    /// `keep_giving_back` for a real borrow: the program's own record of what is out, and real
+    /// pauses.
+    pub(super) fn give_back_until_done(borrow: u64, attempt: impl FnMut() -> Attempt) -> bool {
+        keep_giving_back(borrow, attempt, || std::thread::sleep(GIVE_BACK_STEP), &UNRETURNED, &LET_GO)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Tries that go as scripted, one after another.
+        fn script(tries: &[Attempt]) -> impl FnMut() -> Attempt + '_ {
+            let mut left = tries.iter().copied();
+            move || left.next().expect("no further try was expected")
+        }
+
+        fn nothing_pending() -> (Mutex<Option<(u64, Unreturned)>>, std::sync::atomic::AtomicU64) {
+            (Mutex::new(None), std::sync::atomic::AtomicU64::new(0))
+        }
+
+        #[test]
+        fn a_clipboard_held_by_another_program_is_waited_for_and_said_to_be_out() {
+            let (unreturned, let_go) = nothing_pending();
+            let mut seen = Vec::new();
+            let back = keep_giving_back(
+                7,
+                script(&[Attempt::Busy, Attempt::Busy, Attempt::Restored]),
+                || seen.push(*unreturned.lock()),
+                &unreturned,
+                &let_go,
+            );
+            assert!(back, "it went back once the clipboard was free");
+            assert_eq!(seen, vec![Some((7, Unreturned::Busy)); 2], "and was known to be out meanwhile");
+            assert_eq!(*unreturned.lock(), None, "and no longer once it was back");
+        }
+
+        /// Codex's second review of the 0.1.8 candidate: three tries, then what he had copied was
+        /// dropped and the borrow counted as given back.
+        #[test]
+        fn a_clipboard_that_refuses_his_things_keeps_them_and_tries_again() {
+            let (unreturned, let_go) = nothing_pending();
+            let refusals = [Attempt::Refused; 5];
+            let tries: Vec<Attempt> = refusals.iter().copied().chain([Attempt::Restored]).collect();
+            let mut pauses = 0u32;
+            let back = keep_giving_back(
+                3,
+                script(&tries),
+                || {
+                    pauses += 1;
+                    assert_eq!(*unreturned.lock(), Some((3, Unreturned::Refused)), "kept, and known to be out");
+                },
+                &unreturned,
+                &let_go,
+            );
+            assert!(back, "five refusals, and still it went back in the end");
+            assert_eq!(pauses, 5 * (REFUSED_REST + 1), "resting between tries rather than hammering the clipboard");
+        }
+
+        #[test]
+        fn something_he_copied_meanwhile_ends_the_trying() {
+            let (unreturned, let_go) = nothing_pending();
+            let back = keep_giving_back(1, script(&[Attempt::Busy, Attempt::Superseded]), || {}, &unreturned, &let_go);
+            assert!(back, "his newer copy wins: nothing is owed");
+            assert_eq!(*unreturned.lock(), None);
+        }
+
+        #[test]
+        fn it_is_let_go_only_when_he_says_so_and_only_that_borrow() {
+            let (unreturned, let_go) = nothing_pending();
+            // Told to let go of an older borrow: this one keeps trying.
+            let_go.store(8, std::sync::atomic::Ordering::SeqCst);
+            assert!(keep_giving_back(9, script(&[Attempt::Busy, Attempt::Restored]), || {}, &unreturned, &let_go));
+
+            // Told to let go of this one, part-way: it stops, and says it did not go back.
+            let mut pauses = 0;
+            let back = keep_giving_back(
+                10,
+                || Attempt::Refused,
+                || {
+                    pauses += 1;
+                    if pauses == 3 {
+                        let_go.store(10, std::sync::atomic::Ordering::SeqCst);
+                    }
+                },
+                &unreturned,
+                &let_go,
+            );
+            assert!(!back, "not given back");
+            assert_eq!(pauses, 3, "and it stopped as soon as he said");
+            assert_eq!(*unreturned.lock(), None, "nothing is out any more: he let it go");
+        }
+    }
+}
+
 /// Huck's own clipboard: a named macOS pasteboard. (Windows: see the second `huck` below.)
 ///
 /// Not a new program or a background task - a private, named slot in the clipboard service the
@@ -203,6 +413,8 @@ mod turns {
 /// idle otherwise. The name is shared on purpose, so Huck's other programs can use the same one.
 #[cfg(target_os = "macos")]
 pub mod huck {
+    use super::giving_back::{give_back_until_done, next_borrow, Attempt};
+    pub use super::giving_back::{let_go, unreturned, Unreturned};
     use super::turns::{Gate, Turn, TURN_LIMIT};
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
@@ -217,8 +429,14 @@ pub mod huck {
     }
 
     fn put(board: &NSPasteboard, text: &str) -> bool {
-        board.clearContents();
-        board.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString })
+        put_counted(board, text).0
+    }
+
+    /// Keep the count of our own clear, never a later read that could belong to a newer copy.
+    fn put_counted(board: &NSPasteboard, text: &str) -> (bool, isize) {
+        let ours = board.clearContents();
+        let taken = board.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString });
+        (taken, ours)
     }
 
     pub fn write(text: &str) -> Result<(), String> {
@@ -257,6 +475,9 @@ pub mod huck {
     /// Everything on the normal clipboard, every item and every type, so an image or a copied
     /// file comes back exactly as it was - not just its text.
     pub struct Borrowed {
+        /// Which borrow this is, so that telling him it is not back and letting it go are about
+        /// the same one (`unreturned`, `let_go`).
+        id: u64,
         board: String,
         items: Vec<Vec<(String, Vec<u8>)>>,
         ours: isize,
@@ -331,54 +552,88 @@ pub mod huck {
             .collect()
     }
 
-    fn restore(board: &NSPasteboard, items: &[Vec<(String, Vec<u8>)>]) -> bool {
+    fn restore(board: &NSPasteboard, items: &[Vec<(String, Vec<u8>)>], ours: &mut isize) -> Attempt {
+        restore_with(board, items, ours, |objects| board.writeObjects(objects))
+    }
+
+    fn restore_with(
+        board: &NSPasteboard,
+        items: &[Vec<(String, Vec<u8>)>],
+        ours: &mut isize,
+        write: impl FnOnce(&NSArray<ProtocolObject<dyn NSPasteboardWriting>>) -> bool,
+    ) -> Attempt {
         let objects = match objects(items) {
             Ok(objects) => objects,
             Err(why) => {
                 eprintln!("[hvtt] {why}; the clipboard was left untouched");
-                return false;
+                return Attempt::Refused;
             }
         };
-        board.clearContents();
-        items.is_empty() || board.writeObjects(&NSArray::from_retained_slice(&objects))
+        // Preparing the items may take time. Check after that, immediately before clearing.
+        if board.changeCount() != *ours {
+            return Attempt::Superseded;
+        }
+        *ours = board.clearContents();
+        if items.is_empty() || write(&NSArray::from_retained_slice(&objects)) {
+            Attempt::Restored
+        } else {
+            Attempt::Refused
+        }
     }
 
+    /// `turn`: this borrow's turn at the clipboard, kept until it has been given back.
     fn borrow_snapshot(
         board: &NSPasteboard,
         text: &str,
         snapshot: Snapshot,
+        turn: Option<Turn>,
     ) -> Result<Borrowed, String> {
         // A copy made after the snapshot wins. Check immediately before the destructive clear;
         // NSPasteboard offers no transaction or lock, so this is the narrowest possible race.
         if board.changeCount() != snapshot.change_count {
             return Err("the clipboard changed before it could be borrowed".into());
         }
-        if !put(board, text) {
-            let _ = restore(board, &snapshot.items);
-            return Err("the normal clipboard refused the borrowed text".into());
-        }
-        Ok(Borrowed {
+        let (taken, mut ours) = put_counted(board, text);
+        // Give his things back only if no newer copy has taken the clipboard meanwhile.
+        let back = taken || matches!(restore(board, &snapshot.items, &mut ours), Attempt::Restored | Attempt::Superseded);
+        let borrowed = Borrowed {
+            id: next_borrow(),
             board: board.name().to_string(),
             items: snapshot.items,
-            ours: board.changeCount(),
-            _turn: None,
-        })
+            ours,
+            _turn: turn,
+        };
+        if taken {
+            return Ok(borrowed);
+        }
+        if back {
+            return Err("the normal clipboard refused the borrowed text".into());
+        }
+        // His clipboard was emptied, took neither the words nor his own things back, and this is
+        // the only copy of them left. It is not dropped: it goes the way of any give-back that
+        // could not be done - kept, with its turn, and tried again until it is back, he copies
+        // something new, or he says to let it go. (Until 2026-10-04 it was tried once and
+        // dropped; Windows had the same until its 0.1.8.)
+        std::thread::spawn(move || {
+            let _ = borrowed.give_back();
+        });
+        Err("the normal clipboard refused the borrowed text, and what he had copied is still being put back".into())
     }
 
+    #[cfg(test)]
     fn borrow(board: &NSPasteboard, text: &str) -> Result<Borrowed, String> {
         let snapshot = snapshot(board)?;
-        borrow_snapshot(board, text, snapshot)
+        borrow_snapshot(board, text, snapshot, None)
     }
 
-    /// `borrow`, but only once any other borrow through `gate` has been given back - and the turn
+    /// Borrow, but only once any other borrow through `gate` has been given back - and the turn
     /// is kept until this one is.
     fn borrow_in_turn(gate: &'static Gate, board: &NSPasteboard, text: &str) -> Result<Borrowed, String> {
         let turn = gate
             .take(TURN_LIMIT)
             .ok_or("another paste was still using his clipboard, so his clipboard was left alone")?;
-        let mut borrowed = borrow(board, text)?;
-        borrowed._turn = Some(turn);
-        Ok(borrowed)
+        let snapshot = snapshot(board)?;
+        borrow_snapshot(board, text, snapshot, Some(turn))
     }
 
     /// Put `text` on the normal clipboard for a moment, remembering what was there. A paste into
@@ -410,16 +665,32 @@ pub mod huck {
 
     impl Borrowed {
         /// Put his clipboard back - unless he copied something new in the meantime, which wins.
+        /// True when his clipboard is as it was (or newer).
+        ///
+        /// The clipboard may refuse his things (a large picture, with memory short). Then what he
+        /// had is kept, and this borrow's turn with it, and it is tried again
+        /// (`keep_giving_back`): the program does not leave meanwhile (`stop_borrowing`) without
+        /// telling him first, and no other paste borrows over it. False only when he chose to
+        /// leave without it (`let_go`). Until 2026-10-04 one refusal dropped what he had, the
+        /// turn was released, and Quit went ahead - what Windows did until its 0.1.8.
         pub fn give_back(self) -> bool {
             let board = NSPasteboard::pasteboardWithName(&NSString::from_str(&self.board));
-            if board.changeCount() != self.ours {
-                return false;
+            give_back_until_done(self.id, give_back_attempt(&board, &self.items, self.ours))
+        }
+    }
+
+    /// One try at putting `items` back on `board`, as often as it is called. `ours`: the
+    /// clipboard's change count as this program left it.
+    fn give_back_attempt<'a>(
+        board: &'a NSPasteboard,
+        items: &'a [Vec<(String, Vec<u8>)>],
+        mut ours: isize,
+    ) -> impl FnMut() -> Attempt + 'a {
+        move || {
+            if board.changeCount() != ours {
+                return Attempt::Superseded;
             }
-            let restored = restore(&board, &self.items);
-            if !restored {
-                eprintln!("[hvtt] the borrowed clipboard could not be restored completely");
-            }
-            restored
+            restore(board, items, &mut ours)
         }
     }
 
@@ -478,8 +749,85 @@ pub mod huck {
             let stale = snapshot(&board).unwrap();
             assert!(put(&board, "newer copy"));
             let newer = snapshot(&board).unwrap().items;
-            let result = borrow_snapshot(&board, "must not replace it", stale);
+            let result = borrow_snapshot(&board, "must not replace it", stale, None);
             assert!(result.is_err());
+            assert_eq!(snapshot(&board).unwrap().items, newer);
+        }
+
+        #[test]
+        fn something_he_copied_during_the_borrow_is_left_alone() {
+            let board = private_board();
+            seed_two_items(&board);
+            let borrowed = borrow(&board, "borrowed").expect("private pasteboard can be borrowed");
+            assert!(put(&board, "his newer copy"));
+            let newer = snapshot(&board).unwrap().items;
+            assert!(borrowed.give_back(), "his newer copy wins: nothing is owed");
+            assert_eq!(snapshot(&board).unwrap().items, newer);
+        }
+
+        /// What he had is not dropped when the clipboard will not take it back: the try says
+        /// Refused - which `keep_giving_back` answers by keeping it and trying again - and a later
+        /// try, on the same clipboard, puts it back. An item with no types is one this program
+        /// will not write; the snapshot never makes one, so it stands in for a picture too large
+        /// to put back. This refusal happens before the clipboard is emptied.
+        #[test]
+        fn a_refused_give_back_says_so_and_can_be_tried_again() {
+            let board = private_board();
+            seed_two_items(&board);
+            let before = snapshot(&board).unwrap().items;
+            assert!(put(&board, "borrowed"));
+            let ours = board.changeCount();
+
+            let unwritable = vec![Vec::new()];
+            let mut refused = give_back_attempt(&board, &unwritable, ours);
+            assert_eq!(refused(), Attempt::Refused);
+            assert_eq!(refused(), Attempt::Refused, "and again: still his to give back");
+
+            let mut tried_again = give_back_attempt(&board, &before, board.changeCount());
+            assert_eq!(tried_again(), Attempt::Restored);
+            assert_eq!(snapshot(&board).unwrap().items, before, "what he had, exactly");
+        }
+
+        #[test]
+        fn a_refusal_after_emptying_keeps_our_count_and_can_be_retried() {
+            let board = private_board();
+            seed_two_items(&board);
+            let before = snapshot(&board).unwrap().items;
+            let (taken, mut ours) = put_counted(&board, "borrowed");
+            assert!(taken);
+            assert_eq!(ours, board.changeCount(), "writing does not change ownership again");
+            let borrowed_count = ours;
+
+            assert_eq!(restore_with(&board, &before, &mut ours, |_| false), Attempt::Refused);
+            assert_ne!(ours, borrowed_count, "the refused try really emptied the pasteboard");
+            assert_eq!(ours, board.changeCount(), "that clear is ours, even though writing failed");
+            assert!(snapshot(&board).unwrap().items.is_empty());
+            assert_eq!(restore(&board, &before, &mut ours), Attempt::Restored);
+            assert_eq!(ours, board.changeCount(), "a successful restore keeps the clear's count too");
+            assert_eq!(snapshot(&board).unwrap().items, before, "every item and type went back");
+        }
+
+        #[test]
+        fn a_copy_during_a_refused_restore_is_never_adopted_as_ours() {
+            let board = private_board();
+            seed_two_items(&board);
+            let before = snapshot(&board).unwrap().items;
+            let (taken, mut ours) = put_counted(&board, "borrowed");
+            assert!(taken);
+
+            let refused = restore_with(&board, &before, &mut ours, |_| {
+                // Another owner copies after our clear, before the failed write returns.
+                assert!(put(&board, "his newer copy"));
+                false
+            });
+            assert_eq!(refused, Attempt::Refused);
+            assert_ne!(ours, board.changeCount(), "his count was never read back as ours");
+            let newer = snapshot(&board).unwrap().items;
+            let mut retry = give_back_attempt(&board, &before, ours);
+            assert_eq!(retry(), Attempt::Superseded);
+            assert_eq!(snapshot(&board).unwrap().items, newer, "his newer copy wins");
+            assert_eq!(restore(&board, &before, &mut ours), Attempt::Superseded,
+                "the failed-words recovery must also leave a newer copy alone");
             assert_eq!(snapshot(&board).unwrap().items, newer);
         }
 
@@ -531,6 +879,8 @@ pub mod huck {
 /// the macOS module, so the rest of the app does not care which it is talking to.
 #[cfg(windows)]
 pub mod huck {
+    use super::giving_back::{give_back_until_done, next_borrow, Attempt};
+    pub use super::giving_back::{let_go, unreturned, Unreturned};
     use super::turns::{Gate, Turn, TURN_LIMIT};
     use parking_lot::Mutex;
     use std::time::Duration;
@@ -817,9 +1167,6 @@ pub mod huck {
         _turn: Turn,
     }
 
-    /// Numbers the borrows, from 1.
-    static BORROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
     /// Put `text` on the normal clipboard for a moment, remembering exactly what was there. A
     /// paste into an app like VS Code can only come from the normal clipboard. One at a time: a
     /// second paste waits (a moment) for the first to be given back.
@@ -853,8 +1200,7 @@ pub mod huck {
             };
         }
         // Read only once the clipboard is closed: closing it is itself a change Windows counts.
-        let id = BORROWS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let borrowed = Borrowed { id, items, ours: unsafe { GetClipboardSequenceNumber() }, _turn: turn };
+        let borrowed = Borrowed { id: next_borrow(), items, ours: unsafe { GetClipboardSequenceNumber() }, _turn: turn };
         match refused {
             None => Ok(borrowed),
             Some(true) => Err("the clipboard refused the text".into()),
@@ -883,101 +1229,6 @@ pub mod huck {
     /// Quit could not finish (a give-back is stuck): pasting borrows his clipboard again.
     pub fn resume_borrowing() {
         GATE.reopen();
-    }
-
-    /// How often a give-back that is not done looks again - and how soon it notices that he has
-    /// said to let it go.
-    const GIVE_BACK_STEP: Duration = Duration::from_millis(250);
-
-    /// How many steps a give-back sits out after the clipboard *refused* his things, before it
-    /// tries again - five seconds. Each try empties and rewrites the clipboard, which every
-    /// program watching it sees.
-    const REFUSED_REST: u32 = 20;
-
-    /// One try at giving his clipboard back.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Attempt {
-        /// It is back as it was.
-        Restored,
-        /// He has copied something new since: that wins.
-        Superseded,
-        /// Another program is holding the clipboard.
-        Busy,
-        /// The clipboard opened and would not take his things back.
-        Refused,
-    }
-
-    /// Why his clipboard is not back yet.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Unreturned {
-        /// Another program is holding the clipboard.
-        Busy,
-        /// The clipboard opened and would not take his things back.
-        Refused,
-    }
-
-    /// The borrow whose give-back is not done, and why. What he had copied is still held by this
-    /// program, and so is that borrow's turn: nothing else borrows, and `stop_borrowing` says it
-    /// is still on loan.
-    static UNRETURNED: Mutex<Option<(u64, Unreturned)>> = Mutex::new(None);
-
-    /// The borrow he has said to let go, by number; 0 is none.
-    static LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    /// His clipboard is out on loan and its give-back is not done: which borrow, and why.
-    pub fn unreturned() -> Option<(u64, Unreturned)> {
-        *UNRETURNED.lock()
-    }
-
-    /// He has been told his clipboard is not back, and has chosen to leave without it: that
-    /// borrow's give-back stops trying, and what he had copied is let go. The only way it is ever
-    /// dropped without going back.
-    pub fn let_go(borrow: u64) {
-        LET_GO.store(borrow, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Keep trying to give his clipboard back until it is back, he has copied something new, or
-    /// he has said to let it go (`let_go`). The caller holds what he had, and the borrow's turn,
-    /// for as long as this runs. `true` when his clipboard is as it was, or newer.
-    ///
-    /// Until 2026-10-03 a clipboard held by another program was given 0.2 s and a clipboard that
-    /// refused his things three tries; then what he had was dropped, the borrow counted as given
-    /// back, and Quit and Open Update went ahead (Codex's two reviews of the 0.1.8 candidate).
-    fn keep_giving_back(
-        borrow: u64,
-        mut attempt: impl FnMut() -> Attempt,
-        mut pause: impl FnMut(),
-        unreturned: &Mutex<Option<(u64, Unreturned)>>,
-        let_go: &std::sync::atomic::AtomicU64,
-    ) -> bool {
-        let mut rest = 0;
-        loop {
-            if let_go.load(std::sync::atomic::Ordering::SeqCst) == borrow {
-                *unreturned.lock() = None;
-                eprintln!("[hvtt] his clipboard was not given back: he was told, and chose to leave without it");
-                return false;
-            }
-            if rest > 0 {
-                rest -= 1;
-                pause();
-                continue;
-            }
-            let why = match attempt() {
-                Attempt::Restored | Attempt::Superseded => {
-                    *unreturned.lock() = None;
-                    return true;
-                }
-                Attempt::Busy => Unreturned::Busy,
-                Attempt::Refused => {
-                    rest = REFUSED_REST;
-                    Unreturned::Refused
-                }
-            };
-            if unreturned.lock().replace((borrow, why)) != Some((borrow, why)) {
-                eprintln!("[hvtt] his clipboard is not back yet ({why:?}); it is kept, and tried again");
-            }
-            pause();
-        }
     }
 
     impl Borrowed {
@@ -1013,7 +1264,7 @@ pub mod huck {
                 ours = unsafe { GetClipboardSequenceNumber() };
                 Attempt::Refused
             };
-            keep_giving_back(self.id, attempt, || std::thread::sleep(GIVE_BACK_STEP), &UNRETURNED, &LET_GO)
+            give_back_until_done(self.id, attempt)
         }
     }
 
@@ -1129,88 +1380,6 @@ pub mod huck {
             };
             let _ = std::fs::remove_file(&result);
             assert_eq!(other.trim(), "False", "another program opened the clipboard Huck was holding");
-        }
-
-        /// Tries that go as scripted, one after another.
-        fn script(tries: &[Attempt]) -> impl FnMut() -> Attempt + '_ {
-            let mut left = tries.iter().copied();
-            move || left.next().expect("no further try was expected")
-        }
-
-        fn nothing_pending() -> (Mutex<Option<(u64, Unreturned)>>, std::sync::atomic::AtomicU64) {
-            (Mutex::new(None), std::sync::atomic::AtomicU64::new(0))
-        }
-
-        #[test]
-        fn a_clipboard_held_by_another_program_is_waited_for_and_said_to_be_out() {
-            let (unreturned, let_go) = nothing_pending();
-            let mut seen = Vec::new();
-            let back = keep_giving_back(
-                7,
-                script(&[Attempt::Busy, Attempt::Busy, Attempt::Restored]),
-                || seen.push(*unreturned.lock()),
-                &unreturned,
-                &let_go,
-            );
-            assert!(back, "it went back once the clipboard was free");
-            assert_eq!(seen, vec![Some((7, Unreturned::Busy)); 2], "and was known to be out meanwhile");
-            assert_eq!(*unreturned.lock(), None, "and no longer once it was back");
-        }
-
-        /// Codex's second review of the 0.1.8 candidate: three tries, then what he had copied was
-        /// dropped and the borrow counted as given back.
-        #[test]
-        fn a_clipboard_that_refuses_his_things_keeps_them_and_tries_again() {
-            let (unreturned, let_go) = nothing_pending();
-            let refusals = [Attempt::Refused; 5];
-            let tries: Vec<Attempt> = refusals.iter().copied().chain([Attempt::Restored]).collect();
-            let mut pauses = 0u32;
-            let back = keep_giving_back(
-                3,
-                script(&tries),
-                || {
-                    pauses += 1;
-                    assert_eq!(*unreturned.lock(), Some((3, Unreturned::Refused)), "kept, and known to be out");
-                },
-                &unreturned,
-                &let_go,
-            );
-            assert!(back, "five refusals, and still it went back in the end");
-            assert_eq!(pauses, 5 * (REFUSED_REST + 1), "resting between tries rather than hammering the clipboard");
-        }
-
-        #[test]
-        fn something_he_copied_meanwhile_ends_the_trying() {
-            let (unreturned, let_go) = nothing_pending();
-            let back = keep_giving_back(1, script(&[Attempt::Busy, Attempt::Superseded]), || {}, &unreturned, &let_go);
-            assert!(back, "his newer copy wins: nothing is owed");
-            assert_eq!(*unreturned.lock(), None);
-        }
-
-        #[test]
-        fn it_is_let_go_only_when_he_says_so_and_only_that_borrow() {
-            let (unreturned, let_go) = nothing_pending();
-            // Told to let go of an older borrow: this one keeps trying.
-            let_go.store(8, std::sync::atomic::Ordering::SeqCst);
-            assert!(keep_giving_back(9, script(&[Attempt::Busy, Attempt::Restored]), || {}, &unreturned, &let_go));
-
-            // Told to let go of this one, part-way: it stops, and says it did not go back.
-            let mut pauses = 0;
-            let back = keep_giving_back(
-                10,
-                || Attempt::Refused,
-                || {
-                    pauses += 1;
-                    if pauses == 3 {
-                        let_go.store(10, std::sync::atomic::Ordering::SeqCst);
-                    }
-                },
-                &unreturned,
-                &let_go,
-            );
-            assert!(!back, "not given back");
-            assert_eq!(pauses, 3, "and it stopped as soon as he said");
-            assert_eq!(*unreturned.lock(), None, "nothing is out any more: he let it go");
         }
 
         /// A second program that takes the clipboard from its own window, says so by creating

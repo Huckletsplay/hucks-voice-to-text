@@ -23,7 +23,10 @@
 #     email address survives in the executable;
 #   - builds whisper.cpp for AVX2-class processors (Intel 2013 on, AMD 2015 on) instead of this
 #     one - the program says so on older machines instead of crashing - and checks it did;
-#   - links the C runtime statically, so no Visual C++ Redistributable is needed, and checks it.
+#   - links the C runtime statically, so no Visual C++ Redistributable is needed, and checks it;
+#   - asks for Vulkan's loader (vulkan-1.dll) only when first used, and checks it - so the program
+#     opens on a PC with no graphics driver - and puts Khronos' own copy beside the program for
+#     such a PC (the graphics driver's copy is preferred where there is one).
 #
 # The speech model and the voice detector go inside the installer. They are taken from
 # HVTT_RELEASE_MODEL and HVTT_RELEASE_VAD, or else this PC's app-data copies
@@ -65,6 +68,18 @@ if ((Split-Path -Leaf $detector) -ne 'ggml-silero-v5.1.2.bin') { throw "The voic
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $detector).Hash.ToLower() -ne '29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf') {
     throw "The voice detector at $detector is not the published file."
 }
+# Vulkan's loader, for a PC whose graphics driver brought none (engine_whisper::vulkan_ready):
+# x64\vulkan-1.dll and VulkanRT-License.txt from LunarG's VulkanRT-X64-1.4.363.0-Components.zip
+# (https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/), exactly that file.
+$vulkanDir = if ($env:HVTT_RELEASE_VULKAN) { $env:HVTT_RELEASE_VULKAN } else { Join-Path $env:LOCALAPPDATA 'VulkanSDK\runtime-1.4.363.0' }
+$vulkan = Join-Path $vulkanDir 'vulkan-1.dll'
+$vulkanLicense = Join-Path $vulkanDir 'VulkanRT-License.txt'
+if (-not (Test-Path -LiteralPath $vulkan) -or -not (Test-Path -LiteralPath $vulkanLicense)) {
+    throw "No Vulkan loader and licence in $vulkanDir - see the note above this line in release.ps1."
+}
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $vulkan).Hash.ToLower() -ne 'e1fcfc9489beefa6a6d9d11d6c7517f6a2b7f16e0d3fb8f4103bee0210f314a3') {
+    throw "The Vulkan loader at $vulkan is not the published 1.4.363.0 file."
+}
 $license = Join-Path $projectRoot 'LICENSE'
 $icon = Join-Path $appDir 'desktop\icons\icon.ico'
 $out = Join-Path $projectRoot 'artifacts\windows\release'
@@ -83,18 +98,32 @@ if ($LASTEXITCODE -ne 0) { throw 'Tests failed; the release was NOT built.' }
 
 # --- 2. the anonymous, portable build --------------------------------------------------------
 # Not under %TEMP%: MSBuild refuses to build there ("cannot reside under the Temporary directory").
-# And short: whisper.cpp's CMake build nests deep, and MSBuild cannot create a folder past about
-# 248 characters. `hvr` keeps the deepest path shorter than dev.ps1's own (measured 2026-09-26).
-$work = Join-Path $env:LOCALAPPDATA 'hvr'
-if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+# And at the top of the drive: whisper.cpp's CMake build nests deep - deepest of all its Vulkan
+# shader generator - and from anywhere under the user profile it passes Windows' 260 characters
+# (dev.ps1, step 5; found 2026-10-05).
+$work = Join-Path $env:SystemDrive '\hvr'
+# A folder at the top of the drive is deleted only if this script made it: it leaves its mark
+# inside, and anything else called C:\hvr is somebody's, not ours (Codex's review, 2026-10-05).
+$mark = Join-Path $work '.hucks-voice-to-text-release'
+# One release at a time: a second one would delete the folder the first is building in. The
+# mutex is let go when this PowerShell process ends, however the script ends.
+$oneRelease = New-Object Threading.Mutex($false, 'HucksVoiceToTextRelease')
+$mine = $false
+try { $mine = $oneRelease.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mine = $true }
+if (-not $mine) { throw 'Another release build is running. Wait for it to finish.' }
+if (Test-Path -LiteralPath $work) {
+    if (-not (Test-Path -LiteralPath $mark)) { throw "$work exists and was not made by this script. Move it away, then run again." }
+    Remove-Item -LiteralPath $work -Recurse -Force
+}
 if ($work -match '\s') { throw "The temporary folder path contains a space ($work); the C compiler flags below cannot carry it." }
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 
 $saved = @{}
-foreach ($v in 'CARGO_TARGET_DIR', 'CARGO_ENCODED_RUSTFLAGS', 'CFLAGS', 'CXXFLAGS', 'GGML_NATIVE') {
+foreach ($v in 'CARGO_TARGET_DIR', 'CARGO_ENCODED_RUSTFLAGS', 'CFLAGS', 'CXXFLAGS', 'GGML_NATIVE', 'GGML_VULKAN_SHADER_DEBUG_INFO') {
     $saved[$v] = [Environment]::GetEnvironmentVariable($v, 'Process')
 }
 New-Item -ItemType Directory -Path $work | Out-Null
+New-Item -ItemType File -Path $mark | Out-Null
 try {
     $target = Join-Path $work 't'
     $env:CARGO_TARGET_DIR = $target
@@ -114,6 +143,8 @@ try {
     # AVX2 baseline: with GGML_NATIVE off, ggml enables SSE4.2, AVX, AVX2 and BMI2 (FMA and F16C
     # come with AVX2 under MSVC) and nothing newer.
     $env:GGML_NATIVE = 'OFF'
+    # Shaders compiled with debugging information carry their source paths.
+    $env:GGML_VULKAN_SHADER_DEBUG_INFO = 'OFF'
 
     Write-Host "Building Huck's Voice to Text $version for release..."
     # No --target: it would add a folder level the path length cannot afford. The static runtime
@@ -131,9 +162,11 @@ try {
     if ($settings -notmatch 'GGML_NATIVE:BOOL=OFF' -or $settings -notmatch 'GGML_AVX2:BOOL=ON' -or $settings -match 'GGML_AVX512:BOOL=ON') {
         throw 'whisper.cpp was not built for the AVX2 baseline; the release was NOT packaged.'
     }
-    $cpuProject = Join-Path (Split-Path -Parent $cache) 'ggml\src\ggml-cpu.vcxproj'
-    if ((Get-Content -LiteralPath $cpuProject -Raw) -match 'AdvancedVectorExtensions512') {
-        throw 'whisper.cpp uses AVX-512 instructions; the release was NOT packaged.'
+    # Built with Ninja (dev.ps1, step 5): the compiler flags are in build.ninja.
+    $ninjaFile = Join-Path (Split-Path -Parent $cache) 'build.ninja'
+    $flags = Get-Content -LiteralPath $ninjaFile -Raw
+    if ($flags -notmatch '/arch:AVX2' -or $flags -match '(?i)/arch:AVX512') {
+        throw 'whisper.cpp is not compiled for AVX2 alone; the release was NOT packaged.'
     }
     Write-Host 'Processor target: AVX2 baseline, no AVX-512.'
 
@@ -143,10 +176,12 @@ try {
     $texts = @([Text.Encoding]::ASCII.GetString($bytes), [Text.Encoding]::Unicode.GetString($bytes))
     $account = [regex]::Escape($env:USERNAME)
     $forbidden = [ordered]@{
-        'a user profile'      = '(?i)[A-Za-z]:\\Users\\'
+        # A drive letter stands alone and is followed by one slash: "https://.../whisper.cpp" is an
+        # address, not a path (it stopped the first 0.1.9 build, 2026-10-05).
+        'a user profile'      = '(?i)(?<![A-Za-z])[A-Za-z]:(\\|/(?!/))Users[\\/]'
         'this PC''s account'  = "(?i)[\\/]$account[\\/]"
         'the project drive'   = '(?i)Project Playground[\\/]'
-        'a source path'       = '(?i)[A-Za-z]:\\[^\x00]{0,160}\.(pdb|rs|c|cc|cpp|h|hpp)\b'
+        'a source path'       = '(?i)(?<![A-Za-z])[A-Za-z]:(\\|/(?!/))[^\x00]{0,160}\.(pdb|rs|c|cc|cpp|h|hpp|comp|glsl)\b'
         'an email address'    = '[A-Za-z0-9._%+-]+@[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}'
     }
     $leaks = @()
@@ -164,7 +199,18 @@ try {
     # --- 5. no Visual C++ runtime needed -------------------------------------------------------
     $vs = & (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe') -latest -products * -property installationPath
     $dumpbin = Get-ChildItem -Path (Join-Path $vs 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe') | Select-Object -Last 1
-    $imports = & $dumpbin.FullName /nologo /dependents $exe | Where-Object { $_ -match '\.dll' } | ForEach-Object { $_.Trim() }
+    # dumpbin lists what the program needs to start, then - under its own heading - what it asks
+    # for only when used.
+    $listing = & $dumpbin.FullName /nologo /dependents $exe
+    $delayedFrom = ($listing | Select-String -Pattern 'delay load dependencies' | Select-Object -First 1).LineNumber
+    if (-not $delayedFrom) { throw 'The executable delays no library; vulkan-1.dll would be needed to start. The release was NOT packaged.' }
+    $atStart = $listing | Select-Object -First ($delayedFrom - 1) | Where-Object { $_ -match '\.dll' } | ForEach-Object { $_.Trim() }
+    $later = $listing | Select-Object -Skip $delayedFrom | Where-Object { $_ -match '\.dll' } | ForEach-Object { $_.Trim() }
+    if ($atStart -match '(?i)^vulkan-1\.dll$' -or -not ($later -match '(?i)^vulkan-1\.dll$')) {
+        throw 'The executable needs vulkan-1.dll to start; a PC with no graphics driver could not open it. The release was NOT packaged.'
+    }
+    Write-Host 'Vulkan: asked for only when used - the program opens without it.'
+    $imports = $atStart
     $runtime = $imports | Where-Object { $_ -match '(?i)^(vcruntime|msvcp|vcomp|api-ms-win-crt-)' }
     if ($runtime) { throw ("The executable still needs the Visual C++ runtime ($($runtime -join ', ')); the release was NOT packaged.") }
     Write-Host 'Runtime: static - no Visual C++ Redistributable needed.'
@@ -175,6 +221,7 @@ try {
     $stagedExe = Join-Path $stage 'HucksVoiceToText.exe'
     Copy-Item -LiteralPath $exe -Destination $stagedExe
     & $inno /Qp ("/DAppVersion=$version") ("/DSourceExe=$stagedExe") ("/DSourceModel=$model") ("/DSourceDetector=$detector") `
+        ("/DSourceVulkan=$vulkan") ("/DSourceVulkanLicense=$vulkanLicense") `
         ("/DSourceLicense=$license") ("/DOutputDir=$work") ("/DSetupIcon=$icon") (Join-Path $PSScriptRoot 'HucksVoiceToText.iss')
     if ($LASTEXITCODE -ne 0) { throw 'The installer did not compile.' }
     $installer = Join-Path $work "$name.exe"
@@ -198,5 +245,7 @@ try {
 }
 finally {
     foreach ($v in $saved.Keys) { [Environment]::SetEnvironmentVariable($v, $saved[$v], 'Process') }
-    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $mark) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+    $oneRelease.ReleaseMutex()
+    $oneRelease.Dispose()
 }

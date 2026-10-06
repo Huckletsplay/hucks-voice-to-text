@@ -2,7 +2,7 @@
 
 Speak, and your words land in the text box you were typing in.
 
-Huck's Voice to Text is a dictation utility for macOS and Windows. It lives in the menu bar (the
+Huck's Voice to Text is an offline dictation (speech-to-text) program for Windows and macOS. It lives in the menu bar (the
 notification area on Windows) instead of taking over your desktop. Press a shortcut, talk, press it again — the words go into the text box you
 started in, even if you clicked somewhere else while you were talking.
 
@@ -18,7 +18,7 @@ each is updated when it needs it.
 | Platform | Download | Requirement |
 |---|---|---|
 | macOS | [`HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.7/HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.7/HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg.sha256.txt)) | Apple silicon Mac (M1 or newer), macOS 11 or newer |
-| Windows | [`HucksVoiceToText-0.1.8-windows-x64-setup.exe`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.8/HucksVoiceToText-0.1.8-windows-x64-setup.exe) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.8/HucksVoiceToText-0.1.8-windows-x64-setup.exe.sha256.txt)) | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
+| Windows | [`HucksVoiceToText-0.1.9-windows-x64-setup.exe`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.9/HucksVoiceToText-0.1.9-windows-x64-setup.exe) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.9/HucksVoiceToText-0.1.9-windows-x64-setup.exe.sha256.txt)) | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
 
 This is an unsigned public beta: macOS Gatekeeper and Windows SmartScreen will both call the
 developer unknown. Installation instructions are below, and each download has a SHA-256 checksum
@@ -37,13 +37,19 @@ Windows 10 22H2; other versions have not yet been tested. Intel Macs are not sup
 - **It learns your words.** Fix a word it got wrong — a name, a brand, some jargon — and it
   remembers, and writes it correctly from then on. Switch it off in the panel or under
   **Settings > Learn From My Fixes**.
+- **Hold to talk, if you prefer (Windows, from 0.1.9).** **Settings > Dictation Style** chooses
+  *Press to Start, Press to Send* or *Hold to Talk*: hold the shortcut, talk, let go, and the
+  words are sent.
 - **Stay out of the way.** No window to manage and no Dock or taskbar button — just an H in the
   menu bar or notification area.
 - **Keep it private.** Recognition runs entirely on your computer with
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Audio and text never leave it.
 - **Accurate first, faster if you like.** On a Mac the most accurate speech model, *Best*, is built
-  in. On Windows, where recognition runs on the processor alone for now, the built-in one is
-  *Quick*. H › Settings › Speech Model lists all six - *Tiny*, *Quick*, *Better*, *Medium*, *Best*,
+  in. On Windows the built-in one is *Quick*, and a PC with a graphics card - Intel, NVIDIA or
+  AMD - recognises on it when the card is quick: the program tries the card itself, uses it if
+  it is quick enough, times a slow one against the processor and keeps the faster, and tells you
+  when your PC can carry a more accurate model.
+  H › Settings › Speech Model lists all six - *Tiny*, *Quick*, *Better*, *Medium*, *Best*,
   *Large* - each rated for accuracy and speed, downloaded once when you choose it. A speed check
   when the program first opens sets it up for your computer, and offers a faster model if yours is
   slow there (**Settings > Check This Computer's Speed** runs it again).
@@ -75,7 +81,7 @@ for the new copy. Your settings and shortcuts are kept.
 
 ## Install on Windows
 
-1. Download `HucksVoiceToText-0.1.8-windows-x64-setup.exe` and run it.
+1. Download `HucksVoiceToText-0.1.9-windows-x64-setup.exe` and run it.
 2. Because this beta is not code-signed, Windows may show **Windows protected your PC**. Choose
    **More info**, then **Run anyway**.
 3. Follow the installer. It needs no administrator rights: it installs for your account only, into
@@ -142,8 +148,8 @@ shasum -a 256 -c HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg.sha256.txt
 ```
 
 ```powershell
-Get-FileHash .\HucksVoiceToText-0.1.8-windows-x64-setup.exe -Algorithm SHA256
-Get-Content .\HucksVoiceToText-0.1.8-windows-x64-setup.exe.sha256.txt
+Get-FileHash .\HucksVoiceToText-0.1.9-windows-x64-setup.exe -Algorithm SHA256
+Get-Content .\HucksVoiceToText-0.1.9-windows-x64-setup.exe.sha256.txt
 ```
 
 On Windows, compare the hash printed by `Get-FileHash` with the first value in the checksum file.
@@ -242,4 +248,6 @@ This license applies only to the files published in this public repository. It d
 separate unpublished software.
 
 Third-party components keep their own licenses: whisper.cpp and the Whisper model weights (MIT),
-Tauri (MIT / Apache-2.0), and the Rust crates listed in [`app/README.md`](app/README.md).
+Tauri (MIT / Apache-2.0), the Khronos Vulkan loader that the Windows installer puts beside the
+program (MIT / Apache-2.0; its notice is `VulkanRT-License.txt` there), and the Rust crates listed
+in [`app/README.md`](app/README.md).

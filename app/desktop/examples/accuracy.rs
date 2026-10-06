@@ -335,6 +335,13 @@ fn main() {
         eprintln!("usage: accuracy <corpus-dir> <model.bin> <sound:resampler:decoder> ...");
         std::process::exit(2);
     }
+    // This example calls whisper.cpp directly, and whisper.cpp must not be touched without
+    // Vulkan's loader in the program (`engine_whisper::vulkan_ready`), processor-only runs included.
+    #[cfg(windows)]
+    if !hvtt_desktop::engine_whisper::vulkan_ready() {
+        eprintln!("vulkan-1.dll is missing: install a graphics driver, or put the Vulkan runtime's copy beside this program.");
+        std::process::exit(2);
+    }
     let corpus = load_corpus(Path::new(&args[0]));
     let model = PathBuf::from(&args[1]);
     let show = std::env::var_os("SHOW").is_some();

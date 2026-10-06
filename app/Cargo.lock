@@ -1546,7 +1546,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hvtt-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dirs",
  "serde",
@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "hvtt-desktop"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "block2",
  "core-foundation",
@@ -1576,6 +1576,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "uds_windows",
  "whisper-rs",
+ "whisper-rs-sys",
  "windows 0.61.3",
 ]
 
@@ -4684,6 +4685,7 @@ version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2088172d00f936c348d6a72f488dc2660ab3f507263a195df308a3c2383229f6"
 dependencies = [
+ "libc",
  "whisper-rs-sys",
 ]
 
