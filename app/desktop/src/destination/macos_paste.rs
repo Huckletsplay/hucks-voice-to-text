@@ -30,6 +30,9 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use hvtt_core::pipeline::{DeliveryError, Destination, Liveness};
+use parking_lot::Mutex;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 const HID_SYSTEM_STATE: i32 = 1; // kCGEventSourceStateHIDSystemState
 const PRIVATE_STATE: i32 = -1; // kCGEventSourceStatePrivate
@@ -245,8 +248,351 @@ fn clicks() -> u32 {
     }
 }
 
+/// The system's own count of key presses, and nothing taken from it. A held dictation's key
+/// repeating is **not** left out: the presses the tap keeps back were subtracted here for an
+/// afternoon, and Codex's review (2026-10-05) showed that a repeat arriving between the two reads
+/// cancelled a real key press - a Tab into another box, then a paste there. If the system counts
+/// those repeats, a held dictation is "typed-or-repeated", which the same-window rule forgives
+/// where it can say where the caret is and otherwise only copies. Safe either way.
 fn keys() -> u32 {
     unsafe { CGEventSourceCounterForEventType(HID_SYSTEM_STATE, KEY_DOWN) }
+}
+
+// ---------------------------------------------------------------------------- hold to talk
+//
+// Dictation Style > Hold to Talk: he holds the shortcut, talks, and lets go. The twin of
+// `windows_paste`'s section of the same name, for the same two reasons, and a third of the Mac's
+// own.
+//
+// 1. Its own key must not type. macOS keeps repeating the last key pressed. While every key of
+//    Option+Space is down those repeats are the shortcut again and reach nobody; the moment he
+//    lets go of Option first, they are plain Spaces, typed into his text box for as long as his
+//    thumb is still down. So from the start of a held dictation until that key comes up, its
+//    presses are kept back by an event tap. (Only presses: the release goes through, so the
+//    shortcut's own watcher still sees the key come up.)
+// 2. Letting go of ANY of its keys is letting go. The shortcut library reports a release only
+//    for the main key; Option up, Space still down, would otherwise keep recording.
+//
+// The gate's key count is left alone (`keys`): the presses kept back here are counted only to be
+// said in the log.
+//
+// The tap needs Accessibility, which delivery needs anyway. Without it a key let go is still
+// noticed, by looking; only the keeping-back is lost.
+
+const KEY_UP: u32 = 11;
+const FLAGS_CHANGED: u32 = 12;
+const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+const TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
+const SESSION_EVENT_TAP: u32 = 1; // kCGSessionEventTap
+const FIELD_AUTOREPEAT: u32 = 8; // kCGKeyboardEventAutorepeat
+const FIELD_KEYCODE: u32 = 9; // kCGKeyboardEventKeycode
+const FIELD_SOURCE_STATE: u32 = 45; // kCGEventSourceStateID
+const FLAG_SHIFT: u64 = 0x0002_0000;
+const FLAG_CONTROL: u64 = 0x0004_0000;
+const FLAG_OPTION: u64 = 0x0008_0000;
+/// No key: the Mac's key numbers start at 0, which is A.
+const NO_KEY: u32 = u32::MAX;
+
+/// The key number of the dictation shortcut's own key (49, Space, for Option+Space).
+static TRIGGER: AtomicU32 = AtomicU32::new(NO_KEY);
+/// The dictation shortcut's modifiers, as event flags.
+static TRIGGER_MODIFIERS: AtomicU64 = AtomicU64::new(0);
+
+/// The held dictation whose keys are being watched, by a number of its own; 0 for none. One of
+/// its shortcut's keys coming up ends it - once.
+static HOLDING: AtomicU64 = AtomicU64::new(0);
+static HOLD_SERIAL: AtomicU64 = AtomicU64::new(0);
+/// That hold's own keys, as they were when it began - not the shortcut as it is now, which he
+/// can change while a key is still down.
+static HOLD_KEY: AtomicU32 = AtomicU32::new(NO_KEY);
+static HOLD_MODIFIERS: AtomicU64 = AtomicU64::new(0);
+/// The key whose presses reach no program - a held dictation's own, until it comes up - with
+/// the number of the hold it is for (`swallowing`); 0 for none.
+static SWALLOWING: AtomicU64 = AtomicU64::new(0);
+/// Every press kept back so far, since the program started. For the log only.
+static KEPT_BACK: AtomicU32 = AtomicU32::new(0);
+/// The tap, once made, and the hold it is switched on for; 0 when it is off.
+static TAP: Mutex<Option<Tap>> = Mutex::new(None);
+static TAP_FOR: Mutex<u64> = Mutex::new(0);
+/// The same, for the tap's own thread to read without waiting on anything.
+static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static TAP_WANTED: AtomicBool = AtomicBool::new(false);
+/// How the program is told that a key of a held shortcut came up, and of which hold
+/// (`on_hold_key_up`).
+static HOLD_KEY_UP: std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>> = std::sync::OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct Tap(CFTypeRef);
+// A Mach port, used only through Core Graphics' own thread-safe calls.
+unsafe impl Send for Tap {}
+
+type TapCallback = extern "C" fn(*mut c_void, u32, CFTypeRef, *mut c_void) -> CFTypeRef;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+    fn CGEventSourceFlagsState(state: i32) -> u64;
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events: u64,
+        callback: TapCallback,
+        user: *mut c_void,
+    ) -> CFTypeRef;
+    fn CGEventTapEnable(tap: CFTypeRef, enable: bool);
+    fn CGEventGetIntegerValueField(event: CFTypeRef, field: u32) -> i64;
+    fn CGEventGetFlags(event: CFTypeRef) -> u64;
+}
+
+/// Set once, when the program starts. `told` is given the hold's number (`hold_started`).
+pub fn on_hold_key_up(told: impl Fn(u64) + Send + Sync + 'static) {
+    let _ = HOLD_KEY_UP.set(Box::new(told));
+}
+
+/// A swallowed key and the hold it belongs to, as one number.
+fn swallowing(serial: u64, key: u32) -> u64 {
+    (serial << 16) | (key as u64 & 0xFFFF)
+}
+
+fn key_down(key: u32) -> bool {
+    key != NO_KEY && unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, key as u16) }
+}
+
+/// Is every modifier in `wanted` held - on either side of the keyboard?
+fn modifiers_down(wanted: u64) -> bool {
+    unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) & wanted == wanted }
+}
+
+/// The key number of a shortcut's own key, from its name in an accelerator (`Space`, `V`, `F5`).
+fn key_number(name: &str) -> Option<u32> {
+    const KEYS: &[(&str, u32)] = &[
+        ("A", 0), ("S", 1), ("D", 2), ("F", 3), ("H", 4), ("G", 5), ("Z", 6), ("X", 7), ("C", 8),
+        ("V", 9), ("B", 11), ("Q", 12), ("W", 13), ("E", 14), ("R", 15), ("Y", 16), ("T", 17),
+        ("1", 18), ("2", 19), ("3", 20), ("4", 21), ("6", 22), ("5", 23), ("Equal", 24), ("9", 25),
+        ("7", 26), ("Minus", 27), ("8", 28), ("0", 29), ("BracketRight", 30), ("O", 31), ("U", 32),
+        ("BracketLeft", 33), ("I", 34), ("P", 35), ("Enter", 36), ("L", 37), ("J", 38),
+        ("Quote", 39), ("K", 40), ("Semicolon", 41), ("Backslash", 42), ("Comma", 43),
+        ("Slash", 44), ("N", 45), ("M", 46), ("Period", 47), ("Tab", 48), ("Space", 49),
+        ("Backquote", 50), ("Backspace", 51), ("Escape", 53), ("F5", 96), ("F6", 97), ("F7", 98),
+        ("F3", 99), ("F8", 100), ("F9", 101), ("F11", 103), ("F13", 105), ("F16", 106),
+        ("F14", 107), ("F10", 109), ("F12", 111), ("F15", 113), ("Home", 115), ("PageUp", 116),
+        ("Delete", 117), ("F4", 118), ("End", 119), ("F2", 120), ("PageDown", 121), ("F1", 122),
+        ("ArrowLeft", 123), ("ArrowRight", 124), ("ArrowDown", 125), ("ArrowUp", 126),
+        ("CapsLock", 57), ("F17", 64), ("NumpadDecimal", 65), ("NumpadMultiply", 67),
+        ("NumpadAdd", 69), ("NumLock", 71), ("NumpadDivide", 75), ("NumpadEnter", 76),
+        ("NumpadSubtract", 78), ("F18", 79), ("F19", 80), ("NumpadEqual", 81), ("Numpad0", 82),
+        ("Numpad1", 83), ("Numpad2", 84), ("Numpad3", 85), ("Numpad4", 86), ("Numpad5", 87),
+        ("Numpad6", 88), ("Numpad7", 89), ("F20", 90), ("Numpad8", 91), ("Numpad9", 92),
+        ("IntlBackslash", 10), ("Insert", 114),
+    ];
+    let name = name.strip_prefix("Key").or_else(|| name.strip_prefix("Digit")).unwrap_or(name);
+    KEYS.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, key)| *key)
+}
+
+/// The modifiers an accelerator names (`Ctrl+Alt+Space`), as event flags.
+fn modifiers_of(accelerator: &str) -> u64 {
+    let mut parts: Vec<&str> = accelerator.split('+').map(str::trim).collect();
+    parts.pop();
+    parts.iter().fold(0, |flags, part| {
+        flags | match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => FLAG_CONTROL,
+            "alt" | "option" => FLAG_OPTION,
+            "shift" => FLAG_SHIFT,
+            "super" | "cmd" | "command" | "meta" | "cmdorctrl" | "commandorcontrol" => FLAG_COMMAND,
+            _ => 0,
+        }
+    })
+}
+
+/// Tell the gate which key starts and stops dictation, from its accelerator (`Alt+Space`).
+pub fn set_trigger_key(accelerator: &str) {
+    TRIGGER_MODIFIERS.store(modifiers_of(accelerator), Ordering::Relaxed);
+    let key = accelerator.rsplit('+').next().unwrap_or("").trim();
+    TRIGGER.store(key_number(key).unwrap_or(NO_KEY), Ordering::Relaxed);
+}
+
+/// Can the dictation shortcut's keys be watched at all? If not, a dictation is not held.
+pub fn hold_key_known() -> bool {
+    TRIGGER.load(Ordering::Relaxed) != NO_KEY
+}
+
+/// The tap, made the first time it is wanted and asked for again each time until macOS allows
+/// one. It lives on a thread of its own, switched off until a hold switches it on.
+fn tap() -> Option<Tap> {
+    let mut tap = TAP.lock();
+    if tap.is_none() && super::macos_ax::accessibility_trusted() {
+        let (made, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || unsafe {
+            use core_foundation_sys::mach_port::CFMachPortCreateRunLoopSource;
+            use core_foundation_sys::runloop::{
+                kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun,
+            };
+            let events = (1u64 << KEY_DOWN) | (1 << KEY_UP) | (1 << FLAGS_CHANGED);
+            let port = CGEventTapCreate(SESSION_EVENT_TAP, 0, 0, events, on_key, std::ptr::null_mut());
+            if port.is_null() {
+                let _ = made.send(None);
+                return;
+            }
+            CGEventTapEnable(port, false);
+            let source = CFMachPortCreateRunLoopSource(std::ptr::null(), port as _, 0);
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+            TAP_PORT.store(port as *mut c_void, Ordering::SeqCst);
+            let _ = made.send(Some(Tap(port)));
+            CFRunLoopRun();
+        });
+        *tap = wait.recv().ok().flatten();
+    }
+    *tap
+}
+
+/// Switch the tap on for hold number `serial`. False when there is none to switch on.
+fn tap_on(serial: u64) -> bool {
+    let Some(Tap(port)) = tap() else { return false };
+    let mut wanted_for = TAP_FOR.lock();
+    *wanted_for = serial;
+    TAP_WANTED.store(true, Ordering::SeqCst);
+    unsafe { CGEventTapEnable(port, true) };
+    true
+}
+
+/// Switch it off again - unless a newer hold has it by now.
+fn tap_off(serial: u64) {
+    let mut wanted_for = TAP_FOR.lock();
+    if *wanted_for == serial {
+        *wanted_for = 0;
+        TAP_WANTED.store(false, Ordering::SeqCst);
+        let port = TAP_PORT.load(Ordering::SeqCst);
+        if !port.is_null() {
+            unsafe { CGEventTapEnable(port as CFTypeRef, false) };
+        }
+    }
+}
+
+/// A held dictation has started, at the keypress: its number, by which a key coming up is
+/// reported (`on_hold_key_up`); 0 if the shortcut's key is not known. From here its own key
+/// types nothing, and any key of its shortcut coming up is told to the program.
+pub fn hold_started() -> u64 {
+    let trigger = TRIGGER.load(Ordering::Relaxed);
+    if trigger == NO_KEY {
+        return 0;
+    }
+    let modifiers = TRIGGER_MODIFIERS.load(Ordering::Relaxed);
+    let serial = HOLD_SERIAL.fetch_add(1, Ordering::SeqCst) + 1;
+    HOLD_KEY.store(trigger, Ordering::SeqCst);
+    HOLD_MODIFIERS.store(modifiers, Ordering::SeqCst);
+    let mine = swallowing(serial, trigger);
+    // What is kept back is said before the tap is switched on, and not written again for this
+    // hold: an outage clears it (`on_key`), and a write after the switching-on put it back -
+    // over a key that had come up and gone down again unseen (Codex's third review, 2026-10-05).
+    let has_tap = tap().is_some();
+    SWALLOWING.store(if has_tap && key_down(trigger) { mine } else { 0 }, Ordering::SeqCst);
+    HOLDING.store(serial, Ordering::SeqCst);
+    if !(has_tap && tap_on(serial)) {
+        let _ = SWALLOWING.compare_exchange(mine, 0, Ordering::SeqCst, Ordering::SeqCst);
+        eprintln!("[hvtt] hold to talk without the event tap: the held key is not kept from other programs");
+    }
+    let kept_before = KEPT_BACK.load(Ordering::SeqCst);
+    // Looks, as well as the tap's listening: a key let go ends the hold even with no tap. And
+    // once the key is up - which can be after the dictation is over - the tap may go off.
+    // Everything here is this hold's own: a newer hold's is left alone.
+    std::thread::spawn(move || {
+        while key_down(trigger) {
+            if !modifiers_down(modifiers) {
+                hold_key_came_up(serial);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        hold_key_came_up(serial);
+        let _ = SWALLOWING.compare_exchange(mine, 0, Ordering::SeqCst, Ordering::SeqCst);
+        tap_off(serial);
+        let kept = KEPT_BACK.load(Ordering::SeqCst).wrapping_sub(kept_before);
+        eprintln!("[hvtt] hold to talk: {kept} repeat(s) of its key kept from other programs");
+    });
+    serial
+}
+
+/// Asked once the recording exists: has a key of the held shortcut already come up - in the
+/// moment the microphone took to open? The caller ends the dictation itself; a report of the
+/// same thing, if one was also made, is then one too many and ignored.
+///
+/// `serial`: the hold's number from `hold_started`. With none (0) its keys were never noted -
+/// the ones on record are an earlier hold's - so nothing is concluded from them.
+pub fn hold_already_let_go(serial: u64) -> bool {
+    serial != 0
+        && !(key_down(HOLD_KEY.load(Ordering::SeqCst)) && modifiers_down(HOLD_MODIFIERS.load(Ordering::SeqCst)))
+}
+
+/// One of hold number `serial`'s keys came up: say so, once, naming the hold.
+fn hold_key_came_up(serial: u64) {
+    if serial != 0 && HOLDING.compare_exchange(serial, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        if let Some(told) = HOLD_KEY_UP.get() {
+            told(serial);
+        }
+    }
+}
+
+/// Should the tap keep this key event from every program? Only the key a held dictation is still
+/// holding down (`swallowing`; 0 for none) *repeating* under his finger. A fresh press of it is
+/// never kept back: it means the key came up unseen - the tap was off for a moment - and he has
+/// pressed it again (Codex's review, 2026-10-05).
+fn swallowed(key: u32, repeat: bool, his: bool, swallowing: u64) -> bool {
+    repeat && his && swallowing != 0 && key as u64 == swallowing & 0xFFFF
+}
+
+/// The tap: every key press, release and modifier change, before any program sees it - while a
+/// hold has it switched on. Returning nothing keeps the event from everyone.
+extern "C" fn on_key(_proxy: *mut c_void, kind: u32, event: CFTypeRef, _user: *mut c_void) -> CFTypeRef {
+    match kind {
+        // macOS switches a tap off when it is slow to answer, or on some input. Back on, if a
+        // hold still wants it.
+        TAP_DISABLED_BY_TIMEOUT | TAP_DISABLED_BY_USER_INPUT => {
+            // What happened meanwhile went unseen - the key may have come up and gone down
+            // again - so nothing is kept back any more for the hold that was on (Codex's second
+            // review, 2026-10-05). Letting go is still noticed, by looking.
+            SWALLOWING.store(0, Ordering::SeqCst);
+            let port = TAP_PORT.load(Ordering::SeqCst);
+            if TAP_WANTED.load(Ordering::SeqCst) && !port.is_null() {
+                unsafe { CGEventTapEnable(port as CFTypeRef, true) };
+            }
+        }
+        KEY_DOWN | KEY_UP => {
+            let key = unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) } as u32;
+            // From the keyboard - not the paste keys this program presses, nor another's.
+            let his = unsafe { CGEventGetIntegerValueField(event, FIELD_SOURCE_STATE) } == HID_SYSTEM_STATE as i64;
+            let swallowing = SWALLOWING.load(Ordering::SeqCst);
+            let repeat =
+                kind == KEY_DOWN && unsafe { CGEventGetIntegerValueField(event, FIELD_AUTOREPEAT) } != 0;
+            if swallowed(key, repeat, his, swallowing) {
+                KEPT_BACK.fetch_add(1, Ordering::SeqCst);
+                return std::ptr::null();
+            }
+            // Up - or pressed afresh, so it came up unseen: its presses go through again, at
+            // once, and the hold it belonged to is over.
+            let fresh = kind == KEY_DOWN && !repeat;
+            if (kind == KEY_UP || fresh) && his {
+                // Only the entry just read: a newer hold's stays.
+                if swallowing != 0 && key as u64 == swallowing & 0xFFFF {
+                    let _ = SWALLOWING.compare_exchange(swallowing, 0, Ordering::SeqCst, Ordering::SeqCst);
+                }
+                let holding = HOLDING.load(Ordering::SeqCst);
+                if holding != 0 && key == HOLD_KEY.load(Ordering::SeqCst) && (fresh || !key_down(key)) {
+                    hold_key_came_up(holding);
+                }
+            }
+        }
+        FLAGS_CHANGED => {
+            let holding = HOLDING.load(Ordering::SeqCst);
+            let wanted = HOLD_MODIFIERS.load(Ordering::SeqCst);
+            // The event says a modifier is up; the keyboard itself must say so too. Any program
+            // can post a modifier event (Codex's review, 2026-10-05).
+            if holding != 0 && unsafe { CGEventGetFlags(event) } & wanted != wanted && !modifiers_down(wanted) {
+                hold_key_came_up(holding);
+            }
+        }
+        _ => {}
+    }
+    event
 }
 
 /// The input half of the gate, from what was counted since the keypress and what the gate
@@ -704,6 +1050,33 @@ mod tests {
         if let Some(pid) = named {
             assert!(pid > 0);
         }
+    }
+
+    #[test]
+    fn the_shortcut_names_the_keys_a_hold_watches() {
+        assert_eq!(key_number("Space"), Some(49));
+        assert_eq!(key_number("V"), Some(9));
+        assert_eq!(key_number("F"), Some(3), "the letter, not a function key");
+        assert_eq!(key_number("F5"), Some(96));
+        assert_eq!(key_number("A"), Some(0), "the Mac's key 0 is a real key");
+        assert_eq!(key_number("Numpad1"), Some(83));
+        assert_eq!(key_number("AudioVolumeUp"), None, "not known: that shortcut is not held");
+        assert_eq!(modifiers_of("Alt+Space"), FLAG_OPTION);
+        assert_eq!(modifiers_of("Alt+Ctrl+V"), FLAG_OPTION | FLAG_CONTROL);
+        assert_eq!(modifiers_of("Cmd+Shift+Space"), FLAG_COMMAND | FLAG_SHIFT);
+    }
+
+    #[test]
+    fn a_held_dictation_keeps_back_only_its_own_keys_presses() {
+        let space = swallowing(3, 49);
+        assert!(swallowed(49, true, true, space), "Space repeating under his thumb");
+        assert!(!swallowed(49, false, true, space), "its release, or a fresh press, goes through");
+        assert!(!swallowed(9, true, true, space), "any other key is his typing");
+        assert!(!swallowed(49, true, false, space), "a press this program or another made");
+        assert!(!swallowed(49, true, true, 0), "no hold: Space is Space");
+        // Key 0 is A on the Mac: a hold on A keeps back A, and "none" keeps back nothing.
+        assert!(swallowed(0, true, true, swallowing(1, 0)));
+        assert!(!swallowed(0, true, true, 0));
     }
 
     #[test]

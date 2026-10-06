@@ -535,7 +535,6 @@ fn bind_all(app: &AppHandle) {
     let _ = app.global_shortcut().unregister_all();
     let s = state.settings.lock().clone();
     // The paste gate exempts this key's auto-repeat, and no other key's.
-    #[cfg(windows)]
     platform_paste::set_trigger_key(&s.shortcut);
     let dictate = register_shortcut(app, &s.shortcut, Action::Dictate).err();
     // Only with Huck's clipboard: on the normal one, Cmd+V already does the job.
@@ -1161,7 +1160,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     )?)?;
 
     // How he dictates: it decides whether Live Words, just below it, applies.
-    let hold = HOLD_TO_TALK_HERE && s.dictation_style == DictationStyle::HoldToTalk;
+    let hold = s.dictation_style == DictationStyle::HoldToTalk;
     let style = Submenu::with_id(app, "dictation-style", "Dictation Style", !recording)?;
     style.append(&check("style-press", "Press to Start, Press to Send", !hold)?)?;
     style.append(&check("style-hold", "Hold to Talk — let go to send", hold)?)?;
@@ -1182,9 +1181,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     settings.append(&shortcuts)?;
     settings.append(&clipboard)?;
     // Right above Live Words (his placing, 2026-10-05): it decides whether Live Words applies.
-    if HOLD_TO_TALK_HERE {
-        settings.append(&style)?;
-    }
+    settings.append(&style)?;
     settings.append(&live)?;
     // Same plain words: what happens, and what it costs.
     let stop = Submenu::with_id(app, "stop-talking", "When I Stop Talking", true)?;
@@ -2111,18 +2108,12 @@ static HOLD_NEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// (the shortcut's own report, and on Windows the keyboard hook) end it once.
 static HOLD_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Windows: the number `windows_paste` gave the held dictation's keys; 0 for none. A report that
-/// a held key came up names its hold, and is acted on only if it is still this one.
-#[cfg(windows)]
+/// The number the paste gate gave the held dictation's keys; 0 for none. A report that a held
+/// key came up names its hold, and is acted on only if it is still this one.
 static HOLD_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What the box says while he holds.
 const HOLD_LISTENING: &str = "Listening — let go to send";
-
-/// Hold to Talk exists on Windows only until the Mac's half is written (`macos_paste.rs` must
-/// leave a held key's own auto-repeat out of its count, and end on either key): until then the
-/// Mac neither offers the style nor acts on it, whatever a settings file says.
-const HOLD_TO_TALK_HERE: bool = cfg!(windows);
 
 /// Is dictation number `generation` a held one?
 fn held(generation: u64) -> bool {
@@ -2135,15 +2126,18 @@ fn dictate_pressed(app: AppHandle) {
     post_to_main(&app, |app| {
         use std::sync::atomic::Ordering::SeqCst;
         let state: State<App> = app.state();
-        let hold = HOLD_TO_TALK_HERE && state.settings.lock().dictation_style == DictationStyle::HoldToTalk;
+        // A shortcut whose key the paste gate cannot watch is not held: it could neither end on
+        // a modifier let go nor keep its key from typing. Press to start, press to send.
+        let hold = state.settings.lock().dictation_style == DictationStyle::HoldToTalk
+            && platform_paste::hold_key_known();
         HOLD_NEXT.store(hold, SeqCst);
         toggle_now(app, true);
         HOLD_NEXT.store(false, SeqCst);
     });
 }
 
-/// The dictation shortcut coming up - or, on Windows, any one of its keys (`windows_paste`'s
-/// hook). Ends a held dictation and sends it; does nothing for any other. No stop *press* was
+/// The dictation shortcut coming up - or any one of its keys (the paste gate's watch on the
+/// keyboard, `hold_started`). Ends a held dictation and sends it; does nothing for any other. No stop *press* was
 /// made, so the paste gate is told to expect none.
 fn hold_released(app: &AppHandle) {
     use std::sync::atomic::Ordering::SeqCst;
@@ -2589,10 +2583,9 @@ fn start_recording(app: AppHandle, admitted: Admitted) {
     let hold = HOLD_NEXT.swap(false, std::sync::atomic::Ordering::SeqCst);
     HELD_DICTATION.store(if hold { generation } else { 0 }, std::sync::atomic::Ordering::SeqCst);
     HOLD_OPEN.store(hold, std::sync::atomic::Ordering::SeqCst);
-    // Windows: from here until the shortcut's own key comes up, its auto-repeat reaches no
-    // program, and any one of the shortcut's keys coming up ends the dictation - this hold's
-    // keys, by its own number, so a late word about an earlier hold ends nothing.
-    #[cfg(windows)]
+    // From here until the shortcut's own key comes up, its auto-repeat reaches no program, and
+    // any one of the shortcut's keys coming up ends the dictation - this hold's keys, by its
+    // own number, so a late word about an earlier hold ends nothing.
     HOLD_KEYS.store(if hold { platform_paste::hold_started() } else { 0 }, std::sync::atomic::Ordering::SeqCst);
     state.live_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     *state.live.lock() = Live::default();
@@ -2642,9 +2635,8 @@ fn start_recording(app: AppHandle, admitted: Admitted) {
             *state.recording.lock() = Some(rec);
             drop(changing);
             state.timings.lock().shortcut_to_capture_ms = pressed.elapsed().as_millis();
-            // Windows, held: a key of the shortcut let go while the microphone was opening. Looked
-            // for here, not where the hold began - only now is there a recording to end.
-            #[cfg(windows)]
+            // Held: a key of the shortcut let go while the microphone was opening. Looked for
+            // here, not where the hold began - only now is there a recording to end.
             if hold && platform_paste::hold_already_let_go(HOLD_KEYS.load(std::sync::atomic::Ordering::SeqCst)) {
                 hold_released(&app);
             }
@@ -4470,9 +4462,8 @@ pub fn run() {
                     }
                 });
             }
-            // Windows: the keyboard hook says when one of the shortcut's keys comes up while he
-            // holds (the shortcut's own report waits for its main key alone).
-            #[cfg(windows)]
+            // The paste gate's watch on the keyboard says when one of the shortcut's keys comes
+            // up while he holds (the shortcut's own report waits for its main key alone).
             {
                 let handle = app.handle().clone();
                 platform_paste::on_hold_key_up(move |keys| {

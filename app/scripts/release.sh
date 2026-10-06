@@ -10,10 +10,23 @@
 # These names are the contract with the in-app updater (`desktop/src/update.rs`); change one and
 # the other must change with it.
 #
-# UNSIGNED BETA. The app is signed ad hoc, not with a Developer ID, and is not notarized, so macOS
-# blocks the first launch until the user chooses Open Anyway in Privacy & Security. An ad-hoc
-# identity also changes with every build, so each update needs Microphone and Accessibility
-# switched on again. Say both on the download page.
+# UNSIGNED BETA. The app is not signed with a Developer ID and is not notarized, so macOS blocks
+# the first launch until the user chooses Open Anyway in Privacy & Security. Say so on the
+# download page.
+#
+# ONE SIGNATURE FOR EVERY RELEASE (from 0.1.10). macOS ties Microphone and Accessibility to the
+# app's signature. Signed ad hoc - as every release up to 0.1.7 was - each build is a different
+# program to macOS: after an update the old ticks still show in System Settings and no longer
+# count. So a release is signed with this Mac's own certificate, the one install.sh uses
+# ("Project Playground Local Signing") - that very certificate, by its fingerprint
+# (RELEASE_CERTIFICATE below), since another of the same name would be another signature
+# (Codex's review, 2026-10-06). Self-made, so macOS trusts it no
+# more than before, but the same from one release to the next, so the permissions stay. It
+# holds a name and nothing else of his. **A release cannot be made without it** - one signed
+# any other way would cost everybody their permissions once more. The certificate and its key
+# live in this Mac's login keychain and nowhere else: lose them and the next release does
+# exactly that. The move from an ad-hoc release (0.1.7) to the first one signed this way is
+# one last switching-on.
 #
 # The speech model is placed inside the app so a download works straight away. It is taken from
 # HVTT_RELEASE_MODEL, or else this Mac's Application Support copy (`scripts/fetch-model.sh
@@ -41,6 +54,7 @@ import json, shlex, sys
 c = json.load(open(sys.argv[1]))
 print(f"PRODUCT_NAME={shlex.quote(c['productName'])}")
 print(f"VERSION={shlex.quote(c['version'])}")
+print(f"BUNDLE_ID={shlex.quote(c['identifier'])}")
 CONFPY
 )"
 
@@ -105,9 +119,28 @@ if strings "$APP/Contents/MacOS/hvtt-desktop" \
     exit 1
 fi
 
-say "Signing ad hoc (unsigned beta)…"
-codesign --force --sign - "$APP"
+# The one certificate every release is signed with, by its SHA-1 fingerprint - which is public:
+# it is in every copy of the app. Changing it costs everybody their permissions once.
+RELEASE_CERTIFICATE="39C3C378F490A6690F7FBC8092A90A83EF212046"
+if ! security find-identity -v -p codesigning 2>/dev/null | grep -qiF "$RELEASE_CERTIFICATE"; then
+    echo "Refusing to package: the release certificate ($RELEASE_CERTIFICATE) is not on this Mac." >&2
+    echo "Every release carries that one signature, so that updates keep their permissions." >&2
+    exit 1
+fi
+say "Signing with the release certificate (unsigned beta: no Developer ID, not notarized)…"
+codesign --force --sign "$RELEASE_CERTIFICATE" --timestamp=none "$APP"
 codesign --verify --strict --verbose=1 "$APP"
+# What macOS will hold the permissions against: this program by name, signed with that
+# certificate - not a fingerprint of this one build.
+REQUIREMENT="$(codesign -d -r- "$APP" 2>/dev/null | grep "designated =>" || true)"
+EXPECTED_LEAF="$(printf '%s' "$RELEASE_CERTIFICATE" | tr 'A-F' 'a-f')"
+case "$REQUIREMENT" in
+    *"identifier \"$BUNDLE_ID\" and certificate leaf = H\"$EXPECTED_LEAF\""*) ;;
+    *)
+        echo "Refusing to package: the signature is not tied to the certificate ($REQUIREMENT)." >&2
+        exit 1
+        ;;
+esac
 ARCHS="$(lipo -archs "$APP/Contents/MacOS/hvtt-desktop")"
 [ "$ARCHS" = "arm64" ] || { echo "Unexpected architectures: $ARCHS" >&2; exit 1; }
 

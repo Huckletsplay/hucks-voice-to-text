@@ -144,6 +144,11 @@ fn modifiers_down(wanted: u32) -> bool {
     pairs.iter().all(|(bit, keys)| wanted & bit == 0 || keys.iter().any(|k| key_down(*k)))
 }
 
+/// Can the dictation shortcut's keys be watched at all? If not, a dictation is not held.
+pub fn hold_key_known() -> bool {
+    TRIGGER.load(Ordering::Relaxed) != 0
+}
+
 /// A held dictation has started, at the keypress: its number, by which a key coming up is
 /// reported (`on_hold_key_up`); 0 if the shortcut's key is not known. From here its own key
 /// types nothing, and any key of its shortcut coming up is told to the program.

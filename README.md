@@ -17,7 +17,7 @@ each is updated when it needs it.
 
 | Platform | Download | Requirement |
 |---|---|---|
-| macOS | [`HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.7/HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.7/HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg.sha256.txt)) | Apple silicon Mac (M1 or newer), macOS 11 or newer |
+| macOS | [`HucksVoiceToText-0.1.10-macOS-arm64-unsigned-beta.dmg`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.10/HucksVoiceToText-0.1.10-macOS-arm64-unsigned-beta.dmg) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.10/HucksVoiceToText-0.1.10-macOS-arm64-unsigned-beta.dmg.sha256.txt)) | Apple silicon Mac (M1 or newer), macOS 11 or newer |
 | Windows | [`HucksVoiceToText-0.1.9-windows-x64-setup.exe`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.9/HucksVoiceToText-0.1.9-windows-x64-setup.exe) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.9/HucksVoiceToText-0.1.9-windows-x64-setup.exe.sha256.txt)) | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
 
 This is an unsigned public beta: macOS Gatekeeper and Windows SmartScreen will both call the
@@ -37,7 +37,7 @@ Windows 10 22H2; other versions have not yet been tested. Intel Macs are not sup
 - **It learns your words.** Fix a word it got wrong — a name, a brand, some jargon — and it
   remembers, and writes it correctly from then on. Switch it off in the panel or under
   **Settings > Learn From My Fixes**.
-- **Hold to talk, if you prefer (Windows, from 0.1.9).** **Settings > Dictation Style** chooses
+- **Hold to talk, if you prefer.** **Settings > Dictation Style** chooses
   *Press to Start, Press to Send* or *Hold to Talk*: hold the shortcut, talk, let go, and the
   words are sent.
 - **Stay out of the way.** No window to manage and no Dock or taskbar button — just an H in the
@@ -75,9 +75,14 @@ The speech model is included, so there is nothing else to download.
 **Updates.** Choose **Settings > Check for Updates…** in the menu-bar H. The app asks GitHub only
 when you choose it, downloads a newer DMG with its published SHA-256 checksum, verifies them, and
 asks before opening the DMG. Install it the usual way: quit the app, drag the new copy onto
-Applications and replace the old one, then reopen it. Because this is still an unsigned beta, macOS
-may ask for **Open Anyway** again, and **Microphone** and **Accessibility** need switching on again
-for the new copy. Your settings and shortcuts are kept.
+Applications and replace the old one, then reopen it. Your settings and shortcuts are kept.
+
+**Permissions after an update.** From 0.1.10 every release carries the same signature, so macOS
+keeps **Microphone** and **Accessibility** switched on from one version to the next. Coming from
+0.1.7 or older, they need switching on one last time: if Accessibility shows as on and dictation
+still does not reach your text box, select **Huck's Voice to Text** in **System Settings > Privacy
+& Security > Accessibility**, remove it with **−**, and add it again. Because this is still an
+unsigned beta, macOS may ask for **Open Anyway** again.
 
 ## Install on Windows
 
@@ -144,7 +149,7 @@ privately, see [SECURITY.md](SECURITY.md).
 Each download has a checksum file, linked beside it under [Download](#download).
 
 ```bash
-shasum -a 256 -c HucksVoiceToText-0.1.7-macOS-arm64-unsigned-beta.dmg.sha256.txt
+shasum -a 256 -c HucksVoiceToText-0.1.10-macOS-arm64-unsigned-beta.dmg.sha256.txt
 ```
 
 ```powershell
