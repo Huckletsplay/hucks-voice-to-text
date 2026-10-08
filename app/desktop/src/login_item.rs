@@ -46,6 +46,13 @@ pub fn toggle() -> Result<(), String> {
     }
 }
 
+/// Take the program off the system's startup list, if it is on it: Uninstall's.
+pub fn turn_off() {
+    if matches!(state(), LoginState::On | LoginState::NeedsApproval) {
+        let _ = set(false);
+    }
+}
+
 // ---------------------------------------------------------------------------- macOS
 
 #[cfg(target_os = "macos")]

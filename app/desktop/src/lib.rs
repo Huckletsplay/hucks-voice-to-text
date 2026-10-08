@@ -11,6 +11,8 @@ pub mod engine_whisper;
 mod exit;
 pub mod login_item;
 pub mod recorder;
+#[cfg(any(target_os = "macos", windows))]
+mod uninstall;
 pub mod update;
 #[cfg(windows)]
 mod win_hook;
@@ -1258,6 +1260,12 @@ fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     settings.append(&item("check-updates", "Check for Updates…".into(), !recording)?)?;
     settings.append(&check("updates-on-start", "Check for Updates When It Opens", s.check_updates_on_start)?)?;
     settings.append(&item("version", format!("Version {}", app.package_info().version), false)?)?;
+    // The way out, last. On Windows it is also in Settings > Apps: the same uninstaller.
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        settings.append(&PredefinedMenuItem::separator(app)?)?;
+        settings.append(&item("uninstall", "Uninstall…".into(), !recording)?)?;
+    }
     menu.append(&settings)?;
 
     menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -1342,6 +1350,8 @@ fn on_menu(app: &AppHandle, id: &str) {
                 open_path(dir);
             }
         }
+        #[cfg(any(target_os = "macos", windows))]
+        "uninstall" => ask_to_uninstall(app),
         "quit" => quit(app.clone()),
         _ => return,
     }
@@ -4346,6 +4356,12 @@ fn notice(title: &str, detail: String) -> UpdateView {
 #[tauri::command]
 fn accept_offer(app: AppHandle) {
     let state: State<App> = app.state();
+    // The box's other question with a button of its own. Only while it is the one showing.
+    #[cfg(any(target_os = "macos", windows))]
+    if on_screen(&state, UNINSTALL_TITLE) {
+        uninstall_now(app);
+        return;
+    }
     // Only while the offer is what the box shows: a message that replaced it (a ready update) is
     // never cleared by a late click (Codex's nineteenth review).
     if !state.update.lock().as_ref().is_some_and(|v| v.stage == "offer") {
@@ -4362,6 +4378,99 @@ fn accept_offer(app: AppHandle) {
         }
     }
     push(&app);
+}
+
+/// What the box asks before an uninstall. Its title is how the answer is known to be to this.
+#[cfg(any(target_os = "macos", windows))]
+const UNINSTALL_TITLE: &str = "Uninstall Huck's Voice to Text?";
+
+#[cfg(target_os = "macos")]
+const UNINSTALL_DETAIL: &str = "This removes the app, your settings and learned fixes, your recovery drafts and the \
+                                speech models you downloaded, and switches off its Microphone and Accessibility \
+                                permissions. It cannot be undone.";
+#[cfg(windows)]
+const UNINSTALL_DETAIL: &str = "This removes the program, your settings and learned fixes, your recovery drafts and the \
+                                speech models you downloaded. It cannot be undone.";
+
+/// H > Settings > Uninstall…: ask, in the box, with a button to say yes (his decision,
+/// 2026-10-06: one choice, everything, after one question). Nothing is removed here.
+#[cfg(any(target_os = "macos", windows))]
+fn ask_to_uninstall(app: &AppHandle) {
+    // A copy the installer did not put here (a developer's) has no uninstaller to hand over to.
+    #[cfg(windows)]
+    if !uninstall::installed() {
+        show_update(
+            app,
+            "failed",
+            "Can't uninstall this copy".into(),
+            "It was not put here by its installer, so it has no uninstaller.".into(),
+        );
+        return;
+    }
+    let state: State<App> = app.state();
+    // A speed check's offer the box was holding is over: this takes its place and its button.
+    *state.offered_model.lock() = None;
+    *state.update.lock() = Some(UpdateView {
+        stage: "offer",
+        title: UNINSTALL_TITLE.into(),
+        detail: UNINSTALL_DETAIL.into(),
+        action: Some("Uninstall".into()),
+    });
+    if !matches!(*state.session.lock(), SessionState::Recording | SessionState::Paused | SessionState::Transcribing) {
+        reveal_composer(app);
+    }
+    push(app);
+}
+
+/// He said yes. Leaves the way Quit does - no dictation may start, his own clipboard is given
+/// back first - then removes everything the program kept, puts the app in the Trash, and goes.
+/// On Windows the removing is the installer's uninstaller's, started here: it waits for this copy
+/// to be gone, then takes the program and everything it kept (`HucksVoiceToText.iss`).
+#[cfg(any(target_os = "macos", windows))]
+fn uninstall_now(app: AppHandle) {
+    let state: State<App> = app.state();
+    // Words that are only in the box are his to copy or discard first.
+    if *state.words_unsaved.lock() || !LEAVING.lock().begin() {
+        return;
+    }
+    show_update(&app, "installing", "Uninstalling…".into(), "Removing the app and everything it kept.".into());
+    std::thread::spawn(move || {
+        if !clip::huck::stop_borrowing(std::time::Duration::from_secs(10)) {
+            clip::huck::resume_borrowing();
+            LEAVING.lock().stay();
+            show_update(
+                &app,
+                "failed",
+                "Couldn't uninstall yet".into(),
+                "Your clipboard is still being given back. Try again in a moment.".into(),
+            );
+            return;
+        }
+        // Long enough to read.
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        #[cfg(target_os = "macos")]
+        {
+            // Start at Login, while there is still an app for macOS to take off its list.
+            let _ = on_main(&app, |_| login_item::turn_off());
+            for why in uninstall::remove_what_it_kept(&app.config().identifier) {
+                eprintln!("[hvtt] uninstall: {why}");
+            }
+            if let Some(bundle) = uninstall::running_app() {
+                if !uninstall::move_to_trash(&bundle) {
+                    eprintln!("[hvtt] uninstall: the app could not be moved to the Trash");
+                }
+            }
+        }
+        #[cfg(windows)]
+        if let Err(why) = uninstall::start() {
+            clip::huck::resume_borrowing();
+            LEAVING.lock().stay();
+            show_update(&app, "failed", "Couldn't uninstall".into(), why);
+            return;
+        }
+        EXIT_ALLOWED.store(true, std::sync::atomic::Ordering::SeqCst);
+        app.exit(0);
+    });
 }
 
 pub fn run() {

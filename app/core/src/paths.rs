@@ -91,6 +91,61 @@ fn is_old_recording_name(name: &str) -> bool {
     }
 }
 
+/// Everything the program leaves on a Mac besides the app itself, for Uninstall to remove: his
+/// settings, learned fixes, drafts and speech models (the app-data folder), what the system keeps
+/// for the app's window (caches, WebKit's storage, preferences), the file that tells each
+/// Chromium browser where the extension's helper is, and a downloaded update.
+///
+/// Fixed names under `home` and `temp`, every one of them this program's own - nothing is found
+/// by searching, so nothing of anyone else's can be on the list. Huck's Clipboard is not here:
+/// it is the system's, and Huck's other programs share it. Laid out as macOS lays a home folder
+/// out; the Windows uninstaller is the installer's own.
+pub fn mac_leftovers(home: &Path, temp: &Path) -> Vec<PathBuf> {
+    let library = home.join("Library");
+    // The installed app's name for these, and the bare program's (run from a terminal).
+    let names = [APP_DIR_MAC, "hvtt-desktop"];
+    let mut all = vec![library.join("Application Support").join(APP_DIR_MAC)];
+    for name in names {
+        all.push(library.join("Caches").join(name));
+        all.push(library.join("WebKit").join(name));
+        all.push(library.join("HTTPStorages").join(name));
+        all.push(library.join("HTTPStorages").join(format!("{name}.binarycookies")));
+        all.push(library.join("Preferences").join(format!("{name}.plist")));
+        all.push(library.join("Saved Application State").join(format!("{name}.savedState")));
+    }
+    for browser in [
+        "Google/Chrome",
+        "Google/Chrome Beta",
+        "Microsoft Edge",
+        "BraveSoftware/Brave-Browser",
+        "Chromium",
+    ] {
+        all.push(
+            library.join("Application Support").join(browser).join("NativeMessagingHosts").join(NATIVE_HOST_FILE),
+        );
+    }
+    all.push(temp.join("HucksVoiceToText-Update"));
+    all
+}
+
+/// The Mac's name for the app-data folder: the bundle identifier.
+pub const APP_DIR_MAC: &str = "com.huck.voice-to-text";
+/// The file `install-native-host.sh` puts in each browser's `NativeMessagingHosts`.
+pub const NATIVE_HOST_FILE: &str = "com.huck.voicetotext.json";
+
+/// Remove one of those, whatever it is: a folder with all in it, a file - or, if something has
+/// put a link there, the link alone, never what it leads to. `Ok(false)` when nothing was there.
+pub fn remove_leftover(path: &Path) -> Result<bool, String> {
+    let kind = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("could not look at {}: {e}", path.display())),
+        Ok(m) => m.file_type(),
+    };
+    // `remove_dir_all` does not follow links inside the folder either.
+    let removed = if kind.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+    removed.map(|()| true).map_err(|e| format!("could not remove {}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +220,46 @@ mod tests {
         assert!(elsewhere.join("recording-123.wav").exists(), "nothing deleted through the link");
         assert!(link.symlink_metadata().is_ok(), "the link itself stays");
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn uninstall_removes_only_what_is_this_programs_own() {
+        let root = std::env::temp_dir().join(format!("hvtt-leftovers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, temp) = (root.join("home"), root.join("tmp"));
+        let support = home.join("Library/Application Support");
+        // His things, and somebody else's beside them.
+        std::fs::create_dir_all(support.join("com.huck.voice-to-text/models")).unwrap();
+        std::fs::write(support.join("com.huck.voice-to-text/settings.json"), "{}").unwrap();
+        std::fs::create_dir_all(support.join("Google/Chrome/NativeMessagingHosts")).unwrap();
+        std::fs::write(support.join("Google/Chrome/NativeMessagingHosts/com.huck.voicetotext.json"), "{}").unwrap();
+        std::fs::write(support.join("Google/Chrome/NativeMessagingHosts/com.other.json"), "{}").unwrap();
+        std::fs::create_dir_all(home.join("Library/Caches/com.huck.voice-to-text")).unwrap();
+        std::fs::create_dir_all(home.join("Library/Caches/com.other.app")).unwrap();
+        std::fs::create_dir_all(temp.join("HucksVoiceToText-Update")).unwrap();
+        // Something has put a link where WebKit's folder would be: the link goes, not his file.
+        let precious = root.join("precious");
+        std::fs::create_dir_all(&precious).unwrap();
+        std::fs::write(precious.join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir_all(home.join("Library/WebKit")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&precious, home.join("Library/WebKit/com.huck.voice-to-text")).unwrap();
+
+        let all = mac_leftovers(&home, &temp);
+        assert!(all.iter().all(|p| p.starts_with(&home) || p.starts_with(&temp)));
+        let removed = all.iter().filter(|p| remove_leftover(p).unwrap()).count();
+        assert_eq!(removed, if cfg!(unix) { 5 } else { 4 });
+
+        assert!(!support.join("com.huck.voice-to-text").exists());
+        assert!(!support.join("Google/Chrome/NativeMessagingHosts/com.huck.voicetotext.json").exists());
+        assert!(!home.join("Library/Caches/com.huck.voice-to-text").exists());
+        assert!(!temp.join("HucksVoiceToText-Update").exists());
+        assert!(support.join("Google/Chrome/NativeMessagingHosts/com.other.json").exists());
+        assert!(home.join("Library/Caches/com.other.app").exists());
+        assert!(precious.join("keep.txt").exists(), "a link is removed, never followed");
+        assert!(std::fs::symlink_metadata(home.join("Library/WebKit/com.huck.voice-to-text")).is_err());
+        // Nothing there any more: nothing to do, and no error.
+        assert!(all.iter().all(|p| remove_leftover(p) == Ok(false)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

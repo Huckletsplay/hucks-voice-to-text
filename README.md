@@ -17,7 +17,7 @@ each is updated when it needs it.
 
 | Platform | Download | Requirement |
 |---|---|---|
-| macOS | [`HucksVoiceToText-0.1.10-macOS-arm64-unsigned-beta.dmg`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.10/HucksVoiceToText-0.1.10-macOS-arm64-unsigned-beta.dmg) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.10/HucksVoiceToText-0.1.10-macOS-arm64-unsigned-beta.dmg.sha256.txt)) | Apple silicon Mac (M1 or newer), macOS 11 or newer |
+| macOS | [`HucksVoiceToText-0.1.11-macOS-arm64-unsigned-beta.dmg`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.11/HucksVoiceToText-0.1.11-macOS-arm64-unsigned-beta.dmg) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.11/HucksVoiceToText-0.1.11-macOS-arm64-unsigned-beta.dmg.sha256.txt)) | Apple silicon Mac (M1 or newer), macOS 11 or newer |
 | Windows | [`HucksVoiceToText-0.1.9-windows-x64-setup.exe`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.9/HucksVoiceToText-0.1.9-windows-x64-setup.exe) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.9/HucksVoiceToText-0.1.9-windows-x64-setup.exe.sha256.txt)) | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
 
 This is an unsigned public beta: macOS Gatekeeper and Windows SmartScreen will both call the
@@ -84,6 +84,13 @@ still does not reach your text box, select **Huck's Voice to Text** in **System 
 & Security > Accessibility**, remove it with **−**, and add it again. Because this is still an
 unsigned beta, macOS may ask for **Open Anyway** again.
 
+**Uninstall (from 0.1.11).** Choose **Settings > Uninstall…** in the menu-bar H, then
+**Uninstall**. It moves the app to the Trash and removes everything it kept: your settings and
+learned fixes, recovery drafts, the speech models you downloaded, the Start at Login entry, and its
+Microphone and Accessibility permissions, so a later install starts from the beginning. It cannot
+be undone. It removes the copy you run it from: if you have another copy somewhere else, such as
+one in Applications and one in your home folder's Applications, remove that one the same way.
+
 ## Install on Windows
 
 1. Download `HucksVoiceToText-0.1.9-windows-x64-setup.exe` and run it.
@@ -149,7 +156,7 @@ privately, see [SECURITY.md](SECURITY.md).
 Each download has a checksum file, linked beside it under [Download](#download).
 
 ```bash
-shasum -a 256 -c HucksVoiceToText-0.1.10-macOS-arm64-unsigned-beta.dmg.sha256.txt
+shasum -a 256 -c HucksVoiceToText-0.1.11-macOS-arm64-unsigned-beta.dmg.sha256.txt
 ```
 
 ```powershell

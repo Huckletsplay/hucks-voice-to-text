@@ -1,7 +1,11 @@
 ; The Windows installer for Huck's Voice to Text - built by release.ps1, in Huck's Snip 'n' Clip's
-; shape: per-user, no administrator prompt, a Start menu entry, an optional desktop shortcut, an
-; entry in Installed Apps, and settings, models and recovery drafts left alone on uninstall (they
-; live in %LOCALAPPDATA%\Huck's Voice to Text, not here).
+; shape: per-user, no administrator prompt, a Start menu entry, an optional desktop shortcut and an
+; entry in Installed Apps.
+;
+; Uninstalling removes everything, after one question (his decision, 2026-10-06, as on the Mac):
+; the program, and the settings, learned fixes, recovery drafts and speech models it kept in
+; %LOCALAPPDATA%\Huck's Voice to Text. An update never runs the uninstaller, so it keeps them.
+; The H's Settings > Uninstall... starts this same uninstaller (desktop\src\uninstall.rs).
 
 #ifndef AppVersion
   #error AppVersion must be supplied by release.ps1
@@ -67,6 +71,12 @@ VersionInfoVersion={#AppVersion}.0
 VersionInfoCompany=Huck's Project Playground
 VersionInfoDescription={#AppName} Installer
 VersionInfoProductName={#AppName}
+
+[Messages]
+; The one question, in the words the H's Uninstall… uses in the box.
+ConfirmUninstall=Uninstall %1?%n%nThis removes the program, your settings and learned fixes, your recovery drafts and the speech models you downloaded. It cannot be undone.
+; The program's only surface is its H, so say where Quit is.
+UninstallAppRunningError=%1 is still running.%n%nChoose Quit from the H in the notification area, then click OK to continue, or Cancel to leave it installed.
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
@@ -135,4 +145,84 @@ begin
     MsgBox('Huck''s Voice to Text needs the Microsoft Edge WebView2 Runtime, which this PC does not seem to have.' + #13#10#13#10 +
            'Setup will continue. If the floating box does not appear, install the WebView2 Runtime from Microsoft and start the program again.',
            mbInformation, MB_OK);
+end;
+
+{ ---------------------------------------------------------------------------- Uninstall }
+
+function GetFileAttributes(lpFileName: String): DWORD;
+  external 'GetFileAttributesW@kernel32.dll stdcall';
+
+{ Started from the H (Settings > Uninstall...), silently, the program is on its way out as this
+  begins: wait for it to be gone - it holds the one-copy marker until its process ends - rather
+  than give up because it is "still running". Asked for by hand, the message above says what to do. }
+function InitializeUninstall(): Boolean;
+var
+  Tries: Integer;
+begin
+  Tries := 0;
+  while UninstallSilent() and CheckForMutexes('Local\HucksVoiceToText.SingleInstance') and (Tries < 80) do
+  begin
+    Sleep(250);
+    Tries := Tries + 1;
+  end;
+  Result := True;
+end;
+
+{ One of the program's own folders, with all in it. A link standing where the folder would be is
+  removed, never followed. The window's helper processes can hold their files for a moment after
+  the program has gone, so it is tried for a few seconds. }
+procedure RemoveKept(Dir: String);
+var
+  Tries: Integer;
+  Attributes: DWORD;
+begin
+  Tries := 0;
+  while DirExists(Dir) and (Tries < 20) do
+  begin
+    Attributes := GetFileAttributes(Dir);
+    if (Attributes <> $FFFFFFFF) and ((Attributes and $400) <> 0) then
+      RemoveDir(Dir)
+    else
+      DelTree(Dir, True, True, True);
+    if DirExists(Dir) then
+      Sleep(250);
+    Tries := Tries + 1;
+  end;
+  if DirExists(Dir) then
+    Log('Could not remove ' + Dir);
+end;
+
+{ Everything the program kept outside its own folder - fixed names, every one its own; nothing is
+  searched for. Kept in step with what the program writes (hvtt_core::paths, update.rs). Huck's
+  Clipboard is in the running program's memory on Windows, so it has gone already. }
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Temp, ExePath: String;
+  Tries: Integer;
+begin
+  if CurUninstallStep <> usPostUninstall then
+    exit;
+  { Settings, learned fixes, recovery drafts and downloaded speech models. }
+  RemoveKept(ExpandConstant('{localappdata}\Huck''s Voice to Text'));
+  { What Microsoft Edge WebView2 keeps for the floating box. }
+  RemoveKept(ExpandConstant('{localappdata}\com.huck.voice-to-text'));
+  { A downloaded update. }
+  Temp := GetEnv('TMP');
+  if Temp = '' then
+    Temp := GetEnv('TEMP');
+  if Temp <> '' then
+    RemoveKept(AddBackslash(Temp) + 'HucksVoiceToText-Update');
+  { The program's own folder, if it is still there: the window's helper processes stand in it for a
+    moment after the program has gone, which keeps Windows from removing it. Only ever when empty. }
+  Tries := 0;
+  while DirExists(ExpandConstant('{app}')) and (Tries < 20) do
+  begin
+    if not RemoveDir(ExpandConstant('{app}')) then
+      Sleep(250);
+    Tries := Tries + 1;
+  end;
+  { Windows' own record that this program used the microphone (Settings > Privacy > Microphone). }
+  ExePath := ExpandConstant('{app}\{#AppExeName}');
+  StringChangeEx(ExePath, '\', '#', True);
+  RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged\' + ExePath);
 end;
