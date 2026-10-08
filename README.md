@@ -18,7 +18,7 @@ each is updated when it needs it.
 | Platform | Download | Requirement |
 |---|---|---|
 | macOS | [`HucksVoiceToText-0.1.11-macOS-arm64-unsigned-beta.dmg`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.11/HucksVoiceToText-0.1.11-macOS-arm64-unsigned-beta.dmg) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.11/HucksVoiceToText-0.1.11-macOS-arm64-unsigned-beta.dmg.sha256.txt)) | Apple silicon Mac (M1 or newer), macOS 11 or newer |
-| Windows | [`HucksVoiceToText-0.1.9-windows-x64-setup.exe`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.9/HucksVoiceToText-0.1.9-windows-x64-setup.exe) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.9/HucksVoiceToText-0.1.9-windows-x64-setup.exe.sha256.txt)) | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
+| Windows | [`HucksVoiceToText-0.1.11-windows-x64-setup.exe`](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.11/HucksVoiceToText-0.1.11-windows-x64-setup.exe) ([checksum](https://github.com/Huckletsplay/hucks-voice-to-text/releases/download/v0.1.11/HucksVoiceToText-0.1.11-windows-x64-setup.exe.sha256.txt)) | Windows 10 or 11 (64-bit), with a processor that has AVX2 — most PCs from 2015 on |
 
 This is an unsigned public beta: macOS Gatekeeper and Windows SmartScreen will both call the
 developer unknown. Installation instructions are below, and each download has a SHA-256 checksum
@@ -93,7 +93,7 @@ one in Applications and one in your home folder's Applications, remove that one 
 
 ## Install on Windows
 
-1. Download `HucksVoiceToText-0.1.9-windows-x64-setup.exe` and run it.
+1. Download `HucksVoiceToText-0.1.11-windows-x64-setup.exe` and run it.
 2. Because this beta is not code-signed, Windows may show **Windows protected your PC**. Choose
    **More info**, then **Run anyway**.
 3. Follow the installer. It needs no administrator rights: it installs for your account only, into
@@ -110,8 +110,12 @@ under **Settings > Shortcuts** in the H if you prefer.
 **Updates.** **Settings > Check for Updates…** in the H downloads a newer installer with its
 published SHA-256 checksum and verifies both. **Open Update** installs it and starts the new copy.
 
-**Uninstall** from **Settings > Apps**. Your settings, speech model and recovery drafts stay in
-`%LOCALAPPDATA%\Huck's Voice to Text`; delete that folder to remove them too.
+**Uninstall (from 0.1.11).** Choose **Settings > Uninstall…** in the H, then **Uninstall** - or
+uninstall from Windows' own **Settings > Apps**; both do the same. It removes the program and
+everything it kept: your settings and learned fixes, recovery drafts, the speech models you
+downloaded and the Start with Windows entry, so a later install starts from the beginning. It
+cannot be undone. (Up to 0.1.9, uninstalling left your settings, speech models and drafts in
+`%LOCALAPPDATA%\Huck's Voice to Text`.)
 
 ## Using it
 
@@ -160,8 +164,8 @@ shasum -a 256 -c HucksVoiceToText-0.1.11-macOS-arm64-unsigned-beta.dmg.sha256.tx
 ```
 
 ```powershell
-Get-FileHash .\HucksVoiceToText-0.1.9-windows-x64-setup.exe -Algorithm SHA256
-Get-Content .\HucksVoiceToText-0.1.9-windows-x64-setup.exe.sha256.txt
+Get-FileHash .\HucksVoiceToText-0.1.11-windows-x64-setup.exe -Algorithm SHA256
+Get-Content .\HucksVoiceToText-0.1.11-windows-x64-setup.exe.sha256.txt
 ```
 
 On Windows, compare the hash printed by `Get-FileHash` with the first value in the checksum file.
